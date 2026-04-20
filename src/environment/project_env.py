@@ -157,66 +157,145 @@ class ProjectEnvironment:
                 files.append(str(path.relative_to(self.repo_path)))
         return sorted(files)
     
+    @staticmethod
+    def _fix_hunk_counts(patch_content: str) -> str:
+        """
+        Recompute and fix the line counts in unified diff hunk headers.
+
+        LLMs frequently generate wrong @@ -X,Y +A,B @@ counts.
+        This function parses each hunk, counts the actual old/new lines,
+        and rewrites the headers so that tools like git-apply accept them.
+        """
+        import re
+        # Capture: old_start, new_start, and optional trailing function hint
+        # e.g.  "@@ -78,6 +78,15 @@ def foo" -> groups: "78", "78", " @@ def foo"
+        hunk_header = re.compile(
+            r'^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)'
+        )
+        output_lines: list[str] = []
+        i = 0
+        lines = patch_content.splitlines(keepends=True)
+        while i < len(lines):
+            line = lines[i]
+            m = hunk_header.match(line)
+            if m:
+                old_start = m.group(1)
+                new_start = m.group(2)
+                hint = m.group(3)  # e.g. "" or " def foo"
+                # Collect all lines belonging to this hunk
+                hunk_lines: list[str] = []
+                i += 1
+                while i < len(lines) and not hunk_header.match(lines[i]) \
+                        and not lines[i].startswith('--- ') \
+                        and not lines[i].startswith('+++ '):
+                    hunk_lines.append(lines[i])
+                    i += 1
+                old_count = sum(
+                    1 for l in hunk_lines if l.startswith(' ') or l.startswith('-')
+                )
+                new_count = sum(
+                    1 for l in hunk_lines if l.startswith(' ') or l.startswith('+')
+                )
+                fixed_header = f"@@ -{old_start},{old_count} +{new_start},{new_count} @@{hint}\n"
+                output_lines.append(fixed_header)
+                output_lines.extend(hunk_lines)
+            else:
+                output_lines.append(line)
+                i += 1
+        return "".join(output_lines)
+
     def apply_patch(self, patch_content: str) -> bool:
         """
         Apply a unified diff patch to the repository.
-        
+
+        Attempts multiple strategies in order:
+        1. git apply --ignore-whitespace (standard)
+        2. git apply with fixed hunk counts + --ignore-whitespace
+        3. patch -p1 --fuzz=5 --ignore-whitespace (most lenient)
+
         Args:
             patch_content: The patch in unified diff format.
-            
+
         Returns:
             True if patch was applied successfully, False otherwise.
         """
         if not patch_content.strip():
             logger.warning("Empty patch content, nothing to apply")
             return False
-        
+
         # Save original commit for potential rollback
         if self._original_commit is None:
             self._original_commit = self.repo.head.commit.hexsha
-        
+
+        patch_file = None
+        fixed_patch_file = None
         try:
-            # Write patch to temp file
             with tempfile.NamedTemporaryFile(
-                mode="w",
-                suffix=".patch",
-                delete=False,
-                encoding="utf-8",
+                mode="w", suffix=".patch", delete=False, encoding="utf-8"
             ) as f:
                 f.write(patch_content)
                 patch_file = f.name
-            
-            # Apply patch using git apply
+
+            # Strategy 1: git apply --ignore-whitespace
             try:
-                self.repo.git.apply(patch_file, "--verbose")
-                logger.info("Patch applied successfully")
+                self.repo.git.apply(patch_file, "--ignore-whitespace", "--verbose")
+                logger.info("Patch applied successfully (git apply)")
                 return True
             except GitCommandError as e:
-                logger.error(f"Failed to apply patch with git: {e}")
-                # Try with patch command as fallback
-                try:
-                    result = subprocess.run(
-                        ["patch", "-p1", "-i", patch_file],
-                        cwd=self.repo_path,
-                        capture_output=True,
-                        text=True,
-                        timeout=30,
-                    )
-                    if result.returncode == 0:
-                        logger.info("Patch applied with patch command")
-                        return True
-                    else:
-                        logger.error(f"Patch command failed: {result.stderr}")
-                        return False
-                except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-                    logger.error(f"Patch fallback failed: {e}")
-                    return False
-            finally:
-                os.unlink(patch_file)
-                
+                logger.warning(f"git apply failed, trying fixed hunk counts: {e.stderr[:120]}")
+
+            # Strategy 2: fix hunk counts then git apply
+            fixed_content = self._fix_hunk_counts(patch_content)
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".patch", delete=False, encoding="utf-8"
+            ) as f:
+                f.write(fixed_content)
+                fixed_patch_file = f.name
+
+            try:
+                self.repo.git.apply(
+                    fixed_patch_file, "--ignore-whitespace", "--verbose"
+                )
+                logger.info("Patch applied successfully (git apply + fixed hunk counts)")
+                return True
+            except GitCommandError as e:
+                logger.warning(
+                    f"git apply with fixed counts failed, trying patch command: {e.stderr[:120]}"
+                )
+
+            # Strategy 3: patch --fuzz=5 --ignore-whitespace (most lenient)
+            try:
+                result = subprocess.run(
+                    [
+                        "patch", "-p1",
+                        "--fuzz=5",
+                        "--ignore-whitespace",
+                        "-i", fixed_patch_file,
+                    ],
+                    cwd=self.repo_path,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if result.returncode == 0:
+                    logger.info("Patch applied successfully (patch --fuzz=5)")
+                    return True
+                logger.error(f"patch --fuzz=5 failed: {result.stderr[:200]}")
+                return False
+            except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+                logger.error(f"patch fallback failed: {e}")
+                return False
+
         except Exception as e:
             logger.error(f"Error applying patch: {e}")
             return False
+        finally:
+            for fp in (patch_file, fixed_patch_file):
+                if fp:
+                    try:
+                        os.unlink(fp)
+                    except OSError:
+                        pass
     
     def revert_changes(self) -> bool:
         """

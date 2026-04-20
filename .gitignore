@@ -80,6 +80,16 @@ benchmark_results/
 tmp/
 temp/
 
+# === SWE-bench Run Outputs ===
+swebench_results/
+results_test/
+results_v2/
+results_v3/
+results_v4/
+*.json
+run_swebench*.log
+run_swebench_v2_stdout.log
+
 # === Logs ===
 *.log
 logs/

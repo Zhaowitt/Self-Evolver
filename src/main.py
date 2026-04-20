@@ -214,6 +214,80 @@ def config_info(ctx):
     console.print(table)
 
 
+@cli.command()
+@click.option(
+    "--dataset", "-d",
+    default="lite",
+    type=click.Choice(["lite", "verified", "full"]),
+    help="SWE-bench dataset variant to use",
+)
+@click.option(
+    "--num-instances", "-n",
+    default=None,
+    type=int,
+    help="Number of instances to run (default: all)",
+)
+@click.option(
+    "--output-dir", "-o",
+    default="./benchmark_results",
+    type=click.Path(),
+    help="Output directory for benchmark results",
+)
+@click.option(
+    "--split",
+    default="test",
+    help="Dataset split (train/dev/test)",
+)
+@click.pass_context
+def benchmark(ctx, dataset, num_instances, output_dir, split):
+    """Run SWE-bench benchmark evaluation."""
+    console.print("[bold]SWE-bench Benchmark Evaluation[/bold]")
+    console.print(f"Dataset: swebench-{dataset}")
+    if num_instances:
+        console.print(f"Instances: {num_instances}")
+    console.print(f"Split: {split}")
+    console.print()
+
+    # Check API key
+    config = get_config()
+    if not config.validate_api_key():
+        console.print("[red]Error: OPENAI_API_KEY not configured.[/red]")
+        console.print("Please set OPENAI_API_KEY in your .env file.")
+        sys.exit(1)
+
+    try:
+        from src.benchmark.swebench_runner import create_swebench_runner
+    except ImportError as e:
+        console.print(f"[red]Import error: {e}[/red]")
+        console.print("Install swebench with: pip install swebench")
+        sys.exit(1)
+
+    runner = create_swebench_runner(
+        dataset=dataset,
+        output_dir=Path(output_dir),
+    )
+
+    console.print("[bold]Loading instances...[/bold]")
+    result = runner.run_benchmark(
+        num_instances=num_instances,
+        split=split,
+    )
+
+    table = Table(title="Benchmark Results")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", style="green")
+    table.add_row("Total Instances", str(result.total_instances))
+    table.add_row("Successful", str(result.successful))
+    table.add_row("Failed", str(result.failed))
+    table.add_row("Errors", str(result.errors))
+    table.add_row("Success Rate", f"{result.success_rate:.1%}")
+    table.add_row("Total Tokens", str(result.total_tokens))
+    table.add_row("Duration", f"{result.total_duration_ms:.0f}ms")
+    console.print(table)
+
+    sys.exit(0 if result.successful > 0 else 1)
+
+
 def main():
     """Main entry point."""
     cli(obj={})
