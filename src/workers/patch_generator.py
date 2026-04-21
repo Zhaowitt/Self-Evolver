@@ -44,28 +44,50 @@ You MUST respond with a valid JSON object containing the patch in unified diff f
 }
 ```
 
-## Guidelines
+## CRITICAL: Unified Diff Line Prefix Rules
 
-1. Generate patches in UNIFIED DIFF format (git diff style)
-2. Make MINIMAL changes - only fix what's necessary
-3. Preserve existing code style and formatting
-4. Include sufficient context lines (3 lines before and after)
-5. If multiple files need changes, include all in one patch
-6. Test your logic mentally before generating the patch
-7. If this is a retry, avoid the same mistakes from previous attempts
+Every line in a hunk body MUST start with EXACTLY ONE prefix character:
+- ` ` (SPACE) — unchanged context line (this space is the prefix, NOT part of the code)
+- `-` — removed line
+- `+` — added line
 
-## Unified Diff Format Example
+**WRONG** (missing space prefix on context lines):
+```
+@@ -10,4 +10,4 @@
+def example_function(x):
+    # Some context
+-    return x + 1
++    return x * 2
+    # More context
+```
 
-```diff
---- a/src/module.py
-+++ b/src/module.py
-@@ -10,7 +10,7 @@
+**CORRECT** (every context line starts with a space):
+```
+@@ -10,6 +10,6 @@
  def example_function(x):
      # Some context
 -    return x + 1  # Bug: should be x * 2
 +    return x * 2  # Fixed
      # More context
-```"""
+ 
+```
+
+Key rules:
+1. Even a blank/empty line in the context MUST be written as a single space `' '`, never as an empty string `''`
+2. The `@@ -old_start,old_count +new_start,new_count @@` counts MUST be accurate:
+   - `old_count` = number of context lines + number of removed lines
+   - `new_count` = number of context lines + number of added lines
+3. Include 3 context lines before and after each change
+
+## Guidelines
+
+1. Generate patches in UNIFIED DIFF format (git diff style)
+2. Make MINIMAL changes - only fix what's necessary
+3. Preserve existing code style and formatting
+4. Include sufficient context lines (3 lines before and after each change)
+5. If multiple files need changes, include all diffs in one patch string
+6. Test your logic mentally before generating the patch
+7. If this is a retry, avoid the same mistakes from previous attempts"""
 
 
 class PatchGenerator(BaseWorker):
