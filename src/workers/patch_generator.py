@@ -190,6 +190,31 @@ class PatchGenerator(BaseWorker):
         """Build context for retry attempts."""
         parts = [f"## This is attempt #{context.iteration + 1}"]
         parts.append("Previous attempts have failed. Please try a different approach.")
+
+        judge_route = context.metadata.get("next_route")
+        judge_feedback = context.metadata.get("judge_feedback")
+        if judge_route or judge_feedback:
+            parts.append("\n## Judge Routing Feedback")
+            if judge_route:
+                parts.append(f"Route: {judge_route}")
+            if judge_feedback:
+                parts.append(str(judge_feedback))
+
+            if judge_route == "repair_patch_format":
+                parts.append(
+                    "Focus on producing a syntactically valid unified diff with correct "
+                    "file headers, hunk headers, context prefixes, and complete hunks."
+                )
+            elif judge_route == "empty_patch_reprompt":
+                parts.append(
+                    "You must produce a non-empty patch. If uncertain, make the smallest "
+                    "safe code change that directly addresses the issue."
+                )
+            elif judge_route == "regenerate_patch_same_location":
+                parts.append(
+                    "Keep the current localization unless the verifier logs prove it is "
+                    "wrong; correct the repair logic using the latest test failure."
+                )
         
         if context.previous_patches:
             parts.append("\n## Previous Patches (failed):")

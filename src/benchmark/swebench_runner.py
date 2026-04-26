@@ -7,10 +7,15 @@ Requires Docker and the swebench package for full functionality.
 Note: Full implementation requires server with Docker support.
 """
 
+import json
 import logging
+import shutil
+import subprocess
 import tempfile
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from src.benchmark.base import BenchmarkRunner, InstanceResult
 from src.config import get_config
@@ -35,6 +40,8 @@ class SWEBenchRunner(BenchmarkRunner):
         dataset_name: str = "princeton-nlp/SWE-bench_Lite",
         output_dir: Optional[Path] = None,
         workspace_dir: Optional[Path] = None,
+        model_name: str = "self-evolver",
+        run_id: str = "self-evolver",
     ):
         """
         Initialize SWE-bench runner.
@@ -45,8 +52,11 @@ class SWEBenchRunner(BenchmarkRunner):
             workspace_dir: Directory for cloning repos.
         """
         super().__init__(name="swebench", output_dir=output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         self.dataset_name = dataset_name
         self.workspace_dir = workspace_dir or Path(tempfile.mkdtemp(prefix="swebench_"))
+        self.model_name = model_name
+        self.run_id = run_id
         self.judge = CriticJudge()
         self._dataset = None
     
@@ -104,7 +114,7 @@ class SWEBenchRunner(BenchmarkRunner):
         repo_dir = self.workspace_dir / issue.id.replace("/", "_")
         repo_url = f"https://github.com/{issue.repo_name}.git"
 
-        if not repo_dir.exists():
+        if not repo_dir.exists() or not any(repo_dir.iterdir()):
             self.logger.info(f"Cloning {issue.repo_name} into {repo_dir}...")
             repo_dir.mkdir(parents=True, exist_ok=True)
             env = ProjectEnvironment(repo_dir)
@@ -187,6 +197,369 @@ class SWEBenchRunner(BenchmarkRunner):
                 success=False,
                 error=str(e),
             )
+
+    @staticmethod
+    def _prediction_patch_from_execution(result) -> str:
+        """
+        Extract the best canonical patch from an execution result.
+
+        The official SWE-bench prediction should use git-generated diffs from
+        the verifier, never the LLM's raw diff text.
+        """
+        if result.final_patch and result.final_patch.content.strip():
+            return result.final_patch.content
+
+        for record in reversed(result.iteration_records):
+            verification = record.verification_result
+            if verification and verification.canonical_patch_content.strip():
+                return verification.canonical_patch_content
+        return ""
+
+    @staticmethod
+    def _load_predictions(predictions_path: Path) -> Dict[str, dict]:
+        if not predictions_path.exists():
+            return {}
+        with predictions_path.open(encoding="utf-8") as f:
+            return {
+                item["instance_id"]: item
+                for item in json.load(f)
+            }
+
+    @staticmethod
+    def _save_predictions(predictions_path: Path, predictions: Dict[str, dict]) -> None:
+        predictions_path.parent.mkdir(parents=True, exist_ok=True)
+        with predictions_path.open("w", encoding="utf-8") as f:
+            json.dump(list(predictions.values()), f, indent=2)
+
+    def generate_prediction_for_issue(
+        self,
+        issue: Issue,
+        model_name: Optional[str] = None,
+        cleanup_repo: bool = True,
+    ) -> dict:
+        """Generate a canonical SWE-bench prediction for one issue."""
+        model_name = model_name or self.model_name
+        patch = ""
+        repo_dir = self.workspace_dir / issue.id.replace("/", "_")
+
+        try:
+            test_cmd = self._build_test_cmd(issue)
+            env = self.setup_instance_environment(issue)
+            if test_cmd:
+                env.test_cmd = test_cmd
+
+            orchestrator = ExecutionOrchestrator(
+                env=env,
+                max_iterations=get_config().agent.max_iterations,
+            )
+            result = orchestrator.run(issue)
+            patch = self._prediction_patch_from_execution(result)
+            self.logger.info(
+                f"Generated prediction for {issue.id}: "
+                f"{len(patch)} chars, success={result.success}"
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to generate prediction for {issue.id}: {e}")
+        finally:
+            if cleanup_repo:
+                self._cleanup_path(repo_dir)
+
+        return {
+            "instance_id": issue.id,
+            "model_name_or_path": model_name,
+            "model_patch": patch,
+        }
+
+    def generate_predictions(
+        self,
+        num_instances: Optional[int] = None,
+        split: str = "test",
+        predictions_path: Optional[Path] = None,
+        model_name: Optional[str] = None,
+        max_workers: int = 1,
+        resume: bool = True,
+        cleanup_repo: bool = True,
+    ) -> Path:
+        """
+        Generate or resume SWE-bench predictions.
+
+        Existing non-empty predictions are preserved when resume=True.
+        """
+        predictions_path = predictions_path or self.output_dir / "predictions.json"
+        model_name = model_name or self.model_name
+
+        issues = self.load_instances(split)
+        if num_instances:
+            issues = issues[:num_instances]
+
+        predictions = self._load_predictions(predictions_path) if resume else {}
+        todo = [
+            issue for issue in issues
+            if not resume
+            or not predictions.get(issue.id, {}).get("model_patch", "").strip()
+        ]
+        self.logger.info(f"Generating predictions: {len(todo)} to run, {len(predictions)} cached")
+
+        if max_workers <= 1:
+            for issue in todo:
+                predictions[issue.id] = self.generate_prediction_for_issue(
+                    issue,
+                    model_name=model_name,
+                    cleanup_repo=cleanup_repo,
+                )
+                self._save_predictions(predictions_path, predictions)
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {
+                    pool.submit(
+                        self.generate_prediction_for_issue,
+                        issue,
+                        model_name,
+                        cleanup_repo,
+                    ): issue.id
+                    for issue in todo
+                }
+                for future in as_completed(futures):
+                    instance_id = futures[future]
+                    try:
+                        predictions[instance_id] = future.result()
+                    except Exception as e:
+                        self.logger.error(f"Prediction worker failed for {instance_id}: {e}")
+                        predictions[instance_id] = {
+                            "instance_id": instance_id,
+                            "model_name_or_path": model_name,
+                            "model_patch": "",
+                        }
+                    self._save_predictions(predictions_path, predictions)
+
+        return predictions_path
+
+    def evaluate_predictions(
+        self,
+        predictions_path: Path,
+        split: str = "test",
+        run_id: Optional[str] = None,
+        max_workers: int = 2,
+        cleanup_images: bool = True,
+    ) -> dict:
+        """Evaluate predictions with the official SWE-bench harness in repo batches."""
+        try:
+            from swebench.harness.run_evaluation import main as swebench_eval
+        except ImportError as e:
+            raise ImportError("swebench package required. Install with: pip install swebench") from e
+
+        run_id = run_id or self.run_id
+        predictions = self._load_predictions(predictions_path)
+        repo_groups: dict[str, list[str]] = defaultdict(list)
+        for instance_id in predictions:
+            repo = instance_id.rsplit("__", 1)[0]
+            repo_groups[repo].append(instance_id)
+
+        for repo, instance_ids in sorted(repo_groups.items(), key=lambda item: -len(item[1])):
+            non_empty_ids = [
+                instance_id for instance_id in instance_ids
+                if predictions.get(instance_id, {}).get("model_patch", "").strip()
+            ]
+            if not non_empty_ids:
+                self.logger.info(f"Skipping {repo}: no non-empty patches")
+                continue
+
+            self.logger.info(f"Evaluating {repo}: {len(non_empty_ids)} instances")
+            try:
+                swebench_eval(
+                    dataset_name=self.dataset_name,
+                    split=split,
+                    instance_ids=non_empty_ids,
+                    predictions_path=str(predictions_path),
+                    max_workers=max_workers,
+                    force_rebuild=False,
+                    cache_level="env",
+                    clean=False,
+                    open_file_limit=4096,
+                    run_id=run_id,
+                    timeout=get_config().docker.timeout,
+                    namespace=None,
+                    rewrite_reports=False,
+                    modal=False,
+                    report_dir=str(self.output_dir),
+                )
+            except Exception as e:
+                self.logger.error(f"Evaluation failed for {repo}: {e}")
+            finally:
+                if cleanup_images:
+                    self.cleanup_docker_images(except_base=True)
+
+        summary = self.summarize_official_results(run_id=run_id)
+        summary_path = self.output_dir / "final_summary.json"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        return summary
+
+    def run_phased_benchmark(
+        self,
+        phase: str = "generate",
+        num_instances: Optional[int] = None,
+        split: str = "test",
+        predictions_path: Optional[Path] = None,
+        model_name: Optional[str] = None,
+        run_id: Optional[str] = None,
+        agent_workers: int = 1,
+        eval_workers: int = 2,
+        resume: bool = True,
+        cleanup_images: bool = True,
+        cleanup_repo: bool = True,
+    ) -> dict:
+        """Unified SWE-bench generation/evaluation entrypoint."""
+        predictions_path = predictions_path or self.output_dir / "predictions.json"
+        result: dict = {"predictions_path": str(predictions_path)}
+
+        if phase in {"generate", "both"}:
+            self.generate_predictions(
+                num_instances=num_instances,
+                split=split,
+                predictions_path=predictions_path,
+                model_name=model_name,
+                max_workers=agent_workers,
+                resume=resume,
+                cleanup_repo=cleanup_repo,
+            )
+            result["predictions"] = self.summarize_predictions(predictions_path)
+
+        if phase in {"evaluate", "both"}:
+            if "predictions" not in result:
+                result["predictions"] = self.summarize_predictions(predictions_path)
+            result["evaluation"] = self.evaluate_predictions(
+                predictions_path=predictions_path,
+                split=split,
+                run_id=run_id,
+                max_workers=eval_workers,
+                cleanup_images=cleanup_images,
+            )
+
+        return result
+
+    def summarize_predictions(self, predictions_path: Path) -> dict:
+        """Count empty/non-empty patches in a predictions file."""
+        predictions = self._load_predictions(predictions_path)
+        total = len(predictions)
+        empty = sum(
+            1 for prediction in predictions.values()
+            if not prediction.get("model_patch", "").strip()
+        )
+        return {
+            "total": total,
+            "non_empty": total - empty,
+            "empty": empty,
+        }
+
+    def summarize_official_results(self, run_id: Optional[str] = None) -> dict:
+        """Summarize official SWE-bench logs and separate infra errors."""
+        run_id = run_id or self.run_id
+        candidates = [Path("logs/run_evaluation") / run_id / self.model_name]
+        try:
+            from swebench.harness.constants import RUN_EVALUATION_LOG_DIR
+            candidates.insert(0, RUN_EVALUATION_LOG_DIR / run_id / self.model_name)
+        except Exception:
+            pass
+        candidates.append(Path("/root/Self-Evolver/logs/run_evaluation") / run_id / self.model_name)
+        eval_dir = next((path for path in candidates if path.exists()), candidates[0])
+
+        resolved: list[str] = []
+        unresolved: list[str] = []
+        infra_errors: list[str] = []
+        patch_errors: list[str] = []
+        other_errors: list[str] = []
+
+        if not eval_dir.exists():
+            return {
+                "resolved": resolved,
+                "unresolved": unresolved,
+                "infra_errors": infra_errors,
+                "patch_errors": patch_errors,
+                "other_errors": other_errors,
+                "total_evaluated": 0,
+            }
+
+        for instance_dir in sorted(eval_dir.iterdir()):
+            if not instance_dir.is_dir():
+                continue
+            instance_id = instance_dir.name
+            report_file = instance_dir / "report.json"
+            log_file = instance_dir / "run_instance.log"
+
+            if report_file.exists():
+                try:
+                    data = json.loads(report_file.read_text(encoding="utf-8"))
+                    if data.get(instance_id, {}).get("resolved", False):
+                        resolved.append(instance_id)
+                    else:
+                        unresolved.append(instance_id)
+                    continue
+                except Exception:
+                    pass
+
+            content = log_file.read_text(encoding="utf-8", errors="ignore") if log_file.exists() else ""
+            lower = content.lower()
+            if "toomanyrequests" in lower or "rate limit" in lower:
+                infra_errors.append(instance_id)
+            elif "malformed patch" in lower or "hunk" in lower or "unexpected end of file" in lower:
+                patch_errors.append(instance_id)
+            elif content:
+                other_errors.append(instance_id)
+            else:
+                unresolved.append(instance_id)
+
+        total = len(resolved) + len(unresolved) + len(infra_errors) + len(patch_errors) + len(other_errors)
+        return {
+            "resolved": resolved,
+            "unresolved": unresolved,
+            "infra_errors": infra_errors,
+            "patch_errors": patch_errors,
+            "other_errors": other_errors,
+            "total_evaluated": total,
+            "resolved_count": len(resolved),
+            "unresolved_count": len(unresolved),
+            "infra_error_count": len(infra_errors),
+            "patch_error_count": len(patch_errors),
+            "other_error_count": len(other_errors),
+            "resolve_rate_excluding_infra": (
+                len(resolved) / max(1, total - len(infra_errors))
+            ),
+        }
+
+    @staticmethod
+    def cleanup_docker_images(except_base: bool = True) -> None:
+        """Remove SWE-bench env/eval images while optionally preserving base images."""
+        try:
+            result = subprocess.run(
+                ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"],
+                capture_output=True,
+                text=True,
+            )
+            images_to_remove = []
+            for line in result.stdout.strip().splitlines():
+                if "sweb.eval." in line or "sweb.env." in line:
+                    images_to_remove.append(line)
+                elif not except_base and "sweb.base." in line:
+                    images_to_remove.append(line)
+
+            if images_to_remove:
+                subprocess.run(
+                    ["docker", "rmi", "-f", *images_to_remove],
+                    capture_output=True,
+                    text=True,
+                )
+            subprocess.run(["docker", "image", "prune", "-f"], capture_output=True, text=True)
+        except Exception as e:
+            logger.warning(f"Docker cleanup error: {e}")
+
+    @staticmethod
+    def _cleanup_path(path: Path) -> None:
+        try:
+            if path.exists():
+                shutil.rmtree(path)
+        except Exception as e:
+            logger.warning(f"Failed to cleanup {path}: {e}")
     
     def verify_with_swebench(self, instance_id: str, patch: str) -> bool:
         """
@@ -217,7 +590,7 @@ class SWEBenchRunner(BenchmarkRunner):
             )
             return False
 
-        model_name = "self-evolver"
+        model_name = self.model_name
         # run_id must be short and filesystem-safe
         safe_id = instance_id.replace("/", "__").replace(".", "_")[:40]
         run_id = f"se-verify-{safe_id}"
@@ -313,6 +686,9 @@ class SWEBenchRunner(BenchmarkRunner):
 def create_swebench_runner(
     dataset: str = "lite",
     output_dir: Optional[Path] = None,
+    workspace_dir: Optional[Path] = None,
+    model_name: str = "self-evolver",
+    run_id: str = "self-evolver",
 ) -> SWEBenchRunner:
     """
     Factory function to create a SWE-bench runner.
@@ -320,6 +696,9 @@ def create_swebench_runner(
     Args:
         dataset: "lite" for SWE-bench Lite, "verified" for Verified.
         output_dir: Output directory for results.
+        workspace_dir: Directory for cloned repositories.
+        model_name: SWE-bench prediction model name.
+        run_id: SWE-bench evaluation run ID.
         
     Returns:
         Configured SWEBenchRunner instance.
@@ -331,4 +710,10 @@ def create_swebench_runner(
     }
     
     dataset_name = dataset_map.get(dataset, dataset)
-    return SWEBenchRunner(dataset_name=dataset_name, output_dir=output_dir)
+    return SWEBenchRunner(
+        dataset_name=dataset_name,
+        output_dir=output_dir,
+        workspace_dir=workspace_dir,
+        model_name=model_name,
+        run_id=run_id,
+    )

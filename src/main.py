@@ -234,23 +234,73 @@ def config_info(ctx):
     help="Output directory for benchmark results",
 )
 @click.option(
+    "--workspace-dir",
+    default=None,
+    type=click.Path(),
+    help="Workspace directory for cloned benchmark repositories",
+)
+@click.option(
     "--split",
     default="test",
     help="Dataset split (train/dev/test)",
 )
+@click.option(
+    "--phase",
+    default="generate",
+    type=click.Choice(["generate", "evaluate", "both", "legacy"]),
+    help="Benchmark phase to run",
+)
+@click.option(
+    "--predictions-path",
+    default=None,
+    type=click.Path(),
+    help="Path to SWE-bench predictions JSON",
+)
+@click.option("--run-id", default="self-evolver", help="SWE-bench evaluation run ID")
+@click.option("--model-name", default="self-evolver", help="SWE-bench prediction model name")
+@click.option("--agent-workers", default=1, help="Parallel workers for prediction generation")
+@click.option("--eval-workers", default=2, help="Parallel workers for official evaluation")
+@click.option("--resume/--no-resume", default=True, help="Resume from existing predictions")
+@click.option(
+    "--cleanup-images/--no-cleanup-images",
+    default=True,
+    help="Clean SWE-bench Docker env/eval images after each repo batch",
+)
+@click.option(
+    "--cleanup-repos/--no-cleanup-repos",
+    default=True,
+    help="Clean cloned repositories after prediction generation",
+)
 @click.pass_context
-def benchmark(ctx, dataset, num_instances, output_dir, split):
+def benchmark(
+    ctx,
+    dataset,
+    num_instances,
+    output_dir,
+    workspace_dir,
+    split,
+    phase,
+    predictions_path,
+    run_id,
+    model_name,
+    agent_workers,
+    eval_workers,
+    resume,
+    cleanup_images,
+    cleanup_repos,
+):
     """Run SWE-bench benchmark evaluation."""
     console.print("[bold]SWE-bench Benchmark Evaluation[/bold]")
     console.print(f"Dataset: swebench-{dataset}")
     if num_instances:
         console.print(f"Instances: {num_instances}")
     console.print(f"Split: {split}")
+    console.print(f"Phase: {phase}")
     console.print()
 
-    # Check API key
+    # Check API key only for phases that generate patches.
     config = get_config()
-    if not config.validate_api_key():
+    if phase in {"generate", "both", "legacy"} and not config.validate_api_key():
         console.print("[red]Error: OPENAI_API_KEY not configured.[/red]")
         console.print("Please set OPENAI_API_KEY in your .env file.")
         sys.exit(1)
@@ -265,27 +315,67 @@ def benchmark(ctx, dataset, num_instances, output_dir, split):
     runner = create_swebench_runner(
         dataset=dataset,
         output_dir=Path(output_dir),
+        workspace_dir=Path(workspace_dir) if workspace_dir else None,
+        model_name=model_name,
+        run_id=run_id,
     )
 
-    console.print("[bold]Loading instances...[/bold]")
-    result = runner.run_benchmark(
+    if phase == "legacy":
+        console.print("[bold]Loading instances...[/bold]")
+        result = runner.run_benchmark(
+            num_instances=num_instances,
+            split=split,
+        )
+
+        table = Table(title="Benchmark Results")
+        table.add_column("Metric", style="cyan")
+        table.add_column("Value", style="green")
+        table.add_row("Total Instances", str(result.total_instances))
+        table.add_row("Successful", str(result.successful))
+        table.add_row("Failed", str(result.failed))
+        table.add_row("Errors", str(result.errors))
+        table.add_row("Success Rate", f"{result.success_rate:.1%}")
+        table.add_row("Total Tokens", str(result.total_tokens))
+        table.add_row("Duration", f"{result.total_duration_ms:.0f}ms")
+        console.print(table)
+        sys.exit(0 if result.successful > 0 else 1)
+
+    result = runner.run_phased_benchmark(
+        phase=phase,
         num_instances=num_instances,
         split=split,
+        predictions_path=Path(predictions_path) if predictions_path else None,
+        model_name=model_name,
+        run_id=run_id,
+        agent_workers=agent_workers,
+        eval_workers=eval_workers,
+        resume=resume,
+        cleanup_images=cleanup_images,
+        cleanup_repo=cleanup_repos,
     )
 
-    table = Table(title="Benchmark Results")
+    table = Table(title="SWE-bench Phased Result")
     table.add_column("Metric", style="cyan")
     table.add_column("Value", style="green")
-    table.add_row("Total Instances", str(result.total_instances))
-    table.add_row("Successful", str(result.successful))
-    table.add_row("Failed", str(result.failed))
-    table.add_row("Errors", str(result.errors))
-    table.add_row("Success Rate", f"{result.success_rate:.1%}")
-    table.add_row("Total Tokens", str(result.total_tokens))
-    table.add_row("Duration", f"{result.total_duration_ms:.0f}ms")
+    table.add_row("Predictions", result["predictions_path"])
+    if "predictions" in result:
+        predictions = result["predictions"]
+        table.add_row("Prediction Total", str(predictions.get("total", 0)))
+        table.add_row("Non-empty Patches", str(predictions.get("non_empty", 0)))
+        table.add_row("Empty Patches", str(predictions.get("empty", 0)))
+    if "evaluation" in result:
+        evaluation = result["evaluation"]
+        table.add_row("Resolved", str(evaluation.get("resolved_count", 0)))
+        table.add_row("Unresolved", str(evaluation.get("unresolved_count", 0)))
+        table.add_row("Infra Errors", str(evaluation.get("infra_error_count", 0)))
+        table.add_row("Patch Errors", str(evaluation.get("patch_error_count", 0)))
+        table.add_row(
+            "Resolve Rate excl. Infra",
+            f"{evaluation.get('resolve_rate_excluding_infra', 0.0):.1%}",
+        )
     console.print(table)
 
-    sys.exit(0 if result.successful > 0 else 1)
+    sys.exit(0)
 
 
 def main():

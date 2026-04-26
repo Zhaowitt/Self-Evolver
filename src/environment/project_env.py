@@ -15,7 +15,7 @@ from typing import List, Optional
 from git import Repo
 from git.exc import GitCommandError
 
-from src.environment.models import Issue, PatchInfo, RepoState, TestResult
+from src.environment.models import Issue, PatchApplyResult, RepoState, TestResult
 
 logger = logging.getLogger(__name__)
 
@@ -204,9 +204,9 @@ class ProjectEnvironment:
                 i += 1
         return "".join(output_lines)
 
-    def apply_patch(self, patch_content: str) -> bool:
+    def apply_patch_detailed(self, patch_content: str) -> PatchApplyResult:
         """
-        Apply a unified diff patch to the repository.
+        Apply a unified diff patch to the repository and return diagnostics.
 
         Attempts multiple strategies in order:
         1. git apply --ignore-whitespace (standard)
@@ -217,16 +217,21 @@ class ProjectEnvironment:
             patch_content: The patch in unified diff format.
 
         Returns:
-            True if patch was applied successfully, False otherwise.
+            PatchApplyResult with success state, strategy, and command diagnostics.
         """
         if not patch_content.strip():
             logger.warning("Empty patch content, nothing to apply")
-            return False
+            return PatchApplyResult(
+                success=False,
+                strategy="empty",
+                error_message="Empty patch content",
+            )
 
         # Save original commit for potential rollback
         if self._original_commit is None:
             self._original_commit = self.repo.head.commit.hexsha
 
+        attempts: list[dict[str, str]] = []
         patch_file = None
         fixed_patch_file = None
         try:
@@ -238,11 +243,23 @@ class ProjectEnvironment:
 
             # Strategy 1: git apply --ignore-whitespace
             try:
-                self.repo.git.apply(patch_file, "--ignore-whitespace", "--verbose")
+                stdout = self.repo.git.apply(patch_file, "--ignore-whitespace", "--verbose")
                 logger.info("Patch applied successfully (git apply)")
-                return True
+                return PatchApplyResult(
+                    success=True,
+                    strategy="git_apply",
+                    stdout=stdout or "",
+                    attempts=attempts,
+                )
             except GitCommandError as e:
-                logger.warning(f"git apply failed, trying fixed hunk counts: {e.stderr[:120]}")
+                attempts.append({
+                    "strategy": "git_apply",
+                    "stdout": e.stdout or "",
+                    "stderr": e.stderr or str(e),
+                })
+                logger.warning(
+                    f"git apply failed, trying fixed hunk counts: {(e.stderr or str(e))[:120]}"
+                )
 
             # Strategy 2: fix hunk counts then git apply
             fixed_content = self._fix_hunk_counts(patch_content)
@@ -253,14 +270,26 @@ class ProjectEnvironment:
                 fixed_patch_file = f.name
 
             try:
-                self.repo.git.apply(
+                stdout = self.repo.git.apply(
                     fixed_patch_file, "--ignore-whitespace", "--verbose"
                 )
                 logger.info("Patch applied successfully (git apply + fixed hunk counts)")
-                return True
+                return PatchApplyResult(
+                    success=True,
+                    strategy="git_apply_fixed_hunk_counts",
+                    stdout=stdout or "",
+                    fixed_patch_content=fixed_content,
+                    attempts=attempts,
+                )
             except GitCommandError as e:
+                attempts.append({
+                    "strategy": "git_apply_fixed_hunk_counts",
+                    "stdout": e.stdout or "",
+                    "stderr": e.stderr or str(e),
+                })
                 logger.warning(
-                    f"git apply with fixed counts failed, trying patch command: {e.stderr[:120]}"
+                    "git apply with fixed counts failed, trying patch command: "
+                    f"{(e.stderr or str(e))[:120]}"
                 )
 
             # Strategy 3: patch --fuzz=5 --ignore-whitespace (most lenient)
@@ -277,18 +306,54 @@ class ProjectEnvironment:
                     text=True,
                     timeout=30,
                 )
+                attempts.append({
+                    "strategy": "patch_fuzz",
+                    "stdout": result.stdout or "",
+                    "stderr": result.stderr or "",
+                })
                 if result.returncode == 0:
                     logger.info("Patch applied successfully (patch --fuzz=5)")
-                    return True
+                    return PatchApplyResult(
+                        success=True,
+                        strategy="patch_fuzz",
+                        stdout=result.stdout or "",
+                        stderr=result.stderr or "",
+                        fixed_patch_content=fixed_content,
+                        attempts=attempts,
+                    )
                 logger.error(f"patch --fuzz=5 failed: {result.stderr[:200]}")
-                return False
+                return PatchApplyResult(
+                    success=False,
+                    strategy="failed",
+                    stdout=result.stdout or "",
+                    stderr=result.stderr or "",
+                    error_message="All patch application strategies failed",
+                    fixed_patch_content=fixed_content,
+                    attempts=attempts,
+                )
             except (subprocess.TimeoutExpired, FileNotFoundError) as e:
                 logger.error(f"patch fallback failed: {e}")
-                return False
+                attempts.append({
+                    "strategy": "patch_fuzz",
+                    "stdout": "",
+                    "stderr": str(e),
+                })
+                return PatchApplyResult(
+                    success=False,
+                    strategy="patch_fuzz_error",
+                    error_message=str(e),
+                    fixed_patch_content=fixed_content,
+                    attempts=attempts,
+                )
 
         except Exception as e:
             logger.error(f"Error applying patch: {e}")
-            return False
+            return PatchApplyResult(
+                success=False,
+                strategy="error",
+                error_message=str(e),
+                attempts=attempts,
+            )
         finally:
             for fp in (patch_file, fixed_patch_file):
                 if fp:
@@ -296,6 +361,15 @@ class ProjectEnvironment:
                         os.unlink(fp)
                     except OSError:
                         pass
+
+    def apply_patch(self, patch_content: str) -> bool:
+        """
+        Apply a unified diff patch to the repository.
+
+        Kept as a bool-returning compatibility wrapper around
+        apply_patch_detailed().
+        """
+        return self.apply_patch_detailed(patch_content).success
     
     def revert_changes(self) -> bool:
         """
@@ -489,7 +563,17 @@ class ProjectEnvironment:
         
         # Apply test patch if provided (for SWE-bench)
         if issue.test_patch:
-            if not self.apply_patch(issue.test_patch):
+            test_patch_result = self.apply_patch_detailed(issue.test_patch)
+            if not test_patch_result.success:
                 logger.warning("Failed to apply test patch")
+                self.revert_changes()
+            else:
+                # SWE-bench test patches are needed for local validation but must
+                # not appear in final predictions. Staging them keeps default
+                # `git diff` focused on the agent's later code changes.
+                try:
+                    self.repo.git.add("-A")
+                except GitCommandError as e:
+                    logger.warning(f"Failed to stage test patch: {e}")
         
         return True

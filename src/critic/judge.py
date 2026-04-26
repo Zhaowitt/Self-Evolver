@@ -163,7 +163,9 @@ class CriticJudge:
             from src.workers.verifier import VerificationStatus
             
             status = last_record.verification_result.status
-            if status == VerificationStatus.PATCH_FAILED:
+            if status == VerificationStatus.EMPTY_PATCH:
+                return FailureType.PATCH_GENERATION_ERROR
+            if status in (VerificationStatus.PATCH_FAILED, VerificationStatus.NO_CHANGES):
                 return FailureType.PATCH_APPLICATION_ERROR
             if status == VerificationStatus.NEW_ISSUES:
                 return FailureType.REGRESSION_INTRODUCED
@@ -188,6 +190,12 @@ class CriticJudge:
                     tags.append("parse_error")
                 if "api" in record.error.lower():
                     tags.append("api_error")
+            if record.verification_result:
+                status = record.verification_result.status.value
+                tags.append(status)
+                apply_result = record.verification_result.patch_apply_result
+                if apply_result and apply_result.strategy:
+                    tags.append(f"patch_apply:{apply_result.strategy}")
         
         # Check for repeated failures
         if len(result.iteration_records) > 1:

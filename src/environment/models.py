@@ -165,6 +165,31 @@ class PatchInfo:
 
 
 @dataclass
+class PatchApplyResult:
+    """Structured result from attempting to apply a patch."""
+
+    success: bool
+    strategy: str = ""
+    stdout: str = ""
+    stderr: str = ""
+    error_message: str = ""
+    fixed_patch_content: Optional[str] = None
+    attempts: List[Dict[str, str]] = field(default_factory=list)
+
+    @property
+    def diagnostic(self) -> str:
+        """Compact diagnostic string for retry prompts and logging."""
+        parts = []
+        if self.error_message:
+            parts.append(self.error_message)
+        if self.stderr:
+            parts.append(self.stderr)
+        if self.stdout:
+            parts.append(self.stdout)
+        return "\n".join(part for part in parts if part).strip()
+
+
+@dataclass
 class ExecutionContext:
     """Context passed between workers during execution."""
     

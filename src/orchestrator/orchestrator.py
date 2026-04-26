@@ -5,6 +5,7 @@ Manages the execution flow: Inspector -> Patch Generator -> Verifier
 with retry logic on failures.
 """
 
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -17,14 +18,13 @@ from src.environment.models import (
     ExecutionContext,
     Issue,
     PatchInfo,
-    RepoState,
-    TestResult,
 )
 from src.environment.project_env import ProjectEnvironment
 from src.llm.client import LLMClient
 from src.workers.inspector import Inspector, InspectionResult
+from src.workers.llm_judge import JudgeDecision, JudgeRoute, LLMJudge
 from src.workers.patch_generator import PatchGenerator, PatchResult
-from src.workers.verifier import Verifier, VerificationResult, VerificationStatus
+from src.workers.verifier import Verifier, VerificationResult
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +46,7 @@ class IterationRecord:
     inspection_result: Optional[InspectionResult] = None
     patch_result: Optional[PatchResult] = None
     verification_result: Optional[VerificationResult] = None
+    judge_decision: Optional[JudgeDecision] = None
     error: Optional[str] = None
     tokens_used: int = 0
     duration_ms: float = 0.0
@@ -110,6 +111,7 @@ class ExecutionOrchestrator:
         self.inspector = Inspector(env, self.llm_client)
         self.patch_generator = PatchGenerator(env, self.llm_client)
         self.verifier = Verifier(env, self.llm_client)
+        self.llm_judge = LLMJudge(self.llm_client)
         
         self.logger = logging.getLogger(f"{__name__}.Orchestrator")
     
@@ -147,9 +149,13 @@ class ExecutionOrchestrator:
         
         iteration_records: List[IterationRecord] = []
         final_patch: Optional[PatchInfo] = None
+        current_inspection: Optional[InspectionResult] = None
+        next_route = JudgeRoute.REINSPECT
+        hard_case = False
         
         for iteration in range(self.max_iterations):
             context.iteration = iteration
+            context.metadata["next_route"] = next_route.value
             self.logger.info(f"=== Iteration {iteration + 1}/{self.max_iterations} ===")
             
             iter_start = time.time()
@@ -157,26 +163,34 @@ class ExecutionOrchestrator:
             
             try:
                 # Step 1: Inspection
-                self.logger.info("Step 1: Running Inspector...")
-                inspect_result = self.inspector.execute(context)
-                
-                if not inspect_result.success or not inspect_result.data:
-                    record.error = f"Inspection failed: {inspect_result.error}"
-                    iteration_records.append(record)
-                    context.previous_errors.append(record.error)
-                    continue
-                
-                record.inspection_result = inspect_result.data
-                record.tokens_used += inspect_result.tokens_used
+                if current_inspection is None or next_route == JudgeRoute.REINSPECT:
+                    self.logger.info("Step 1: Running Inspector...")
+                    inspect_result = self.inspector.execute(context)
+
+                    if not inspect_result.success or not inspect_result.data:
+                        record.error = f"Inspection failed: {inspect_result.error}"
+                        iteration_records.append(record)
+                        context.previous_errors.append(record.error)
+                        next_route = JudgeRoute.REINSPECT
+                        continue
+
+                    current_inspection = inspect_result.data
+                    record.tokens_used += inspect_result.tokens_used
+                else:
+                    self.logger.info(f"Step 1: Reusing inspection for route {next_route.value}")
+
+                record.inspection_result = current_inspection
                 
                 # Step 2: Patch Generation
                 self.logger.info("Step 2: Running Patch Generator...")
-                patch_result = self.patch_generator.execute(context, inspect_result.data)
+                patch_result = self.patch_generator.execute(context, current_inspection)
                 
                 if not patch_result.success or not patch_result.data:
                     record.error = f"Patch generation failed: {patch_result.error}"
+                    record.duration_ms = (time.time() - iter_start) * 1000
                     iteration_records.append(record)
                     context.previous_errors.append(record.error)
+                    next_route = JudgeRoute.EMPTY_PATCH_REPROMPT
                     continue
                 
                 record.patch_result = patch_result.data
@@ -184,8 +198,13 @@ class ExecutionOrchestrator:
                 
                 if not patch_result.data.patch_content:
                     record.error = "Empty patch generated"
+                    self._judge_failed_attempt(context, record)
+                    record.duration_ms = (time.time() - iter_start) * 1000
                     iteration_records.append(record)
                     context.previous_errors.append(record.error)
+                    next_route = self._route_from_record(record)
+                    if next_route == JudgeRoute.REINSPECT:
+                        current_inspection = None
                     continue
                 
                 # Step 3: Verification
@@ -200,7 +219,7 @@ class ExecutionOrchestrator:
                 if verify_result.success and verify_result.data and verify_result.data.success:
                     # Success!
                     self.logger.info("Verification passed! Issue fixed.")
-                    final_patch = patch_result.data.patch_info
+                    final_patch = verify_result.data.canonical_patch_info or patch_result.data.patch_info
                     
                     total_duration = (time.time() - start_time) * 1000
                     return ExecutionResult(
@@ -218,13 +237,24 @@ class ExecutionOrchestrator:
                 self.logger.info("Verification failed, preparing for retry...")
                 
                 # Update context with failure information
-                if patch_result.data.patch_info:
+                if verify_result.data and verify_result.data.canonical_patch_info:
+                    context.previous_patches.append(verify_result.data.canonical_patch_info)
+                elif patch_result.data.patch_info:
                     context.previous_patches.append(patch_result.data.patch_info)
                 
                 if verify_result.data and verify_result.data.test_result:
                     context.test_results.append(verify_result.data.test_result)
-                    error_msg = verify_result.data.summary or "Verification failed"
-                    context.previous_errors.append(error_msg)
+                if verify_result.data:
+                    error_msg = verify_result.data.summary or verify_result.data.error_message
+                    context.previous_errors.append(error_msg or "Verification failed")
+
+                self._judge_failed_attempt(context, record)
+                next_route = self._route_from_record(record)
+                if next_route == JudgeRoute.GIVE_UP_HARD_CASE:
+                    hard_case = True
+                    break
+                if next_route == JudgeRoute.REINSPECT:
+                    current_inspection = None
                 
             except Exception as e:
                 self.logger.error(f"Iteration {iteration + 1} error: {e}")
@@ -232,21 +262,92 @@ class ExecutionOrchestrator:
                 record.duration_ms = (time.time() - iter_start) * 1000
                 iteration_records.append(record)
                 context.previous_errors.append(str(e))
+                next_route = JudgeRoute.REINSPECT
         
         # Max iterations reached
         total_duration = (time.time() - start_time) * 1000
         self.logger.warning(f"Max iterations ({self.max_iterations}) reached without success")
         
+        failure_reason = "judge_give_up" if hard_case else "max_iterations"
+        self._record_hard_case(issue, iteration_records, failure_reason)
+
         return ExecutionResult(
-            status=ExecutionStatus.MAX_ITERATIONS,
+            status=ExecutionStatus.FAILED if hard_case else ExecutionStatus.MAX_ITERATIONS,
             issue_id=issue.id,
             success=False,
-            iterations_used=self.max_iterations,
+            iterations_used=len(iteration_records),
             total_tokens=self.llm_client.total_tokens_used,
             total_duration_ms=total_duration,
             iteration_records=iteration_records,
-            error_message=f"Failed after {self.max_iterations} iterations",
+            error_message=(
+                "LLM judge routed this issue to hard-case buffer"
+                if hard_case else f"Failed after {self.max_iterations} iterations"
+            ),
+            metadata={"hard_case": hard_case, "last_route": next_route.value},
         )
+
+    def _judge_failed_attempt(
+        self,
+        context: ExecutionContext,
+        record: IterationRecord,
+    ) -> None:
+        """Run LLM judge after a failed attempt and store retry feedback."""
+        judge_result = self.llm_judge.execute(context, record)
+        if judge_result.data:
+            record.judge_decision = judge_result.data
+            context.metadata["judge_feedback"] = judge_result.data.feedback_for_next_attempt
+            context.metadata["next_route"] = judge_result.data.route.value
+        if judge_result.llm_response:
+            record.tokens_used += judge_result.tokens_used
+
+    def _route_from_record(self, record: IterationRecord) -> JudgeRoute:
+        """Extract the next route from a judged record, defaulting to reinspect."""
+        if record.judge_decision:
+            return record.judge_decision.route
+        return JudgeRoute.REINSPECT
+
+    def _record_hard_case(
+        self,
+        issue: Issue,
+        records: List[IterationRecord],
+        reason: str,
+    ) -> None:
+        """Append a compact hard-case record for later failure analysis."""
+        try:
+            output_path = get_config().environment.workspace_dir / "hard_cases.jsonl"
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "issue_id": issue.id,
+                "repo_name": issue.repo_name,
+                "base_commit": issue.base_commit,
+                "reason": reason,
+                "created_at": datetime.now().isoformat(),
+                "iterations": len(records),
+                "routes": [
+                    record.judge_decision.route.value
+                    for record in records
+                    if record.judge_decision
+                ],
+                "errors": [
+                    record.error
+                    for record in records
+                    if record.error
+                ],
+                "verification_statuses": [
+                    record.verification_result.status.value
+                    for record in records
+                    if record.verification_result
+                ],
+                "patch_apply_strategies": [
+                    record.verification_result.patch_apply_result.strategy
+                    for record in records
+                    if record.verification_result and record.verification_result.patch_apply_result
+                ],
+            }
+            with output_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception as e:
+            self.logger.warning(f"Failed to write hard-case record: {e}")
     
     def run_single_iteration(
         self,
