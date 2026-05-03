@@ -24,6 +24,7 @@ class VerificationStatus(Enum):
     
     SUCCESS = "success"
     EMPTY_PATCH = "empty_patch"
+    PATCH_CONTEXT_MISMATCH = "patch_context_mismatch"
     PATCH_FAILED = "patch_failed"
     NO_CHANGES = "no_changes"
     TESTS_FAILED = "tests_failed"
@@ -88,7 +89,25 @@ class Verifier(BaseWorker):
             )
         
         try:
-            # Step 1: Apply the patch
+            # Step 1: Check patch context before applying.
+            context_check = self.env.check_patch_context(patch_result.patch_content)
+            if not context_check.success:
+                self.logger.warning("Patch context check failed")
+                return WorkerResult(
+                    success=False,
+                    data=VerificationResult(
+                        status=VerificationStatus.PATCH_CONTEXT_MISMATCH,
+                        patch_applied=False,
+                        raw_patch_content=patch_result.patch_content,
+                        error_message=context_check.diagnostic,
+                        summary=(
+                            "Patch hunk context does not match repository files. "
+                            f"{context_check.diagnostic[:500]}"
+                        ),
+                    ),
+                )
+
+            # Step 2: Apply the patch
             self.logger.info("Applying patch...")
             apply_result = self.env.apply_patch_detailed(patch_result.patch_content)
             
@@ -130,11 +149,11 @@ class Verifier(BaseWorker):
                     ),
                 )
             
-            # Step 2: Run tests
+            # Step 3: Run tests
             self.logger.info("Running tests...")
             test_result = self.env.run_tests()
             
-            # Step 3: Analyze results
+            # Step 4: Analyze results
             result = self._analyze_test_results(test_result, context)
             result.patch_applied = True
             result.raw_patch_content = patch_result.patch_content
@@ -143,7 +162,7 @@ class Verifier(BaseWorker):
             result.patch_apply_result = apply_result
             result.test_result = test_result
             
-            # Step 4: Revert changes for next iteration if needed
+            # Step 5: Revert changes for next iteration if needed
             if not result.success:
                 self.logger.info("Reverting changes due to verification failure")
                 self.env.revert_changes()
@@ -245,6 +264,21 @@ class Verifier(BaseWorker):
             )
         
         try:
+            context_check = self.env.check_patch_context(patch_result.patch_content)
+            if not context_check.success:
+                return WorkerResult(
+                    success=False,
+                    data=VerificationResult(
+                        status=VerificationStatus.PATCH_CONTEXT_MISMATCH,
+                        raw_patch_content=patch_result.patch_content,
+                        error_message=context_check.diagnostic,
+                        summary=(
+                            "Patch hunk context does not match repository files. "
+                            f"{context_check.diagnostic[:500]}"
+                        ),
+                    ),
+                )
+
             # Apply patch
             apply_result = self.env.apply_patch_detailed(patch_result.patch_content)
             if not apply_result.success:

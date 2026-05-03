@@ -20,7 +20,7 @@ from typing import Dict, List, Optional
 from src.benchmark.base import BenchmarkRunner, InstanceResult
 from src.config import get_config
 from src.critic.judge import CriticJudge
-from src.environment.models import Issue
+from src.environment.models import Issue, normalize_patch_text
 from src.environment.project_env import ProjectEnvironment
 from src.orchestrator.orchestrator import ExecutionOrchestrator
 
@@ -207,12 +207,12 @@ class SWEBenchRunner(BenchmarkRunner):
         the verifier, never the LLM's raw diff text.
         """
         if result.final_patch and result.final_patch.content.strip():
-            return result.final_patch.content
+            return normalize_patch_text(result.final_patch.content)
 
         for record in reversed(result.iteration_records):
             verification = record.verification_result
             if verification and verification.canonical_patch_content.strip():
-                return verification.canonical_patch_content
+                return normalize_patch_text(verification.canonical_patch_content)
         return ""
 
     @staticmethod
@@ -230,6 +230,7 @@ class SWEBenchRunner(BenchmarkRunner):
         predictions_path.parent.mkdir(parents=True, exist_ok=True)
         with predictions_path.open("w", encoding="utf-8") as f:
             json.dump(list(predictions.values()), f, indent=2)
+            f.write("\n")
 
     def generate_prediction_for_issue(
         self,
@@ -267,7 +268,7 @@ class SWEBenchRunner(BenchmarkRunner):
         return {
             "instance_id": issue.id,
             "model_name_or_path": model_name,
-            "model_patch": patch,
+            "model_patch": normalize_patch_text(patch) if patch.strip() else "",
         }
 
     def generate_predictions(

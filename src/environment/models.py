@@ -11,6 +11,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
+def normalize_patch_text(patch_content: str) -> str:
+    """Normalize patch line endings and ensure a final newline."""
+    patch_content = patch_content.replace("\r\n", "\n").replace("\r", "\n")
+    if patch_content and not patch_content.endswith("\n"):
+        patch_content += "\n"
+    return patch_content
+
+
 class TestStatus(Enum):
     """Status of a test execution."""
     
@@ -142,6 +150,7 @@ class PatchInfo:
     @classmethod
     def from_diff(cls, diff_content: str) -> "PatchInfo":
         """Parse patch info from unified diff content."""
+        diff_content = normalize_patch_text(diff_content)
         modified_files = []
         added = 0
         removed = 0
@@ -187,6 +196,18 @@ class PatchApplyResult:
         if self.stdout:
             parts.append(self.stdout)
         return "\n".join(part for part in parts if part).strip()
+
+
+@dataclass
+class PatchContextCheckResult:
+    """Result of checking whether patch hunk context matches repository files."""
+
+    success: bool
+    diagnostic: str = ""
+    file_path: str = ""
+    hunk_header: str = ""
+    expected_line: str = ""
+    actual_line: str = ""
 
 
 @dataclass

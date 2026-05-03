@@ -7,6 +7,7 @@ running tests, and applying patches.
 
 import logging
 import os
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -15,7 +16,14 @@ from typing import List, Optional
 from git import Repo
 from git.exc import GitCommandError
 
-from src.environment.models import Issue, PatchApplyResult, RepoState, TestResult
+from src.environment.models import (
+    Issue,
+    PatchApplyResult,
+    PatchContextCheckResult,
+    RepoState,
+    TestResult,
+    normalize_patch_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +129,7 @@ class ProjectEnvironment:
         file_path: str,
         start_line: int = 1,
         end_line: Optional[int] = None,
+        include_line_numbers: bool = False,
     ) -> str:
         """
         Read specific lines from a file.
@@ -129,6 +138,7 @@ class ProjectEnvironment:
             file_path: Relative path to the file.
             start_line: Starting line number (1-indexed).
             end_line: Ending line number (inclusive). None means end of file.
+            include_line_numbers: Prefix returned lines with 1-indexed line numbers.
             
         Returns:
             Selected lines as string.
@@ -138,8 +148,15 @@ class ProjectEnvironment:
         
         start_idx = max(0, start_line - 1)
         end_idx = end_line if end_line else len(lines)
+        selected = lines[start_idx:end_idx]
+
+        if include_line_numbers:
+            return "\n".join(
+                f"{start_idx + offset + 1:5d}: {line}"
+                for offset, line in enumerate(selected)
+            )
         
-        return "\n".join(lines[start_idx:end_idx])
+        return "\n".join(selected)
     
     def list_files(self, pattern: str = "**/*.py") -> List[str]:
         """
@@ -156,6 +173,135 @@ class ProjectEnvironment:
             if path.is_file() and ".git" not in str(path):
                 files.append(str(path.relative_to(self.repo_path)))
         return sorted(files)
+
+    def check_patch_context(self, patch_content: str) -> PatchContextCheckResult:
+        """
+        Check that each unified diff hunk's old-side context matches files.
+
+        This catches LLM-generated hunks whose context is stale, truncated, or
+        fabricated before lenient patch application can place them incorrectly.
+        """
+        patch_content = normalize_patch_text(patch_content)
+        hunk_header = re.compile(
+            r"^@@ -(?P<old_start>\d+)(?:,(?P<old_count>\d+))? "
+            r"\+(?P<new_start>\d+)(?:,(?P<new_count>\d+))? @@"
+        )
+        lines = patch_content.splitlines()
+        old_file_path = ""
+        file_path = ""
+        i = 0
+
+        while i < len(lines):
+            line = lines[i]
+            if line.startswith("--- "):
+                old_file_path = self._diff_path_to_repo_path(line[4:].strip())
+                i += 1
+                continue
+            if line.startswith("+++ "):
+                file_path = self._diff_path_to_repo_path(line[4:].strip()) or old_file_path
+                i += 1
+                continue
+
+            match = hunk_header.match(line)
+            if not match:
+                i += 1
+                continue
+
+            header = line
+            if not file_path:
+                return PatchContextCheckResult(
+                    success=False,
+                    diagnostic=f"Hunk has no target file header: {header}",
+                    hunk_header=header,
+                )
+
+            old_start = int(match.group("old_start"))
+            old_count = int(match.group("old_count") or "1")
+            old_lines: list[str] = []
+            i += 1
+
+            while i < len(lines) and not hunk_header.match(lines[i]) \
+                    and not lines[i].startswith("diff --git ") \
+                    and not lines[i].startswith("--- ") \
+                    and not lines[i].startswith("+++ "):
+                hunk_line = lines[i]
+                if hunk_line.startswith("\\"):
+                    i += 1
+                    continue
+                if not hunk_line:
+                    return PatchContextCheckResult(
+                        success=False,
+                        diagnostic=(
+                            "Malformed hunk body line without unified diff prefix "
+                            f"in {file_path}: {header}"
+                        ),
+                        file_path=file_path,
+                        hunk_header=header,
+                    )
+                prefix = hunk_line[0]
+                if prefix in {" ", "-"}:
+                    old_lines.append(hunk_line[1:])
+                elif prefix != "+":
+                    return PatchContextCheckResult(
+                        success=False,
+                        diagnostic=(
+                            f"Invalid hunk line prefix {prefix!r} in "
+                            f"{file_path}: {header}"
+                        ),
+                        file_path=file_path,
+                        hunk_header=header,
+                    )
+                i += 1
+
+            if old_count == 0 and not old_lines:
+                continue
+
+            try:
+                actual_file_lines = self.get_file_content(file_path).splitlines()
+            except FileNotFoundError:
+                return PatchContextCheckResult(
+                    success=False,
+                    diagnostic=f"Patch references missing file: {file_path}",
+                    file_path=file_path,
+                    hunk_header=header,
+                )
+
+            start_idx = max(0, old_start - 1)
+            actual_lines = actual_file_lines[start_idx:start_idx + len(old_lines)]
+            if actual_lines != old_lines:
+                mismatch_idx = self._first_mismatch_index(old_lines, actual_lines)
+                expected = old_lines[mismatch_idx] if mismatch_idx < len(old_lines) else ""
+                actual = actual_lines[mismatch_idx] if mismatch_idx < len(actual_lines) else "<EOF>"
+                line_no = old_start + mismatch_idx
+                return PatchContextCheckResult(
+                    success=False,
+                    diagnostic=(
+                        f"Patch context mismatch in {file_path} at line {line_no}. "
+                        f"Hunk: {header}. Expected old-side line {expected!r}, "
+                        f"actual file line is {actual!r}."
+                    ),
+                    file_path=file_path,
+                    hunk_header=header,
+                    expected_line=expected,
+                    actual_line=actual,
+                )
+
+        return PatchContextCheckResult(success=True)
+
+    @staticmethod
+    def _diff_path_to_repo_path(diff_path: str) -> str:
+        if diff_path in {"/dev/null", "dev/null"}:
+            return ""
+        if diff_path.startswith("a/") or diff_path.startswith("b/"):
+            return diff_path[2:]
+        return diff_path
+
+    @staticmethod
+    def _first_mismatch_index(expected: list[str], actual: list[str]) -> int:
+        for idx, expected_line in enumerate(expected):
+            if idx >= len(actual) or actual[idx] != expected_line:
+                return idx
+        return len(expected)
     
     @staticmethod
     def _fix_hunk_counts(patch_content: str) -> str:
@@ -166,7 +312,7 @@ class ProjectEnvironment:
         This function parses each hunk, counts the actual old/new lines,
         and rewrites the headers so that tools like git-apply accept them.
         """
-        import re
+        patch_content = normalize_patch_text(patch_content)
         # Capture: old_start, new_start, and optional trailing function hint
         # e.g.  "@@ -78,6 +78,15 @@ def foo" -> groups: "78", "78", " @@ def foo"
         hunk_header = re.compile(
@@ -219,6 +365,8 @@ class ProjectEnvironment:
         Returns:
             PatchApplyResult with success state, strategy, and command diagnostics.
         """
+        patch_content = normalize_patch_text(patch_content)
+
         if not patch_content.strip():
             logger.warning("Empty patch content, nothing to apply")
             return PatchApplyResult(

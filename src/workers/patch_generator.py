@@ -10,7 +10,7 @@ import re
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from src.environment.models import ExecutionContext, PatchInfo
+from src.environment.models import ExecutionContext, PatchInfo, normalize_patch_text
 from src.environment.project_env import ProjectEnvironment
 from src.llm.client import LLMClient
 from src.workers.base import BaseWorker, WorkerResult
@@ -78,6 +78,7 @@ Key rules:
    - `old_count` = number of context lines + number of removed lines
    - `new_count` = number of context lines + number of added lines
 3. Include 3 context lines before and after each change
+4. The final patch string MUST end with a newline character
 
 ## Guidelines
 
@@ -87,7 +88,9 @@ Key rules:
 4. Include sufficient context lines (3 lines before and after each change)
 5. If multiple files need changes, include all diffs in one patch string
 6. Test your logic mentally before generating the patch
-7. If this is a retry, avoid the same mistakes from previous attempts"""
+7. If this is a retry, avoid the same mistakes from previous attempts
+8. Code excerpts may include line-number prefixes for reference only; do NOT
+   copy those line-number prefixes into the patch body"""
 
 
 class PatchGenerator(BaseWorker):
@@ -165,26 +168,74 @@ class PatchGenerator(BaseWorker):
                     parts.append(f"\n### {loc}")
                     parts.append(f"```python\n{code}\n```")
         
-        # Fetch full file content for suspected files
-        if inspection_result and inspection_result.suspected_files:
-            parts.append("\n## Full File Contents:")
-            for file_path in inspection_result.suspected_files[:3]:
-                try:
-                    content = self.env.get_file_content(file_path)
-                    # Limit content size
-                    if len(content) > 5000:
-                        content = content[:5000] + "\n... (truncated)"
-                    parts.append(f"\n### {file_path}")
-                    parts.append(f"```python\n{content}\n```")
-                except FileNotFoundError:
-                    self.logger.warning(f"File not found: {file_path}")
-                except Exception as e:
-                    self.logger.warning(f"Error reading {file_path}: {e}")
+        if inspection_result:
+            focused_context = self._build_focused_code_context(inspection_result)
+            if focused_context:
+                parts.append("\n## Focused Code Context With Line Numbers")
+                parts.append(
+                    "Use these exact line numbers to build hunk headers. "
+                    "Do not include the numeric prefixes in the diff itself."
+                )
+                parts.extend(focused_context)
         
         parts.append("\n## Task")
         parts.append("Generate a minimal patch in unified diff format to fix this issue.")
         
         return "\n".join(parts)
+
+    def _build_focused_code_context(
+        self,
+        inspection_result: InspectionResult,
+    ) -> List[str]:
+        """Build targeted source excerpts around suspected locations."""
+        parts: List[str] = []
+        seen_ranges: set[tuple[str, int, int]] = set()
+
+        for location in inspection_result.suspected_locations[:5]:
+            file_path = location.file_path
+            if not file_path:
+                continue
+
+            start = max(1, location.start_line - 50)
+            end = (location.end_line or location.start_line) + 50
+            key = (file_path, start, end)
+            if key in seen_ranges:
+                continue
+            seen_ranges.add(key)
+
+            try:
+                content = self.env.get_file_content_with_lines(
+                    file_path,
+                    start_line=start,
+                    end_line=end,
+                    include_line_numbers=True,
+                )
+                parts.append(f"\n### {file_path}:{start}-{end}")
+                parts.append(f"```python\n{content}\n```")
+            except FileNotFoundError:
+                self.logger.warning(f"File not found: {file_path}")
+            except Exception as e:
+                self.logger.warning(f"Error reading {file_path}: {e}")
+
+        if parts:
+            return parts
+
+        for file_path in inspection_result.suspected_files[:3]:
+            try:
+                content = self.env.get_file_content_with_lines(
+                    file_path,
+                    start_line=1,
+                    end_line=160,
+                    include_line_numbers=True,
+                )
+                parts.append(f"\n### {file_path}:1-160")
+                parts.append(f"```python\n{content}\n```")
+            except FileNotFoundError:
+                self.logger.warning(f"File not found: {file_path}")
+            except Exception as e:
+                self.logger.warning(f"Error reading {file_path}: {e}")
+
+        return parts
     
     def _build_retry_context(self, context: ExecutionContext) -> str:
         """Build context for retry attempts."""
@@ -240,7 +291,7 @@ class PatchGenerator(BaseWorker):
                 data = json.loads(json_str)
                 patch = data.get("patch", "")
                 # Unescape newlines if needed
-                patch = patch.replace("\\n", "\n")
+                patch = normalize_patch_text(patch.replace("\\n", "\n"))
                 
                 return PatchResult(
                     patch_content=patch,
@@ -253,7 +304,7 @@ class PatchGenerator(BaseWorker):
         # Fallback: try to extract diff directly
         diff_match = re.search(r'```(?:diff)?\s*(---.*?)\s*```', content, re.DOTALL)
         if diff_match:
-            patch = diff_match.group(1)
+            patch = normalize_patch_text(diff_match.group(1))
             patch_info = PatchInfo.from_diff(patch)
             return PatchResult(
                 patch_content=patch,
@@ -265,7 +316,7 @@ class PatchGenerator(BaseWorker):
         diff_pattern = r'(--- a/.*?\n\+\+\+ b/.*?\n@@.*?(?:\n[-+ ].*)*)'
         diff_match = re.search(diff_pattern, content, re.DOTALL)
         if diff_match:
-            patch = diff_match.group(1)
+            patch = normalize_patch_text(diff_match.group(1))
             patch_info = PatchInfo.from_diff(patch)
             return PatchResult(
                 patch_content=patch,

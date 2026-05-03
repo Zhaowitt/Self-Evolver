@@ -75,6 +75,12 @@ class LLMJudge(BaseWorker):
 
     def execute(self, context: ExecutionContext, iteration_record=None) -> WorkerResult[JudgeDecision]:
         """Judge the failed attempt and choose the next retry route."""
+        if iteration_record and iteration_record.verification_result:
+            status = iteration_record.verification_result.status.value
+            if status in {"patch_failed", "patch_context_mismatch", "no_changes", "empty_patch"}:
+                decision = self._fallback_decision(iteration_record)
+                return WorkerResult(success=True, data=decision)
+
         try:
             user_message = self._build_prompt(context, iteration_record)
             response = self._call_llm(user_message)
@@ -202,12 +208,17 @@ class LLMJudge(BaseWorker):
         verification = iteration_record.verification_result
         if verification:
             status = verification.status.value
-            if status in {"patch_failed", "no_changes"}:
+            if status in {"patch_failed", "patch_context_mismatch", "no_changes"}:
                 return JudgeDecision(
-                    failure_category="patch_apply_failure",
+                    failure_category=(
+                        "patch_context_mismatch"
+                        if status == "patch_context_mismatch"
+                        else "patch_apply_failure"
+                    ),
                     route=JudgeRoute.REPAIR_PATCH_FORMAT,
                     feedback_for_next_attempt=(
-                        "Repair the unified diff format, file paths, and hunk context. "
+                        "Repair the unified diff format, file paths, and hunk context "
+                        "so the old-side context exactly matches the current files. "
                         "Preserve the intended code change."
                     ),
                     confidence=0.6,

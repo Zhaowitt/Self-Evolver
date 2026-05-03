@@ -18,7 +18,7 @@ from rich.table import Table
 
 from src.config import get_config
 from src.critic.judge import CriticJudge
-from src.environment.models import Issue
+from src.environment.models import Issue, normalize_patch_text
 from src.environment.project_env import ProjectEnvironment
 from src.orchestrator.orchestrator import ExecutionOrchestrator, ExecutionResult
 
@@ -132,7 +132,10 @@ def fix(ctx, repo, issue, issue_id, max_iterations, test_cmd, output):
             "iterations_used": result.iterations_used,
             "total_tokens": result.total_tokens,
             "total_duration_ms": result.total_duration_ms,
-            "final_patch": result.final_patch.content if result.final_patch else None,
+            "final_patch": (
+                normalize_patch_text(result.final_patch.content)
+                if result.final_patch else None
+            ),
             "evaluation": {
                 "success": evaluation.success,
                 "failure_type": evaluation.failure_type.value,
