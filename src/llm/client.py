@@ -19,19 +19,22 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Message:
     """A single message in a conversation."""
-    
-    role: str  # "system", "user", "assistant"
-    content: str
+
+    role: str  # "system", "user", "assistant", or "tool"
+    content: str = ""
+    tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+    tool_call_id: Optional[str] = None
 
 
 @dataclass
 class LLMResponse:
     """Response from LLM API call."""
-    
+
     content: str
     model: str
     usage: Dict[str, int] = field(default_factory=dict)
     finish_reason: Optional[str] = None
+    tool_calls: List[Dict[str, Any]] = field(default_factory=list)
     
     @property
     def prompt_tokens(self) -> int:
@@ -119,8 +122,15 @@ class LLMClient:
         temperature = temperature if temperature is not None else self.config.temperature
         max_tokens = max_tokens or self.config.max_tokens
         
-        # Convert Message objects to dicts
-        message_dicts = [{"role": m.role, "content": m.content} for m in messages]
+        # Convert Message objects to OpenAI chat message dicts.
+        message_dicts: List[Dict[str, Any]] = []
+        for message in messages:
+            item: Dict[str, Any] = {"role": message.role, "content": message.content}
+            if message.tool_calls:
+                item["tool_calls"] = message.tool_calls
+            if message.tool_call_id:
+                item["tool_call_id"] = message.tool_call_id
+            message_dicts.append(item)
         
         logger.debug(f"Sending chat request to {model} with {len(messages)} messages")
         
@@ -134,6 +144,17 @@ class LLMClient:
         
         # Extract response data
         choice = response.choices[0]
+        response_message = choice.message
+        tool_calls = []
+        for tool_call in response_message.tool_calls or []:
+            tool_calls.append({
+                "id": tool_call.id,
+                "type": tool_call.type,
+                "function": {
+                    "name": tool_call.function.name,
+                    "arguments": tool_call.function.arguments,
+                },
+            })
         usage = {
             "prompt_tokens": response.usage.prompt_tokens,
             "completion_tokens": response.usage.completion_tokens,
@@ -146,10 +167,11 @@ class LLMClient:
         logger.debug(f"Received response: {usage.get('total_tokens', 0)} tokens used")
         
         return LLMResponse(
-            content=choice.message.content or "",
+            content=response_message.content or "",
             model=response.model,
             usage=usage,
             finish_reason=choice.finish_reason,
+            tool_calls=tool_calls,
         )
     
     def chat_with_system(

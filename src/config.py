@@ -41,6 +41,15 @@ class AgentConfig(BaseModel):
     timeout_seconds: int = Field(
         default_factory=lambda: int(os.getenv("AGENT_TIMEOUT", "300"))
     )
+    inspector_max_tool_calls: int = Field(
+        default_factory=lambda: int(os.getenv("INSPECTOR_MAX_TOOL_CALLS", "8"))
+    )
+    inspector_read_max_lines: int = Field(
+        default_factory=lambda: int(os.getenv("INSPECTOR_READ_MAX_LINES", "400"))
+    )
+    inspector_read_max_chars: int = Field(
+        default_factory=lambda: int(os.getenv("INSPECTOR_READ_MAX_CHARS", "20000"))
+    )
 
 
 class EnvironmentConfig(BaseModel):
