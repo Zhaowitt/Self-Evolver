@@ -19,10 +19,17 @@ from typing import Dict, List, Optional
 
 from src.benchmark.base import BenchmarkRunner, InstanceResult
 from src.config import get_config
+from src.controller.controller_client import ControllerClient
+from src.controller.schema import ControllerSignal
 from src.critic.judge import CriticJudge
 from src.environment.models import Issue
 from src.environment.project_env import ProjectEnvironment
+from src.memory.memory_retriever import MemoryRetriever
 from src.orchestrator.orchestrator import ExecutionOrchestrator
+from src.reward.reward_model import RewardModel
+from src.rl.rollout_writer import RolloutWriter, build_rollout_record
+from src.skills.skill_evolver import SkillEvolver
+from src.skills.skill_selector import SkillSelector
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +49,10 @@ class SWEBenchRunner(BenchmarkRunner):
         workspace_dir: Optional[Path] = None,
         model_name: str = "self-evolver",
         run_id: str = "self-evolver",
+        controller_mode: str = "off",
+        controller_stage: str = "eval",
+        rollout_jsonl: Optional[Path] = None,
+        reward_config: Optional[Path] = None,
     ):
         """
         Initialize SWE-bench runner.
@@ -59,6 +70,22 @@ class SWEBenchRunner(BenchmarkRunner):
         self.run_id = run_id
         self.judge = CriticJudge()
         self._dataset = None
+        self.controller_mode = controller_mode
+        self.controller_stage = controller_stage
+        self.controller_client = (
+            ControllerClient(mode=controller_mode)
+            if controller_mode != "off"
+            else None
+        )
+        self.skill_selector = SkillSelector()
+        self.skill_evolver = SkillEvolver() if controller_mode != "off" else None
+        self.reward_model = RewardModel.from_config_file(reward_config)
+        if rollout_jsonl:
+            self.rollout_writer = RolloutWriter(rollout_jsonl)
+        elif controller_mode != "off":
+            self.rollout_writer = RolloutWriter(self.output_dir / "rollouts.jsonl")
+        else:
+            self.rollout_writer = None
     
     def _load_dataset(self, split: str = "test"):
         """Load the SWE-bench dataset from HuggingFace."""
@@ -173,15 +200,18 @@ class SWEBenchRunner(BenchmarkRunner):
                 env.test_cmd = test_cmd
 
             # Run the orchestrator
+            controller_signal = self._build_controller_signal(issue)
             orchestrator = ExecutionOrchestrator(
                 env=env,
                 max_iterations=get_config().agent.max_iterations,
+                controller_signal=controller_signal,
             )
 
             result = orchestrator.run(issue)
 
             # Evaluate
             evaluation = self.judge.evaluate(result)
+            self._write_rollout(issue, controller_signal, result, evaluation)
 
             return InstanceResult(
                 instance_id=issue.id,
@@ -248,12 +278,16 @@ class SWEBenchRunner(BenchmarkRunner):
             if test_cmd:
                 env.test_cmd = test_cmd
 
+            controller_signal = self._build_controller_signal(issue)
             orchestrator = ExecutionOrchestrator(
                 env=env,
                 max_iterations=get_config().agent.max_iterations,
+                controller_signal=controller_signal,
             )
             result = orchestrator.run(issue)
             patch = self._prediction_patch_from_execution(result)
+            evaluation = self.judge.evaluate(result)
+            self._write_rollout(issue, controller_signal, result, evaluation)
             self.logger.info(
                 f"Generated prediction for {issue.id}: "
                 f"{len(patch)} chars, success={result.success}"
@@ -269,6 +303,65 @@ class SWEBenchRunner(BenchmarkRunner):
             "model_name_or_path": model_name,
             "model_patch": patch,
         }
+
+    def _build_controller_signal(self, issue: Issue) -> Optional[ControllerSignal]:
+        """Generate optional controller guidance for an issue."""
+        if not self.controller_client:
+            return None
+        hard_cases = self._retrieve_hard_cases(issue)
+        memory_query = " ".join(
+            str(item.get("failure_type", "")) for item in hard_cases
+        )
+        selected_skills = self.skill_selector.select_many(
+            memory_query=memory_query or issue.description,
+            limit=2,
+        )
+        return self.controller_client.generate(
+            issue,
+            stage=self.controller_stage,
+            skills=selected_skills,
+            hard_cases=hard_cases,
+        )
+
+    def _retrieve_hard_cases(self, issue: Issue) -> List[dict]:
+        """Fetch similar hard cases if a buffer exists."""
+        path = get_config().environment.workspace_dir / "hard_cases.jsonl"
+        if not path.exists():
+            return []
+        retriever = MemoryRetriever(path)
+        return [
+            record.to_dict()
+            for record in retriever.retrieve(repo_name=issue.repo_name, limit=3)
+        ]
+
+    def _write_rollout(
+        self,
+        issue: Issue,
+        controller_signal: Optional[ControllerSignal],
+        result,
+        evaluation=None,
+    ) -> None:
+        """Write one rollout record when rollout logging is enabled."""
+        if not self.rollout_writer:
+            return
+        evaluation = evaluation or self.judge.evaluate(result)
+        reward = self.reward_model.score(result, controller_signal=controller_signal)
+        skill_evolution = None
+        if self.skill_evolver and controller_signal:
+            skill_evolution = self.skill_evolver.update_from_rollout(
+                controller_signal,
+                reward,
+            )
+        self.rollout_writer.append(
+            build_rollout_record(
+                issue,
+                controller_signal,
+                result,
+                evaluation=evaluation,
+                reward=reward,
+                skill_evolution=skill_evolution,
+            )
+        )
 
     def generate_predictions(
         self,
@@ -689,6 +782,10 @@ def create_swebench_runner(
     workspace_dir: Optional[Path] = None,
     model_name: str = "self-evolver",
     run_id: str = "self-evolver",
+    controller_mode: str = "off",
+    controller_stage: str = "eval",
+    rollout_jsonl: Optional[Path] = None,
+    reward_config: Optional[Path] = None,
 ) -> SWEBenchRunner:
     """
     Factory function to create a SWE-bench runner.
@@ -716,4 +813,8 @@ def create_swebench_runner(
         workspace_dir=workspace_dir,
         model_name=model_name,
         run_id=run_id,
+        controller_mode=controller_mode,
+        controller_stage=controller_stage,
+        rollout_jsonl=rollout_jsonl,
+        reward_config=reward_config,
     )

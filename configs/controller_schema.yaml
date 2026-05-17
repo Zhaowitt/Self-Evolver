@@ -1,0 +1,30 @@
+schema_version: controller_signal_v1
+allowed_modes:
+  - train
+  - eval
+allowed_difficulties:
+  - easy
+  - medium
+  - hard
+required_output_fields:
+  - task_wrapper
+  - selected_skill_ids
+  - skill
+  - skills
+  - strategy
+  - memory_query
+  - target_failure_type
+  - difficulty
+  - skill_updates
+mode_rules:
+  train_task_wrapper: allowed
+  eval_task_wrapper: must_be_null
+skill_updates:
+  operations:
+    - create
+    - update
+    - deprecate
+  sources:
+    - controller
+    - hard_case
+  max_selected_skills: 2

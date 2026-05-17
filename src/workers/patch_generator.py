@@ -10,6 +10,7 @@ import re
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+from src.controller.injection import format_controller_guidance
 from src.environment.models import ExecutionContext, PatchInfo
 from src.environment.project_env import ProjectEnvironment
 from src.llm.client import LLMClient
@@ -145,6 +146,12 @@ class PatchGenerator(BaseWorker):
         
         parts.append("## Issue Description")
         parts.append(context.issue.description)
+
+        controller_guidance = format_controller_guidance(
+            context.metadata.get("controller_signal")
+        )
+        if controller_guidance:
+            parts.append("\n" + controller_guidance)
         
         if inspection_result:
             parts.append("\n## Fault Localization Results")

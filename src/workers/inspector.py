@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from src.config import get_config
+from src.controller.injection import format_controller_guidance
 from src.environment.models import CodeLocation, ExecutionContext
 from src.environment.project_env import ProjectEnvironment
 from src.llm.client import LLMClient, LLMResponse, Message
@@ -134,6 +135,12 @@ class Inspector(BaseWorker):
         parts = []
         parts.append("## Issue Description")
         parts.append(context.issue.description)
+
+        controller_guidance = format_controller_guidance(
+            context.metadata.get("controller_signal")
+        )
+        if controller_guidance:
+            parts.append("\n" + controller_guidance)
         
         if context.issue.hints:
             parts.append("\n## Hints")
@@ -508,11 +515,12 @@ class Inspector(BaseWorker):
         """Normalize ripgrep output to repo-relative paths."""
         formatted = []
         for line in output.splitlines()[:max_matches]:
-            file_part, sep, rest = line.partition(":")
-            if sep:
+            parts = line.rsplit(":", 2)
+            if len(parts) == 3:
+                file_part, line_no, rest = parts
                 try:
                     rel = self._repo_relative(Path(file_part).resolve())
-                    formatted.append(f"{rel}:{rest}")
+                    formatted.append(f"{rel}:{line_no}:{rest}")
                     continue
                 except ValueError:
                     pass

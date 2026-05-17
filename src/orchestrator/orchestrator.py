@@ -5,15 +5,14 @@ Manages the execution flow: Inspector -> Patch Generator -> Verifier
 with retry logic on failures.
 """
 
-import json
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from src.config import get_config
+from src.controller.schema import controller_signal_from_any
 from src.environment.models import (
     ExecutionContext,
     Issue,
@@ -21,6 +20,7 @@ from src.environment.models import (
 )
 from src.environment.project_env import ProjectEnvironment
 from src.llm.client import LLMClient
+from src.memory.hard_case_buffer import HardCaseBuffer
 from src.workers.inspector import Inspector, InspectionResult
 from src.workers.llm_judge import JudgeDecision, JudgeRoute, LLMJudge
 from src.workers.patch_generator import PatchGenerator, PatchResult
@@ -94,6 +94,7 @@ class ExecutionOrchestrator:
         env: ProjectEnvironment,
         llm_client: Optional[LLMClient] = None,
         max_iterations: Optional[int] = None,
+        controller_signal: Optional[Any] = None,
     ):
         """
         Initialize the orchestrator.
@@ -106,6 +107,7 @@ class ExecutionOrchestrator:
         self.env = env
         self.llm_client = llm_client or LLMClient()
         self.max_iterations = max_iterations or get_config().agent.max_iterations
+        self.controller_signal = controller_signal_from_any(controller_signal)
         
         # Initialize workers with shared LLM client
         self.inspector = Inspector(env, self.llm_client)
@@ -138,6 +140,8 @@ class ExecutionOrchestrator:
             repo_state=repo_state,
             max_iterations=self.max_iterations,
         )
+        if self.controller_signal:
+            context.metadata["controller_signal"] = self.controller_signal.to_dict()
         
         # Set up environment for the issue
         if not self.env.setup_issue(issue):
@@ -231,6 +235,7 @@ class ExecutionOrchestrator:
                         total_duration_ms=total_duration,
                         final_patch=final_patch,
                         iteration_records=iteration_records,
+                        metadata=self._base_result_metadata(),
                     )
                 
                 # Verification failed - prepare for retry
@@ -283,7 +288,11 @@ class ExecutionOrchestrator:
                 "LLM judge routed this issue to hard-case buffer"
                 if hard_case else f"Failed after {self.max_iterations} iterations"
             ),
-            metadata={"hard_case": hard_case, "last_route": next_route.value},
+            metadata={
+                **self._base_result_metadata(),
+                "hard_case": hard_case,
+                "last_route": next_route.value,
+            },
         )
 
     def _judge_failed_attempt(
@@ -315,39 +324,38 @@ class ExecutionOrchestrator:
         """Append a compact hard-case record for later failure analysis."""
         try:
             output_path = get_config().environment.workspace_dir / "hard_cases.jsonl"
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            payload = {
-                "issue_id": issue.id,
-                "repo_name": issue.repo_name,
-                "base_commit": issue.base_commit,
-                "reason": reason,
-                "created_at": datetime.now().isoformat(),
-                "iterations": len(records),
-                "routes": [
-                    record.judge_decision.route.value
-                    for record in records
-                    if record.judge_decision
-                ],
-                "errors": [
-                    record.error
-                    for record in records
-                    if record.error
-                ],
-                "verification_statuses": [
-                    record.verification_result.status.value
-                    for record in records
-                    if record.verification_result
-                ],
-                "patch_apply_strategies": [
-                    record.verification_result.patch_apply_result.strategy
-                    for record in records
-                    if record.verification_result and record.verification_result.patch_apply_result
-                ],
-            }
-            with output_path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            HardCaseBuffer(output_path).append_from_execution(
+                issue=issue,
+                records=records,
+                reason=reason,
+                failure_type=self._hard_case_failure_type(records),
+                metadata=self._base_result_metadata(),
+            )
         except Exception as e:
             self.logger.warning(f"Failed to write hard-case record: {e}")
+
+    def _base_result_metadata(self) -> Dict[str, Any]:
+        """Metadata shared by success, failure, hard-case, and rollout paths."""
+        if not self.controller_signal:
+            return {}
+        return {"controller_signal": self.controller_signal.to_dict()}
+
+    @staticmethod
+    def _hard_case_failure_type(records: List[IterationRecord]) -> str:
+        """Map the last verifier status to the normalized hard-case taxonomy."""
+        for record in reversed(records):
+            if record.verification_result:
+                status = record.verification_result.status.value
+                if status in {"patch_failed", "no_changes"}:
+                    return "patch_application_error"
+                if status == "empty_patch":
+                    return "patch_generation_error"
+                if status == "tests_failed":
+                    return "test_failure"
+                if status == "new_issues":
+                    return "regression_introduced"
+                return status
+        return "unknown"
     
     def run_single_iteration(
         self,

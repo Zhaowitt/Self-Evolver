@@ -7,7 +7,15 @@ from src.environment.models import (
     RepoState,
     TestResult,
 )
-from src.environment.project_env import ProjectEnvironment
+
+
+def __getattr__(name):
+    """Lazily import heavier environment helpers only when requested."""
+    if name == "ProjectEnvironment":
+        from src.environment.project_env import ProjectEnvironment
+
+        return ProjectEnvironment
+    raise AttributeError(name)
 
 __all__ = [
     "ProjectEnvironment",

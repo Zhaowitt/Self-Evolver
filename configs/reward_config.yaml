@@ -1,0 +1,11 @@
+max_reasonable_files: 5
+cost_token_budget: 50000
+weights:
+  patch_applies_cleanly: 0.15
+  non_empty_canonical_diff: 0.15
+  tests_pass: 0.35
+  avoids_patch_apply_error: 0.10
+  reasonable_file_count: 0.10
+  follows_task_wrapper_constraints: 0.05
+  avoids_timeout: 0.05
+  cost_efficiency: 0.05

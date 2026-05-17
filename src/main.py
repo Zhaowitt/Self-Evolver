@@ -262,6 +262,30 @@ def config_info(ctx):
 @click.option("--eval-workers", default=2, help="Parallel workers for official evaluation")
 @click.option("--resume/--no-resume", default=True, help="Resume from existing predictions")
 @click.option(
+    "--controller-mode",
+    default="off",
+    type=click.Choice(["off", "mock", "template", "llm"]),
+    help="Optional upstream Controller mode for worker guidance",
+)
+@click.option(
+    "--controller-stage",
+    default="eval",
+    type=click.Choice(["train", "eval"]),
+    help="Controller safety stage; eval disables task wrappers",
+)
+@click.option(
+    "--rollout-jsonl",
+    default=None,
+    type=click.Path(),
+    help="Optional rollout JSONL path (defaults to output-dir/rollouts.jsonl when Controller is enabled)",
+)
+@click.option(
+    "--reward-config",
+    default=None,
+    type=click.Path(exists=True),
+    help="Optional reward config file",
+)
+@click.option(
     "--cleanup-images/--no-cleanup-images",
     default=True,
     help="Clean SWE-bench Docker env/eval images after each repo batch",
@@ -286,6 +310,10 @@ def benchmark(
     agent_workers,
     eval_workers,
     resume,
+    controller_mode,
+    controller_stage,
+    rollout_jsonl,
+    reward_config,
     cleanup_images,
     cleanup_repos,
 ):
@@ -296,6 +324,7 @@ def benchmark(
         console.print(f"Instances: {num_instances}")
     console.print(f"Split: {split}")
     console.print(f"Phase: {phase}")
+    console.print(f"Controller: {controller_mode} ({controller_stage})")
     console.print()
 
     # Check API key only for phases that generate patches.
@@ -318,6 +347,10 @@ def benchmark(
         workspace_dir=Path(workspace_dir) if workspace_dir else None,
         model_name=model_name,
         run_id=run_id,
+        controller_mode=controller_mode,
+        controller_stage=controller_stage,
+        rollout_jsonl=Path(rollout_jsonl) if rollout_jsonl else None,
+        reward_config=Path(reward_config) if reward_config else None,
     )
 
     if phase == "legacy":

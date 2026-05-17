@@ -1,0 +1,8 @@
+skill_similarity_threshold: 0.88
+skill_write_reward_threshold: 0.75
+skill_deprecate_reward_threshold: 0.35
+skill_deprecate_min_usage: 5
+max_selected_skills: 2
+metadata_path: skills/metadata.json
+archive_dir: skills/_archive
+write_policy: reward_gated
