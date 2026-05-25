@@ -24,12 +24,12 @@ provide task wrappers, strategy cues, memory cues, and skill-selection signals.
 - `CriticJudge`: rule-based execution evaluation and failure summary.
 - `SWEBenchRunner`: prediction generation, official SWE-bench evaluation,
   Docker cleanup, and infra/patch error separation.
-- `Controller`: optional upstream guidance generator for worker prompts. It can
-  run in `off`, `mock`, `template`, or OpenAI-compatible `llm` mode.
+- `Controller`: optional upstream guidance generator for worker prompts. It
+  runs in `off` or OpenAI-compatible `llm` mode.
 - `SkillBank` / `SkillEvolver`: seed skill loading, skill selection, reward
   tracking, and reward-gated skill create/update/deprecate proposals.
-- `RewardModel` / rollout logging: execution-derived reward components and
-  JSONL rollout records for EasyR1-style training/debugging.
+- `RewardModel` / online reward: execution-derived reward components, JSONL
+  rollout logging, and an EasyR1 callable reward function.
 
 ## Repository Layout
 
@@ -42,8 +42,8 @@ src/
   llm/             OpenAI-compatible LLM client
   memory/          Hard-case buffer and retrieval helpers
   orchestrator/    repair loop coordination and retry routing
-  reward/          Reward components and EasyR1 reward adapter
-  rl/              Rollout writer and EasyR1 dataset adapter
+  reward/          Reward components and online EasyR1 reward function
+  rl/              Online rollout runner, rollout writer, and EasyR1 prompt dataset
   skills/          Skill bank, selector, dedup, stats, and evolution logic
   workers/         Inspector, PatchGenerator, Verifier, LLMJudge
 configs/           Controller, reward, skill evolution, and EasyR1 examples
@@ -158,19 +158,6 @@ Training/evolution mode may use a `task_wrapper` to guide how the worker solves
 an existing task. Evaluation mode keeps the benchmark issue fixed and forces
 `task_wrapper` to `null`; only skill, strategy, and memory cues are allowed.
 
-Run a small mock-controller training rollout:
-
-```bash
-python -m src.main benchmark \
-  --dataset lite \
-  --split train \
-  --num-instances 1 \
-  --controller-mode mock \
-  --controller-stage train \
-  --rollout-jsonl benchmark_results/rollouts.jsonl \
-  --reward-config configs/reward_config.yaml
-```
-
 Use a vLLM-served Controller:
 
 ```bash
@@ -184,7 +171,7 @@ python -m src.main benchmark \
 
 Relevant benchmark options:
 
-- `--controller-mode off|mock|template|llm`
+- `--controller-mode off|llm`
 - `--controller-stage train|eval`
 - `--rollout-jsonl PATH`
 - `--reward-config PATH`
@@ -200,27 +187,62 @@ Key defaults are in:
 - `configs/controller_schema.yaml`
 - `configs/reward_config.yaml`
 - `configs/skill_evolution.yaml`
-- `configs/easyr1_grpo_example.yaml`
+- `configs/easyr1_online_grpo_example.yaml`
 
 ## EasyR1 Integration
 
-This repo does not embed EasyR1 training. It exposes rollout and reward files
-that can be consumed by an external EasyR1 pipeline.
+This repo does not embed EasyR1 training. It exposes full Controller prompt
+datasets and an online reward function that EasyR1 can call during GRPO.
+Rollout JSONL files are execution logs only; they are not the reward source.
 
-Convert rollout rewards:
+Build a SWE-bench train prompt dataset:
 
 ```bash
-python -m src.reward.easyr1_adapter \
-  --input benchmark_results/rollouts.jsonl \
-  --output benchmark_results/rewards.jsonl \
-  --config configs/reward_config.yaml
+python -m src.rl.easyr1_dataset \
+  --dataset lite \
+  --split train \
+  --num-instances 20 \
+  --stage train \
+  --workspace-root /path/to/reward_workspace \
+  --output benchmark_results/controller_train.jsonl
 ```
 
-Dataset conversion helpers live in `src/rl/easyr1_dataset.py`. A typical loop is:
+Each JSONL row contains:
+
+- `prompt`: JSON-encoded chat messages with the exact Controller system and
+  user prompt.
+- `ground_truth`: serialized SWE-bench instance metadata used by the reward
+  function.
+- `extra_info`: runtime metadata such as stage, split, workspace root, and
+  targeted test command.
+
+Point EasyR1 to the online reward function:
+
+```yaml
+data:
+  train_files: /path/to/controller_train.jsonl
+  prompt_key: prompt
+  answer_key: ground_truth
+worker:
+  reward:
+    reward_function: /path/to/Self_Evolver/src/reward/online_reward.py:compute_score
+```
+
+The online reward path is:
 
 ```text
-Self-Evolver rollout JSONL -> EasyR1 dataset/reward -> GRPO training
--> Controller checkpoint -> vLLM OpenAI-compatible endpoint -> Self-Evolver llm mode
+EasyR1 policy response -> Controller JSON parser -> ControllerSignal injection
+-> Inspector -> PatchGenerator -> Verifier/Judge -> RewardModel -> score
+```
+
+Useful environment variables for reward execution:
+
+```bash
+SELF_EVOLVER_REWARD_WORKSPACE=/path/to/reward_workspace
+SELF_EVOLVER_ROLLOUT_JSONL=benchmark_results/online_rollouts.jsonl
+SELF_EVOLVER_REWARD_CONFIG=configs/reward_config.yaml
+SELF_EVOLVER_ENABLE_SKILL_EVOLUTION=0
+SELF_EVOLVER_MAX_ITERATIONS=3
 ```
 
 ## Patch Verification Design

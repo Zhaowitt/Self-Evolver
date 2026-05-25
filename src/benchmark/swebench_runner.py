@@ -25,9 +25,9 @@ from src.critic.judge import CriticJudge
 from src.environment.models import Issue
 from src.environment.project_env import ProjectEnvironment
 from src.memory.memory_retriever import MemoryRetriever
-from src.orchestrator.orchestrator import ExecutionOrchestrator
 from src.reward.reward_model import RewardModel
-from src.rl.rollout_writer import RolloutWriter, build_rollout_record
+from src.rl.online_rollout_runner import build_targeted_test_cmd, run_online_rollout
+from src.rl.rollout_writer import RolloutWriter
 from src.skills.skill_evolver import SkillEvolver
 from src.skills.skill_selector import SkillSelector
 
@@ -168,19 +168,7 @@ class SWEBenchRunner(BenchmarkRunner):
 
         Returns None if no fail_to_pass data is available.
         """
-        import json as _json
-        raw = issue.metadata.get("fail_to_pass")
-        if not raw:
-            return None
-        try:
-            tests: list[str] = _json.loads(raw) if isinstance(raw, str) else raw
-        except (ValueError, TypeError):
-            return None
-        if not tests:
-            return None
-        # pytest accepts test IDs directly; quote paths with spaces just in case
-        test_args = " ".join(f'"{t}"' for t in tests)
-        return f"python3 -m pytest {test_args} -x --tb=short -q"
+        return build_targeted_test_cmd(issue)
 
     def run_instance(self, issue: Issue) -> InstanceResult:
         """Run a single SWE-bench instance."""
@@ -199,19 +187,19 @@ class SWEBenchRunner(BenchmarkRunner):
             if test_cmd:
                 env.test_cmd = test_cmd
 
-            # Run the orchestrator
             controller_signal = self._build_controller_signal(issue)
-            orchestrator = ExecutionOrchestrator(
+            rollout = run_online_rollout(
+                issue,
                 env=env,
-                max_iterations=get_config().agent.max_iterations,
                 controller_signal=controller_signal,
+                max_iterations=get_config().agent.max_iterations,
+                reward_model=self.reward_model,
+                rollout_writer=self.rollout_writer,
+                skill_evolver=self.skill_evolver,
+                judge=self.judge,
             )
-
-            result = orchestrator.run(issue)
-
-            # Evaluate
-            evaluation = self.judge.evaluate(result)
-            self._write_rollout(issue, controller_signal, result, evaluation)
+            result = rollout.execution_result
+            evaluation = rollout.evaluation
 
             return InstanceResult(
                 instance_id=issue.id,
@@ -279,15 +267,18 @@ class SWEBenchRunner(BenchmarkRunner):
                 env.test_cmd = test_cmd
 
             controller_signal = self._build_controller_signal(issue)
-            orchestrator = ExecutionOrchestrator(
+            rollout = run_online_rollout(
+                issue,
                 env=env,
-                max_iterations=get_config().agent.max_iterations,
                 controller_signal=controller_signal,
+                max_iterations=get_config().agent.max_iterations,
+                reward_model=self.reward_model,
+                rollout_writer=self.rollout_writer,
+                skill_evolver=self.skill_evolver,
+                judge=self.judge,
             )
-            result = orchestrator.run(issue)
+            result = rollout.execution_result
             patch = self._prediction_patch_from_execution(result)
-            evaluation = self.judge.evaluate(result)
-            self._write_rollout(issue, controller_signal, result, evaluation)
             self.logger.info(
                 f"Generated prediction for {issue.id}: "
                 f"{len(patch)} chars, success={result.success}"
@@ -333,35 +324,6 @@ class SWEBenchRunner(BenchmarkRunner):
             record.to_dict()
             for record in retriever.retrieve(repo_name=issue.repo_name, limit=3)
         ]
-
-    def _write_rollout(
-        self,
-        issue: Issue,
-        controller_signal: Optional[ControllerSignal],
-        result,
-        evaluation=None,
-    ) -> None:
-        """Write one rollout record when rollout logging is enabled."""
-        if not self.rollout_writer:
-            return
-        evaluation = evaluation or self.judge.evaluate(result)
-        reward = self.reward_model.score(result, controller_signal=controller_signal)
-        skill_evolution = None
-        if self.skill_evolver and controller_signal:
-            skill_evolution = self.skill_evolver.update_from_rollout(
-                controller_signal,
-                reward,
-            )
-        self.rollout_writer.append(
-            build_rollout_record(
-                issue,
-                controller_signal,
-                result,
-                evaluation=evaluation,
-                reward=reward,
-                skill_evolution=skill_evolution,
-            )
-        )
 
     def generate_predictions(
         self,

@@ -1,1 +1,1 @@
-"""Rollout logging and EasyR1 dataset helpers."""
+"""Online rollout execution and EasyR1 prompt dataset helpers."""

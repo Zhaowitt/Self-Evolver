@@ -264,7 +264,7 @@ def config_info(ctx):
 @click.option(
     "--controller-mode",
     default="off",
-    type=click.Choice(["off", "mock", "template", "llm"]),
+    type=click.Choice(["off", "llm"]),
     help="Optional upstream Controller mode for worker guidance",
 )
 @click.option(

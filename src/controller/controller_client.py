@@ -1,4 +1,4 @@
-"""Controller clients for mock/template/vLLM-backed guidance generation."""
+"""Controller clients for vLLM/OpenAI-compatible guidance generation."""
 
 from __future__ import annotations
 
@@ -14,11 +14,11 @@ from src.skills.skill_bank import SkillMetadata
 
 
 class ControllerClient:
-    """Generate ControllerSignal objects from mock, template, or LLM modes."""
+    """Generate ControllerSignal objects from an LLM or return an empty signal."""
 
     def __init__(
         self,
-        mode: str = "mock",
+        mode: str = "llm",
         config: Optional[ControllerConfig] = None,
         llm_client: Optional[LLMClient] = None,
         prompt_builder: Optional[ControllerPromptBuilder] = None,
@@ -38,10 +38,6 @@ class ControllerClient:
     ) -> ControllerSignal:
         if self.mode == "off":
             return ControllerSignal.empty(mode=stage, source="off")
-        if self.mode == "mock":
-            return self._mock_signal(issue, stage=stage, skill=skill, skills=skills)
-        if self.mode == "template":
-            return self._template_signal(issue, stage=stage, skill=skill, skills=skills)
         if self.mode == "llm":
             return self._llm_signal(
                 issue,
@@ -55,61 +51,6 @@ class ControllerClient:
             source=self.mode,
             parse_error=f"unknown controller mode: {self.mode}",
         )
-
-    def _mock_signal(
-        self,
-        issue: Issue,
-        stage: str,
-        skill: Optional[SkillMetadata | SkillSignal],
-        skills: Optional[Sequence[SkillMetadata | SkillSignal]] = None,
-    ) -> ControllerSignal:
-        selected_skills = _skill_list(skill=skill, skills=skills)
-        if not selected_skills:
-            selected_skills = [
-                SkillSignal(
-                    id="inspect_before_editing",
-                    title="Inspect Before Editing",
-                    summary="Inspect failure evidence and relevant files before editing.",
-                    target_failure_type="general",
-                )
-            ]
-        selected_skill = selected_skills[0]
-        task_wrapper = (
-            "Ask the worker to inspect the failing test or failure evidence before generating a patch."
-            if stage == "train"
-            else None
-        )
-        signal = ControllerSignal(
-            mode=stage,
-            task_wrapper=task_wrapper,
-            skill=selected_skill,
-            skills=selected_skills[:2],
-            selected_skill_ids=[item.id for item in selected_skills[:2] if item.id],
-            strategy="Inspect the focused failure first, then generate the smallest patch that addresses the observed behavior.",
-            memory_query=f"{issue.repo_name or issue.id} minimal patch failure evidence",
-            target_failure_type=selected_skill.target_failure_type or "general",
-            difficulty="medium",
-            source="mock",
-        )
-        return signal.enforce_mode()
-
-    def _template_signal(
-        self,
-        issue: Issue,
-        stage: str,
-        skill: Optional[SkillMetadata | SkillSignal],
-        skills: Optional[Sequence[SkillMetadata | SkillSignal]] = None,
-    ) -> ControllerSignal:
-        signal = self._mock_signal(issue, stage=stage, skill=skill, skills=skills)
-        tests = issue.metadata.get("fail_to_pass")
-        if tests:
-            signal.strategy = (
-                "Inspect the listed FAIL_TO_PASS test target before editing, then keep the fix scoped to the failing behavior."
-            )
-            if stage == "train":
-                signal.task_wrapper = "Require the worker to inspect the focused failing test before patching."
-        signal.source = "template"
-        return signal.enforce_mode()
 
     def _llm_signal(
         self,

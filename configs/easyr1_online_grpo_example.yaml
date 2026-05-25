@@ -1,0 +1,32 @@
+experiment_name: self_evolver_controller_online_grpo
+controller_model: Qwen/Qwen2.5-1.5B-Instruct
+
+data:
+  train_files: /path/to/controller_train.jsonl
+  val_files: /path/to/controller_val.jsonl
+  prompt_key: prompt
+  answer_key: ground_truth
+  max_prompt_length: 8192
+  max_response_length: 1536
+  rollout_batch_size: 8
+
+worker:
+  reward:
+    reward_function: /path/to/Self_Evolver/src/reward/online_reward.py:compute_score
+
+self_evolver:
+  rollout_jsonl: benchmark_results/online_rollouts.jsonl
+  reward_workspace: /path/to/reward_workspace
+  reward_config: configs/reward_config.yaml
+  enable_skill_evolution: false
+
+serving:
+  engine: vllm
+  base_url: http://127.0.0.1:8000/v1
+  model_env: CONTROLLER_MODEL
+
+notes:
+  - Generate train_files with python -m src.rl.easyr1_dataset.
+  - rollout_jsonl is execution logging only, not the reward source.
+  - EasyR1 calls src.reward.online_reward:compute_score for online rewards.
+  - Evaluation mode must keep task_wrapper disabled.
