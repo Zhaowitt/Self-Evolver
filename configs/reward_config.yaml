@@ -1,0 +1,12 @@
+# Execution utility (Proposal 2.6) — single source of truth for reward weights.
+# Loaded by RewardModel.from_config_file (src/reward/reward_model.py); the code
+# defaults are identical for installs without this file.
+weights:
+  resolved: 0.5           # all F2P pass AND no P2P regression in the eval outcome
+  f2p_fraction: 0.2       # fraction of FAIL_TO_PASS tests passing
+  p2p_no_regression: 0.1  # no PASS_TO_PASS regression observed
+  cost_efficiency: 0.1    # 1 - min(1, total_tokens / cost_token_budget)
+  process: 0.1            # patch applied AND non-empty canonical diff AND within budget
+cost_token_budget: 60000
+skill_write_gate: 0.55          # min utility before skill create/update/deprecate applies
+evolution_baseline_alpha: 0.3   # EMA smoothing for the evolution-utility baseline

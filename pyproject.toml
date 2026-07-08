@@ -28,23 +28,22 @@ dependencies = [
     "pydantic>=2.0.0",
     "python-dotenv>=1.0.0",
     "gitpython>=3.1.0",
-    "docker>=7.0.0",
+    "pyyaml>=6.0",
     "datasets>=2.0.0",
     "rich>=13.0.0",
     "click>=8.0.0",
     "tenacity>=8.0.0",
+    # The container test backend and evaluators import swebench at module load;
+    # the harness main() is called with the 4.x keyword signature.
+    "swebench>=4.0.0,<5.0.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
-    "pytest-asyncio>=0.21.0",
     "black>=23.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
-]
-swebench = [
-    "swebench>=2.0.0",
 ]
 
 [project.scripts]
@@ -53,6 +52,13 @@ self-evolver = "src.main:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["src*"]
+
+[tool.pytest.ini_options]
+# Make `pytest tests -q` work on a fresh clone (and after `pip install -e .`)
+# by putting the repo root on sys.path so `import src...` resolves.
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
 
 [tool.black]
 line-length = 100

@@ -9,6 +9,7 @@ import logging
 import os
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -428,9 +429,10 @@ class ProjectEnvironment:
         """
         cmd = test_cmd or self.test_cmd
         timeout = timeout or self.timeout
-        
+
         logger.info(f"Running tests: {cmd}")
-        
+
+        start = time.monotonic()
         try:
             result = subprocess.run(
                 cmd,
@@ -441,19 +443,18 @@ class ProjectEnvironment:
                 timeout=timeout,
                 env={**os.environ, "PYTHONPATH": str(self.repo_path)},
             )
-            
-            output = result.stdout
-            error_logs = result.stderr
+
             passed = result.returncode == 0
-            
+
             logger.info(f"Tests {'passed' if passed else 'failed'}")
-            
-            return TestResult(
+
+            return TestResult.from_pytest_output(
                 passed=passed,
-                output=output,
-                error_logs=error_logs,
+                output=result.stdout,
+                error_logs=result.stderr,
+                duration_ms=(time.monotonic() - start) * 1000,
             )
-            
+
         except subprocess.TimeoutExpired:
             logger.error(f"Test execution timed out after {timeout}s")
             return TestResult(
@@ -468,23 +469,6 @@ class ProjectEnvironment:
                 output="",
                 error_logs=str(e),
             )
-    
-    def run_specific_tests(self, test_files: List[str]) -> TestResult:
-        """
-        Run specific test files.
-        
-        Args:
-            test_files: List of test file paths to run.
-            
-        Returns:
-            TestResult with pass/fail status.
-        """
-        if not test_files:
-            return TestResult(passed=True, output="No tests specified")
-        
-        test_paths = " ".join(test_files)
-        cmd = f"{self.test_cmd} {test_paths}"
-        return self.run_tests(test_cmd=cmd)
     
     def get_diff(self) -> str:
         """
@@ -565,15 +549,19 @@ class ProjectEnvironment:
         if issue.test_patch:
             test_patch_result = self.apply_patch_detailed(issue.test_patch)
             if not test_patch_result.success:
-                logger.warning("Failed to apply test patch")
+                # Without the hidden tests, local verification for this issue
+                # would be meaningless — fail loudly instead of degrading.
+                logger.error(
+                    f"Failed to apply test patch: {test_patch_result.diagnostic[:500]}"
+                )
                 self.revert_changes()
-            else:
-                # SWE-bench test patches are needed for local validation but must
-                # not appear in final predictions. Staging them keeps default
-                # `git diff` focused on the agent's later code changes.
-                try:
-                    self.repo.git.add("-A")
-                except GitCommandError as e:
-                    logger.warning(f"Failed to stage test patch: {e}")
-        
+                return False
+            # SWE-bench test patches are needed for local validation but must
+            # not appear in final predictions. Staging them keeps default
+            # `git diff` focused on the agent's later code changes.
+            try:
+                self.repo.git.add("-A")
+            except GitCommandError as e:
+                logger.warning(f"Failed to stage test patch: {e}")
+
         return True

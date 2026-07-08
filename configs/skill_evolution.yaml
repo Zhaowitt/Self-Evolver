@@ -1,0 +1,19 @@
+# Skill-evolution knobs loaded by src.skills.skill_evolver.SkillEvolutionConfig.
+# Every key here maps 1:1 to a dataclass field; unknown keys are rejected on load.
+
+# Dedup similarity above which a proposed skill is treated as a duplicate.
+skill_similarity_threshold: 0.88
+# Minimum utility to gate a Reflector skill write when a triggering utility is supplied.
+skill_write_utility_threshold: 0.55
+# Skills the controller may select per task.
+max_selected_skills: 2
+# Hard cap on active skills; lowest-contribution skills are evicted past this.
+max_active_skills: 12
+# Retirement: minimum credited trials before a skill can be retired.
+retire_min_trials: 5
+# Retirement: retire when (successes - failures) / trials <= this.
+retire_net_success_threshold: -0.2
+# EMA smoothing for the advantage baseline over rollout utilities.
+baseline_ema_alpha: 0.3
+# Reflector cadence: reflect every N completed train rollouts.
+reflect_every_n_rollouts: 10

@@ -1,0 +1,20 @@
+# Task evolution tunables (Proposal 2.3).
+# Loaded by src/tasks/config.py; in-code defaults are identical to these values.
+
+# EMA step for per-family success rate s_f.
+ema_alpha: 0.3
+# Family weight = exp(-(s_f - 0.5)^2 / (2 * boundary_sigma^2)):
+# sampling concentrates near the 50% capability boundary.
+boundary_sigma: 0.2
+# Instance boost = 1 + boost_factor * cluster_hits (reflection signal).
+boost_factor: 2.0
+# Too-hard weight decay multiplier after too_hard_attempts consecutive failures.
+decay_factor: 0.3
+too_hard_attempts: 3
+# Neutral prior for s_f: families start at peak weight.
+initial_success_ema: 0.5
+
+# Focused variants: F2P subset of size 1, problem statement augmented with the
+# failing test path, instance_id suffixed ::focus-<n>.
+focus_enabled: true
+focus_max_per_instance: 1

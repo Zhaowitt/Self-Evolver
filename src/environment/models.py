@@ -4,6 +4,7 @@ Data models for Project Environment.
 Defines the core data structures used across the system.
 """
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -13,12 +14,39 @@ from typing import Any, Dict, List, Optional
 
 class TestStatus(Enum):
     """Status of a test execution."""
-    
+
     PASSED = "passed"
     FAILED = "failed"
     ERROR = "error"
     SKIPPED = "skipped"
     TIMEOUT = "timeout"
+
+
+# pytest -rA / -v report lines. XPASS/XFAIL map to PASSED, matching official
+# SWE-bench grading (swebench.harness.grading.test_passed).
+_PYTEST_STATUS_MAP = {
+    "PASSED": TestStatus.PASSED,
+    "XPASS": TestStatus.PASSED,
+    "XFAIL": TestStatus.PASSED,
+    "FAILED": TestStatus.FAILED,
+    "ERROR": TestStatus.ERROR,
+    "SKIPPED": TestStatus.SKIPPED,
+}
+# "PASSED path::test" (short summary, -rA) — name must be a test id.
+_PYTEST_PREFIX_LINE = re.compile(
+    r"^(PASSED|FAILED|ERROR|SKIPPED|XPASS|XFAIL)\s+(\S*::\S+)"
+)
+# "path::test PASSED [ 50%]" (verbose mode).
+_PYTEST_SUFFIX_LINE = re.compile(
+    r"^(\S*::\S+)\s+(PASSED|FAILED|ERROR|SKIPPED|XPASS|XFAIL)\b"
+)
+# Final tally, e.g. "2 failed, 3 passed, 1 skipped, 2 errors in 1.23s".
+_PYTEST_TALLY_ITEM = re.compile(
+    r"(\d+) (passed|failed|errors?|skipped|xfailed|xpassed)\b"
+)
+# Strip SGR color codes: pytest colorizes when FORCE_COLOR/tty is set, and the
+# escapes would otherwise defeat the line-start status patterns.
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
 @dataclass
@@ -104,11 +132,78 @@ class TestResult:
     def from_success(cls, output: str = "") -> "TestResult":
         """Create a successful test result."""
         return cls(passed=True, output=output)
-    
+
     @classmethod
     def from_failure(cls, error_logs: str, output: str = "") -> "TestResult":
         """Create a failed test result."""
         return cls(passed=False, error_logs=error_logs, output=output)
+
+    @classmethod
+    def from_pytest_output(
+        cls,
+        passed: bool,
+        output: str,
+        error_logs: str = "",
+        duration_ms: float = 0.0,
+    ) -> "TestResult":
+        """
+        Build a TestResult with real per-test cases and counts parsed from
+        pytest output (works with -q, -v, and -rA report styles).
+
+        Counts come from pytest's final tally line when present (authoritative
+        even when per-test lines are absent, e.g. plain -q), otherwise from
+        the parsed per-test lines. XPASS/XFAIL count as passed, matching
+        official SWE-bench grading.
+        """
+        cases: Dict[str, TestCase] = {}
+        tally: Dict[str, int] = {}
+        for line in _ANSI.sub("", f"{output}\n{error_logs}").splitlines():
+            line = line.strip()
+            m = _PYTEST_PREFIX_LINE.match(line) or _PYTEST_SUFFIX_LINE.match(line)
+            if m:
+                a, b = m.groups()
+                name, raw_status = (b, a) if a in _PYTEST_STATUS_MAP else (a, b)
+                status = _PYTEST_STATUS_MAP[raw_status]
+                error_message = None
+                if status in (TestStatus.FAILED, TestStatus.ERROR) and " - " in line:
+                    error_message = line.split(" - ", 1)[1]
+                cases[name] = TestCase(
+                    name=name, status=status, error_message=error_message
+                )
+            elif " in " in line and _PYTEST_TALLY_ITEM.search(line):
+                tally = {
+                    key.rstrip("s") if key.startswith("error") else key: int(n)
+                    for n, key in _PYTEST_TALLY_ITEM.findall(line)
+                }
+        test_cases = list(cases.values())
+        if tally:
+            passed_tests = (
+                tally.get("passed", 0)
+                + tally.get("xpassed", 0)
+                + tally.get("xfailed", 0)
+            )
+            failed_tests = tally.get("failed", 0)
+            error_tests = tally.get("error", 0)
+            skipped_tests = tally.get("skipped", 0)
+        else:
+            passed_tests = sum(1 for tc in test_cases if tc.status == TestStatus.PASSED)
+            failed_tests = sum(1 for tc in test_cases if tc.status == TestStatus.FAILED)
+            error_tests = sum(1 for tc in test_cases if tc.status == TestStatus.ERROR)
+            skipped_tests = sum(
+                1 for tc in test_cases if tc.status == TestStatus.SKIPPED
+            )
+        return cls(
+            passed=passed,
+            total_tests=passed_tests + failed_tests + error_tests + skipped_tests,
+            passed_tests=passed_tests,
+            failed_tests=failed_tests,
+            error_tests=error_tests,
+            skipped_tests=skipped_tests,
+            test_cases=test_cases,
+            output=output,
+            error_logs=error_logs,
+            duration_ms=duration_ms,
+        )
 
 
 @dataclass

@@ -191,6 +191,23 @@ class LLMJudge(BaseWorker):
         if not iteration_record:
             return JudgeDecision(category, route, feedback, confidence=0.0)
 
+        # A patch worker that crashed (parse/API error) returns no patch_result
+        # at all but records an error. That is a generation failure, not a
+        # deliberately empty patch, so retry generation rather than reprompting
+        # for "non-empty" content.
+        if getattr(iteration_record, "patch_result", None) is None and getattr(
+            iteration_record, "error", None
+        ):
+            return JudgeDecision(
+                failure_category="patch_worker_error",
+                route=JudgeRoute.REGENERATE_PATCH_SAME_LOCATION,
+                feedback_for_next_attempt=(
+                    "The patch worker errored before returning a patch; retry "
+                    "generation and produce a valid unified diff."
+                ),
+                confidence=0.4,
+            )
+
         if not iteration_record.patch_result or not iteration_record.patch_result.patch_content:
             return JudgeDecision(
                 failure_category="empty_patch",

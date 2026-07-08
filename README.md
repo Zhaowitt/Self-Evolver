@@ -1,169 +1,97 @@
 # Self-Evolver
 
-Self-Evolver is a multi-agent code repair framework for repository-level
-software engineering tasks. The current implementation is focused on SWE-bench
-style repair loops: inspect the issue, generate a patch, verify it in a real
-repository, judge failures, and retry with structured feedback.
-
-The broader research goal is a self-evolving coding agent that learns from hard
-cases through task evolution and skill evolution. This repository currently
-implements the static multi-agent baseline plus a failure-routing judge and
-SWE-bench evaluation workflow.
-
-## What Is Included
-
-- `ProjectEnvironment`: Git repository interaction, patch application, test
-  execution, canonical diff capture, and SWE-bench issue setup.
-- `Inspector`: LLM-based fault localization and root-cause analysis.
-- `PatchGenerator`: LLM-based unified diff patch generation.
-- `Verifier`: tool-based patch application and test verification. Successful
-  predictions use `git diff` canonical output, not raw LLM diff text.
-- `LLMJudge`: failure diagnosis and retry routing. It can route retries, but
-  cannot declare success.
-- `CriticJudge`: rule-based execution evaluation and failure summary.
-- `SWEBenchRunner`: prediction generation, official SWE-bench evaluation,
-  Docker cleanup, and infra/patch error separation.
-
-## Repository Layout
-
-```text
-src/
-  benchmark/       SWE-bench runner and benchmark result models
-  critic/          rule-based execution evaluator
-  environment/     Git, patch, test, and issue environment APIs
-  llm/             OpenAI-compatible LLM client
-  orchestrator/    repair loop coordination and retry routing
-  workers/         Inspector, PatchGenerator, Verifier, LLMJudge
-tests/             focused unit/integration tests for patch and judge behavior
-run_swebench_v2.py compatibility wrapper around the unified CLI
-Proposal.md        research proposal and design motivation
-```
-
-## Setup
-
-Python 3.10 or newer is required.
+A self-evolving multi-agent coding agent for repository-level issue resolving.
+The Controller drives an outer loop of **task evolution** and **skill evolution**
+over an Inspector → PatchGenerator → Verifier repair loop, graded with official
+SWE-bench-family semantics.
 
 ```bash
-pip install -e ".[dev]"
+pip install -e .
+cp .env.example .env      # then fill in OPENAI_API_KEY
 ```
 
-For SWE-bench evaluation:
+Container grading uses `apptainer` (or `docker` if present); no other setup.
+
+## Benchmark configuration
+
+Set the data root and container-image cache (both have portable defaults):
 
 ```bash
-pip install -e ".[swebench]"
+export SWEBENCH_DATA_DIR="$(pwd)/benchmarks"     # default: <repo>/benchmarks
+export SIF_CACHE_DIR="$HOME/.cache/self_evolver/sif"
 ```
 
-Create a `.env` file or export environment variables:
+Download every dataset (idempotent; `DATASETS=` selects a subset):
 
 ```bash
-OPENAI_API_KEY=sk-...
-OPENAI_MODEL=gpt-4o
-OPENAI_BASE_URL=https://api.openai.com/v1
-MAX_ITERATIONS=3
-WORKSPACE_DIR=./workspace
-DOCKER_TIMEOUT=600
+bash scripts/download_benchmarks.sh
 ```
 
-## CLI Usage
+| `--benchmark`    | `--dataset`          | Role                         | Grading |
+| ---------------- | -------------------- | ---------------------------- | ------- |
+| `swebench`       | `full` (`--split train`) | RL / evolution training pool | apptainer/docker |
+| `swebench`       | `verified`           | primary eval (Python)        | apptainer/docker |
+| `swebench`       | `lite`               | fast dev (`dev`/`test`)      | apptainer/docker |
+| `swebench_live`  | `lite`\|`full`\|`test` | contamination-free held-out | apptainer/docker |
+| `multi_swe_bench`| `full` (1632, 7 langs)\|`flash` (300) | cross-language transfer | official Docker harness |
+| `swebench_pro`   | `test`               | harder OOD                   | official Docker harness |
 
-Check local configuration and repository test execution:
+## Training commands
+
+Each experiment is one script (`SEED=`, `TEST_BACKEND=`, `NUM_*=` override defaults).
+Baselines to full method:
 
 ```bash
-python -m src.main check --repo /path/to/repo --test-cmd "pytest"
-python -m src.main config-info
+bash scripts/run_zero_shot.sh        # base model, single agent, no evolution
+bash scripts/run_mas_static.sh       # fixed multi-agent workflow, no evolution
+bash scripts/run_task_evolution.sh   # task evolution only
+bash scripts/run_skill_evolution.sh  # skill evolution only
+bash scripts/run_full_method.sh      # task + skill evolution (main method)
+bash scripts/run_rl_controller.sh    # build EasyR1 GRPO data + train the Controller
+bash scripts/run_all_experiments.sh  # every experiment x seeds -> metrics tables
 ```
 
-Run a repair task against a local repository:
-
-```bash
-python -m src.main fix \
-  --repo /path/to/repo \
-  --issue "Describe the bug or requested behavior" \
-  --test-cmd "pytest"
-```
-
-## SWE-bench Workflow
-
-Generate predictions only:
+Equivalent direct CLI (a train run evolves the skill bank, then freezes it):
 
 ```bash
 python -m src.main benchmark \
-  --phase generate \
-  --dataset lite \
-  --predictions-path swebench_results/predictions.json
+  --benchmark swebench --dataset full --split train --stage train --phase generate \
+  --agent-mode mas --skills evolve --memory on --task-evolution on \
+  --num-instances 100 --seed 0 --run-id full_method-train
 ```
 
-Evaluate existing predictions only:
+Flags: `--agent-mode single|mas`, `--skills off|static|evolve`, `--memory on|off`,
+`--task-evolution on|off`, `--controller-mode off|llm`, `--stage train|eval`,
+`--test-backend auto|apptainer|docker|host`, `--train-ids FILE` (contamination guard).
+
+## Evaluation commands
+
+Frozen held-out eval (skills snapshotted read-only) generates predictions:
 
 ```bash
 python -m src.main benchmark \
-  --phase evaluate \
-  --dataset lite \
-  --predictions-path swebench_results/predictions.json \
-  --run-id se-lite-v2
+  --benchmark swebench --dataset verified --stage eval --phase generate \
+  --skills static --seed 0 --run-id full_method-eval
+
+bash scripts/run_transfer_eval.sh    # frozen eval on SWE-bench-Live + Multi-SWE-bench
 ```
 
-Generate and evaluate in one run:
+Grade a predictions file (official Docker harness when docker is present, else the
+same swebench grading via apptainer):
 
 ```bash
-python -m src.main benchmark \
-  --phase both \
-  --dataset lite \
-  --agent-workers 4 \
-  --eval-workers 2 \
-  --predictions-path swebench_results/predictions.json \
-  --run-id se-lite-v2
+PREDICTIONS=runs/full_method-eval/predictions.json bash scripts/evaluate.sh
 ```
 
-The old `run_swebench_v2.py` entrypoint is now only a compatibility wrapper:
+Aggregate metrics (resolved rate, pass@k, cost-to-success, per-iteration evolution
+curve) as JSON + Markdown:
 
 ```bash
-python run_swebench_v2.py --phase both --dataset lite
+python -m src.benchmark.metrics --rollouts runs/*/rollouts.jsonl --report
 ```
 
-## Patch Verification Design
+Multi-SWE-bench and SWE-bench Pro grade with their own Docker harnesses: the runner
+generates predictions and writes a harness-ready patch file, then prints the exact
+official command.
 
-LLMs often produce raw unified diffs with malformed hunks, missing context
-prefixes, or stale line counts. Self-Evolver now treats raw LLM diff text as an
-intermediate artifact:
-
-```text
-raw LLM diff -> local apply/fix/fuzzy apply -> verifier tests -> git diff canonical patch
-```
-
-Only the canonical `git diff` output is used as the final SWE-bench prediction.
-This reduces malformed patch, hunk mismatch, and truncated patch failures in
-official evaluation.
-
-SWE-bench `test_patch` changes are staged during local issue setup so they are
-available for targeted verification but excluded from final predictions.
-
-## Failure Routing
-
-The LLM judge emits one of these routes after failed attempts:
-
-- `repair_patch_format`
-- `regenerate_patch_same_location`
-- `reinspect`
-- `empty_patch_reprompt`
-- `give_up_hard_case`
-
-Success is still determined only by deterministic verifier results. If an issue
-exhausts the retry budget or is routed to hard-case handling, a compact JSONL
-record is written to `WORKSPACE_DIR/hard_cases.jsonl`.
-
-## Validation
-
-Run the focused tests:
-
-```bash
-pytest tests -q
-```
-
-Useful lightweight checks:
-
-```bash
-python -m compileall -q src tests run_swebench_v2.py
-git diff --check
-```
 

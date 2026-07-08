@@ -32,6 +32,35 @@ class LLMConfig(BaseModel):
     )
 
 
+class ControllerConfig(BaseModel):
+    """Controller LLM configuration settings."""
+
+    api_key: str = Field(
+        default_factory=lambda: os.getenv(
+            "CONTROLLER_API_KEY",
+            os.getenv("OPENAI_API_KEY", ""),
+        )
+    )
+    model: str = Field(
+        default_factory=lambda: os.getenv(
+            "CONTROLLER_MODEL",
+            os.getenv("OPENAI_MODEL", "gpt-4o"),
+        )
+    )
+    base_url: Optional[str] = Field(
+        default_factory=lambda: os.getenv(
+            "CONTROLLER_BASE_URL",
+            os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+        )
+    )
+    max_tokens: int = Field(
+        default_factory=lambda: int(os.getenv("CONTROLLER_MAX_TOKENS", "1024"))
+    )
+    temperature: float = Field(
+        default_factory=lambda: float(os.getenv("CONTROLLER_TEMPERATURE", "0.2"))
+    )
+
+
 class AgentConfig(BaseModel):
     """Agent behavior configuration."""
     
@@ -76,6 +105,7 @@ class Config(BaseModel):
     """Main configuration container."""
     
     llm: LLMConfig = Field(default_factory=LLMConfig)
+    controller: ControllerConfig = Field(default_factory=ControllerConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     environment: EnvironmentConfig = Field(default_factory=EnvironmentConfig)
     docker: DockerConfig = Field(default_factory=DockerConfig)

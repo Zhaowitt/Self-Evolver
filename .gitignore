@@ -77,8 +77,15 @@ desktop.ini
 # === Benchmark Workspace (large repos) ===
 workspace/
 benchmark_results/
+runs/
+data/
 tmp/
 temp/
+
+# === Benchmark data & container images (large, machine-local) ===
+# `benchmarks` is a symlink to the downloaded SWE-bench save_to_disk copies.
+/benchmarks
+*.sif
 
 # === SWE-bench Run Outputs ===
 swebench_results/
@@ -93,3 +100,9 @@ run_swebench_v2_stdout.log
 # === Logs ===
 *.log
 logs/
+
+# === Keep evolved skill state (rescued from the blanket *.json rule above) ===
+# Runtime skill stats and archived revisions must survive a fresh checkout.
+!skills/metadata.json
+!skills/_archive/
+!skills/_archive/**

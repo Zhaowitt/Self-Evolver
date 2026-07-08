@@ -196,21 +196,3 @@ class LLMClient:
             Message(role="user", content=user_message),
         ]
         return self.chat(messages, **kwargs)
-    
-    def complete(
-        self,
-        prompt: str,
-        **kwargs: Any,
-    ) -> LLMResponse:
-        """
-        Simple completion with just a user prompt.
-        
-        Args:
-            prompt: The user prompt.
-            **kwargs: Additional parameters passed to chat().
-            
-        Returns:
-            LLMResponse containing the model's response.
-        """
-        messages = [Message(role="user", content=prompt)]
-        return self.chat(messages, **kwargs)

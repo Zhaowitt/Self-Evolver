@@ -8,8 +8,9 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, List, Optional
 
+from src.controller.injection import format_controller_guidance
 from src.environment.models import ExecutionContext, PatchInfo
 from src.environment.project_env import ProjectEnvironment
 from src.llm.client import LLMClient
@@ -90,6 +91,58 @@ Key rules:
 7. If this is a retry, avoid the same mistakes from previous attempts"""
 
 
+def _normalize_patch(patch: str) -> str:
+    """A unified diff must end with a newline; fenced-block extraction can drop it."""
+    if patch and not patch.endswith("\n"):
+        return patch + "\n"
+    return patch
+
+
+def parse_patch_response(content: str) -> PatchResult:
+    """Parse a patch from an LLM response (JSON object, ```diff block, or bare diff).
+
+    When the patch arrives as a JSON string, ``json.loads`` has already decoded
+    escape sequences. Some models instead emit the whole diff on a single line
+    with literal ``\\n`` separators and no real newlines; only in that case do we
+    unescape, so a legitimate backslash-n inside code (e.g. ``print("\\n")``) in
+    a proper multi-line diff is never turned into a real newline.
+    """
+    json_match = re.search(r'```json\s*(.*?)\s*```', content, re.DOTALL)
+    if json_match:
+        try:
+            data = json.loads(json_match.group(1))
+            patch = data.get("patch", "")
+            if "\n" not in patch and "\\n" in patch:
+                patch = patch.replace("\\n", "\n")
+            return PatchResult(
+                patch_content=_normalize_patch(patch),
+                modified_files=data.get("modified_files", []),
+                explanation=data.get("explanation", ""),
+            )
+        except json.JSONDecodeError:
+            pass
+
+    # Fallback: a fenced ```diff block, then a bare unified diff anywhere.
+    diff_match = re.search(r'```(?:diff)?\s*(---.*?)\s*```', content, re.DOTALL)
+    if not diff_match:
+        diff_match = re.search(
+            r'(--- a/.*?\n\+\+\+ b/.*?\n@@.*?(?:\n[-+ ].*)*)', content, re.DOTALL
+        )
+    if diff_match:
+        patch = _normalize_patch(diff_match.group(1))
+        return PatchResult(
+            patch_content=patch,
+            modified_files=PatchInfo.from_diff(patch).modified_files,
+            explanation="Extracted from response",
+        )
+
+    logger.warning("Could not parse patch from response")
+    return PatchResult(
+        patch_content="",
+        explanation=f"Failed to parse patch. Raw response: {content[:500]}",
+    )
+
+
 class PatchGenerator(BaseWorker):
     """Patch Generator worker for creating code fixes."""
     
@@ -97,9 +150,11 @@ class PatchGenerator(BaseWorker):
         self,
         env: ProjectEnvironment,
         llm_client: Optional[LLMClient] = None,
+        skill_bank: Any = None,
     ):
         super().__init__(llm_client=llm_client, name="PatchGenerator")
         self.env = env
+        self.skill_bank = skill_bank
     
     @property
     def system_prompt(self) -> str:
@@ -145,6 +200,13 @@ class PatchGenerator(BaseWorker):
         
         parts.append("## Issue Description")
         parts.append(context.issue.description)
+
+        controller_guidance = format_controller_guidance(
+            context.metadata.get("controller_signal"),
+            skill_bank=self.skill_bank,
+        )
+        if controller_guidance:
+            parts.append("\n" + controller_guidance)
         
         if inspection_result:
             parts.append("\n## Fault Localization Results")
@@ -232,49 +294,4 @@ class PatchGenerator(BaseWorker):
     
     def _parse_response(self, content: str) -> PatchResult:
         """Parse LLM response into PatchResult."""
-        # Try to extract JSON
-        json_match = re.search(r'```json\s*(.*?)\s*```', content, re.DOTALL)
-        if json_match:
-            json_str = json_match.group(1)
-            try:
-                data = json.loads(json_str)
-                patch = data.get("patch", "")
-                # Unescape newlines if needed
-                patch = patch.replace("\\n", "\n")
-                
-                return PatchResult(
-                    patch_content=patch,
-                    modified_files=data.get("modified_files", []),
-                    explanation=data.get("explanation", ""),
-                )
-            except json.JSONDecodeError:
-                pass
-        
-        # Fallback: try to extract diff directly
-        diff_match = re.search(r'```(?:diff)?\s*(---.*?)\s*```', content, re.DOTALL)
-        if diff_match:
-            patch = diff_match.group(1)
-            patch_info = PatchInfo.from_diff(patch)
-            return PatchResult(
-                patch_content=patch,
-                modified_files=patch_info.modified_files,
-                explanation="Extracted from response",
-            )
-        
-        # Last resort: look for unified diff pattern anywhere
-        diff_pattern = r'(--- a/.*?\n\+\+\+ b/.*?\n@@.*?(?:\n[-+ ].*)*)'
-        diff_match = re.search(diff_pattern, content, re.DOTALL)
-        if diff_match:
-            patch = diff_match.group(1)
-            patch_info = PatchInfo.from_diff(patch)
-            return PatchResult(
-                patch_content=patch,
-                modified_files=patch_info.modified_files,
-                explanation="Extracted from response",
-            )
-        
-        self.logger.warning("Could not parse patch from response")
-        return PatchResult(
-            patch_content="",
-            explanation=f"Failed to parse patch. Raw response: {content[:500]}",
-        )
+        return parse_patch_response(content)

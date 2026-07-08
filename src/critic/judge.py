@@ -7,26 +7,13 @@ structured feedback for analysis.
 
 import logging
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from src.environment.models import PatchInfo
-from src.orchestrator.orchestrator import ExecutionResult, ExecutionStatus, IterationRecord
+from src.orchestrator.orchestrator import ExecutionResult, ExecutionStatus
+from src.skills.failure_types import FailureType, failure_type_from_verification_status
 
 logger = logging.getLogger(__name__)
-
-
-class FailureType(Enum):
-    """Types of failures that can occur during execution."""
-    
-    NONE = "none"
-    LOCALIZATION_ERROR = "localization_error"
-    PATCH_GENERATION_ERROR = "patch_generation_error"
-    PATCH_APPLICATION_ERROR = "patch_application_error"
-    TEST_FAILURE = "test_failure"
-    REGRESSION_INTRODUCED = "regression_introduced"
-    TIMEOUT = "timeout"
-    UNKNOWN = "unknown"
 
 
 @dataclass
@@ -91,25 +78,32 @@ class CriticJudge:
     def __init__(self):
         self.logger = logging.getLogger(f"{__name__}.CriticJudge")
     
-    def evaluate(self, result: ExecutionResult) -> Evaluation:
+    def evaluate(self, result: ExecutionResult, eval_outcome: Any = None) -> Evaluation:
         """
         Evaluate an execution result.
-        
+
         Args:
             result: The execution result to evaluate.
-            
+            eval_outcome: Optional ``EvalOutcome`` (official per-test grading of
+                the final patch). When absent, the counts fall back to any
+                outcome the verifier attached in the loop, then to the last
+                run's per-test statuses.
+
         Returns:
             Evaluation with metrics and analysis.
         """
         self.logger.info(f"Evaluating execution for issue: {result.issue_id}")
-        
+
         evaluation = Evaluation(
             success=result.success,
             iterations_used=result.iterations_used,
             total_tokens=result.total_tokens,
             total_duration_ms=result.total_duration_ms,
         )
-        
+
+        # Real test counts, so pass_rate reflects actual F2P/P2P evidence.
+        self._populate_test_counts(evaluation, result, eval_outcome)
+
         # Analyze patch if available
         if result.final_patch:
             evaluation.patch_lines_changed = result.final_patch.total_changes
@@ -138,40 +132,57 @@ class CriticJudge:
         """Check if patch follows minimal change principle."""
         # Simple heuristic: less than 50 lines changed
         return patch.total_changes <= 50
-    
+
+    @staticmethod
+    def _populate_test_counts(
+        evaluation: Evaluation,
+        result: ExecutionResult,
+        eval_outcome: Any,
+    ) -> None:
+        """Set tests_passed/tests_total from the best available test evidence."""
+        outcome = eval_outcome
+        if outcome is None:
+            for record in reversed(result.iteration_records):
+                verification = record.verification_result
+                candidate = getattr(verification, "eval_outcome", None) if verification else None
+                if candidate is not None:
+                    outcome = candidate
+                    break
+        if outcome is not None:
+            evaluation.tests_passed = outcome.f2p_passed + outcome.p2p_passed
+            evaluation.tests_total = outcome.f2p_total + outcome.p2p_total
+            return
+        for record in reversed(result.iteration_records):
+            verification = record.verification_result
+            test_result = getattr(verification, "test_result", None) if verification else None
+            if test_result is not None:
+                evaluation.tests_passed = test_result.passed_tests
+                evaluation.tests_total = test_result.total_tests
+                return
+
     def _determine_failure_type(self, result: ExecutionResult) -> FailureType:
-        """Determine the primary failure type."""
+        """Determine the primary failure type via the unified taxonomy."""
         if result.status == ExecutionStatus.ERROR:
             return FailureType.UNKNOWN
-        
+
         if not result.iteration_records:
             return FailureType.UNKNOWN
-        
+
         last_record = result.iteration_records[-1]
-        
-        # Check each stage
+
         if last_record.inspection_result is None:
             return FailureType.LOCALIZATION_ERROR
-        
-        if last_record.patch_result is None:
+
+        if last_record.patch_result is None or not last_record.patch_result.patch_content:
             return FailureType.PATCH_GENERATION_ERROR
-        
-        if last_record.patch_result and not last_record.patch_result.patch_content:
-            return FailureType.PATCH_GENERATION_ERROR
-        
+
         if last_record.verification_result:
-            from src.workers.verifier import VerificationStatus
-            
-            status = last_record.verification_result.status
-            if status == VerificationStatus.EMPTY_PATCH:
-                return FailureType.PATCH_GENERATION_ERROR
-            if status in (VerificationStatus.PATCH_FAILED, VerificationStatus.NO_CHANGES):
-                return FailureType.PATCH_APPLICATION_ERROR
-            if status == VerificationStatus.NEW_ISSUES:
-                return FailureType.REGRESSION_INTRODUCED
-            if status == VerificationStatus.TESTS_FAILED:
-                return FailureType.TEST_FAILURE
-        
+            return FailureType(
+                failure_type_from_verification_status(
+                    last_record.verification_result.status.value
+                )
+            )
+
         return FailureType.UNKNOWN
     
     def _extract_failure_tags(self, result: ExecutionResult) -> List[str]:
@@ -275,36 +286,3 @@ class CriticJudge:
             )
         
         return " ".join(reflections) if reflections else "No specific reflection available."
-    
-    def compare_evaluations(
-        self,
-        evaluations: List[Evaluation],
-    ) -> Dict[str, Any]:
-        """
-        Compare multiple evaluations to identify patterns.
-        
-        Useful for analyzing batch results.
-        """
-        if not evaluations:
-            return {}
-        
-        success_count = sum(1 for e in evaluations if e.success)
-        total = len(evaluations)
-        
-        failure_types = {}
-        for e in evaluations:
-            ft = e.failure_type.value
-            failure_types[ft] = failure_types.get(ft, 0) + 1
-        
-        avg_iterations = sum(e.iterations_used for e in evaluations) / total
-        avg_tokens = sum(e.total_tokens for e in evaluations) / total
-        
-        return {
-            "total": total,
-            "success_count": success_count,
-            "success_rate": success_count / total,
-            "failure_type_distribution": failure_types,
-            "avg_iterations": avg_iterations,
-            "avg_tokens": avg_tokens,
-            "avg_efficiency": sum(e.efficiency_score for e in evaluations) / total,
-        }

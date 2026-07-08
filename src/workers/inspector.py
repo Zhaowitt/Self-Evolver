@@ -13,7 +13,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from src.benchmark.datasets import source_globs
 from src.config import get_config
+from src.controller.injection import format_controller_guidance
 from src.environment.models import CodeLocation, ExecutionContext
 from src.environment.project_env import ProjectEnvironment
 from src.llm.client import LLMClient, LLMResponse, Message
@@ -82,9 +84,11 @@ class Inspector(BaseWorker):
         self,
         env: ProjectEnvironment,
         llm_client: Optional[LLMClient] = None,
+        skill_bank: Any = None,
     ):
         super().__init__(llm_client=llm_client, name="Inspector")
         self.env = env
+        self.skill_bank = skill_bank
         agent_config = get_config().agent
         self.max_tool_calls = max(0, agent_config.inspector_max_tool_calls)
         self.read_max_lines = max(1, agent_config.inspector_read_max_lines)
@@ -134,7 +138,14 @@ class Inspector(BaseWorker):
         parts = []
         parts.append("## Issue Description")
         parts.append(context.issue.description)
-        
+
+        controller_guidance = format_controller_guidance(
+            context.metadata.get("controller_signal"),
+            skill_bank=self.skill_bank,
+        )
+        if controller_guidance:
+            parts.append("\n" + controller_guidance)
+
         if context.issue.hints:
             parts.append("\n## Hints")
             parts.append(context.issue.hints)
@@ -142,9 +153,12 @@ class Inspector(BaseWorker):
         parts.append(f"\n## Repository: {context.repo_state.path.name}")
         
         try:
-            py_files = self.env.list_files("**/*.py")[:50]
-            parts.append("\n## Python Files in Repository:")
-            parts.append("\n".join(f"- {f}" for f in py_files))
+            language = context.issue.metadata.get("repo_language") if context.issue.metadata else None
+            source_files: List[str] = []
+            for glob in source_globs(language):
+                source_files.extend(self.env.list_files(glob))
+            parts.append(f"\n## Source Files in Repository ({language or 'python'}):")
+            parts.append("\n".join(f"- {f}" for f in source_files[:50]))
         except Exception as e:
             self.logger.warning(f"Could not list files: {e}")
         
@@ -157,7 +171,20 @@ class Inspector(BaseWorker):
     def _build_retry_context(self, context: ExecutionContext) -> str:
         """Build context for retry attempts."""
         parts = [f"## This is attempt #{context.iteration + 1}"]
-        
+
+        # On a re-inspection the judge already critiqued the previous
+        # localization; surface its routing and feedback so the fault region is
+        # reconsidered instead of repeated.
+        judge_route = context.metadata.get("next_route")
+        judge_feedback = context.metadata.get("judge_feedback")
+        if judge_feedback or judge_route:
+            parts.append("\n## Judge Localization Feedback")
+            if judge_route:
+                parts.append(f"Route: {judge_route}")
+            if judge_feedback:
+                parts.append(str(judge_feedback))
+            parts.append("Use this feedback to reconsider which files and lines are at fault.")
+
         error_context = self._format_error_context(context)
         if error_context:
             parts.append(error_context)
@@ -508,11 +535,12 @@ class Inspector(BaseWorker):
         """Normalize ripgrep output to repo-relative paths."""
         formatted = []
         for line in output.splitlines()[:max_matches]:
-            file_part, sep, rest = line.partition(":")
-            if sep:
+            parts = line.rsplit(":", 2)
+            if len(parts) == 3:
+                file_part, line_no, rest = parts
                 try:
                     rel = self._repo_relative(Path(file_part).resolve())
-                    formatted.append(f"{rel}:{rest}")
+                    formatted.append(f"{rel}:{line_no}:{rest}")
                     continue
                 except ValueError:
                     pass

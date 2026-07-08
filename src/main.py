@@ -216,64 +216,64 @@ def config_info(ctx):
 
 @cli.command()
 @click.option(
+    "--benchmark", "-b", "benchmark_name",
+    default="swebench",
+    type=click.Choice(["swebench", "swebench_live", "swebench_pro", "multi_swe_bench"]),
+    help="Benchmark family to run",
+)
+@click.option(
     "--dataset", "-d",
     default="lite",
-    type=click.Choice(["lite", "verified", "full"]),
-    help="SWE-bench dataset variant to use",
+    help="Dataset variant (swebench: lite|verified|full; "
+         "swebench_live: lite|full|verified|test; swebench_pro: test; "
+         "multi_swe_bench: full|flash)",
 )
-@click.option(
-    "--num-instances", "-n",
-    default=None,
-    type=int,
-    help="Number of instances to run (default: all)",
-)
-@click.option(
-    "--output-dir", "-o",
-    default="./benchmark_results",
-    type=click.Path(),
-    help="Output directory for benchmark results",
-)
-@click.option(
-    "--workspace-dir",
-    default=None,
-    type=click.Path(),
-    help="Workspace directory for cloned benchmark repositories",
-)
-@click.option(
-    "--split",
-    default="test",
-    help="Dataset split (train/dev/test)",
-)
-@click.option(
-    "--phase",
-    default="generate",
-    type=click.Choice(["generate", "evaluate", "both", "legacy"]),
-    help="Benchmark phase to run",
-)
-@click.option(
-    "--predictions-path",
-    default=None,
-    type=click.Path(),
-    help="Path to SWE-bench predictions JSON",
-)
-@click.option("--run-id", default="self-evolver", help="SWE-bench evaluation run ID")
-@click.option("--model-name", default="self-evolver", help="SWE-bench prediction model name")
-@click.option("--agent-workers", default=1, help="Parallel workers for prediction generation")
-@click.option("--eval-workers", default=2, help="Parallel workers for official evaluation")
+@click.option("--num-instances", "-n", default=None, type=int,
+              help="Instances to run (train stage: number of rollouts). Default: all")
+@click.option("--output-dir", "-o", default="./benchmark_results", type=click.Path(),
+              help="Run directory for predictions, rollouts, snapshot, and metrics")
+@click.option("--workspace-dir", default=None, type=click.Path(),
+              help="Directory for cloned benchmark repositories")
+@click.option("--split", default="test", help="Dataset split (validated per dataset)")
+@click.option("--phase", default="generate",
+              type=click.Choice(["generate", "evaluate", "both"]),
+              help="Benchmark phase to run")
+@click.option("--predictions-path", default=None, type=click.Path(),
+              help="Path to the predictions JSON (default: <output-dir>/predictions.json)")
+@click.option("--run-id", default="self-evolver", help="Evaluation run id")
+@click.option("--model-name", default="self-evolver", help="Prediction model name")
+@click.option("--agent-mode", default="mas", type=click.Choice(["single", "mas"]),
+              help="single: one-shot baseline; mas: multi-agent repair loop")
+@click.option("--skills", default="static", type=click.Choice(["off", "static", "evolve"]),
+              help="off: no skills; static: fixed bank; evolve: skill evolution (train)")
+@click.option("--memory", default="on", type=click.Choice(["on", "off"]),
+              help="Hard-case retrieval and reflection")
+@click.option("--task-evolution", default="off", type=click.Choice(["on", "off"]),
+              help="TaskPool-driven sampling and focused variants (train stage only)")
+@click.option("--controller-mode", default="off", type=click.Choice(["off", "llm"]),
+              help="Upstream Controller guidance mode")
+@click.option("--stage", default="eval", type=click.Choice(["train", "eval"]),
+              help="train enables evolution; eval freezes the skill bank (no writes)")
+@click.option("--seed", default=0, type=int, help="RNG seed for task sampling")
+@click.option("--test-backend", default="auto",
+              type=click.Choice(["auto", "docker", "apptainer", "host"]),
+              help="In-loop verification backend (official container semantics)")
+@click.option("--hints", is_flag=True, default=False,
+              help="Surface human hints_text to the worker (off by default)")
+@click.option("--validate-skills", default=0, type=int,
+              help="Replay M held-out instances before a reflector skill write")
+@click.option("--train-ids", default=None, type=click.Path(exists=True),
+              help="File of training ids to exclude from an eval set (contamination guard)")
+@click.option("--eval-workers", default=2, help="Workers for the official docker harness")
 @click.option("--resume/--no-resume", default=True, help="Resume from existing predictions")
-@click.option(
-    "--cleanup-images/--no-cleanup-images",
-    default=True,
-    help="Clean SWE-bench Docker env/eval images after each repo batch",
-)
-@click.option(
-    "--cleanup-repos/--no-cleanup-repos",
-    default=True,
-    help="Clean cloned repositories after prediction generation",
-)
+@click.option("--reward-config", default=None, type=click.Path(exists=True),
+              help="Reward config file (default: configs/reward_config.yaml)")
+@click.option("--cleanup-images/--no-cleanup-images", default=True,
+              help="Clean docker env/eval images after each repo batch")
 @click.pass_context
 def benchmark(
     ctx,
+    benchmark_name,
     dataset,
     num_instances,
     output_dir,
@@ -283,80 +283,104 @@ def benchmark(
     predictions_path,
     run_id,
     model_name,
-    agent_workers,
+    agent_mode,
+    skills,
+    memory,
+    task_evolution,
+    controller_mode,
+    stage,
+    seed,
+    test_backend,
+    hints,
+    validate_skills,
+    train_ids,
     eval_workers,
     resume,
+    reward_config,
     cleanup_images,
-    cleanup_repos,
 ):
-    """Run SWE-bench benchmark evaluation."""
-    console.print("[bold]SWE-bench Benchmark Evaluation[/bold]")
-    console.print(f"Dataset: swebench-{dataset}")
-    if num_instances:
-        console.print(f"Instances: {num_instances}")
-    console.print(f"Split: {split}")
-    console.print(f"Phase: {phase}")
+    """Run a SWE-bench-family benchmark under one experiment configuration."""
+    console.print(f"[bold]{benchmark_name} benchmark[/bold]")
+    console.print(f"Dataset: {dataset} | Split: {split} | Phase: {phase} | Stage: {stage}")
+    console.print(
+        f"Experiment: agent={agent_mode} skills={skills} memory={memory} "
+        f"task-evolution={task_evolution} controller={controller_mode} "
+        f"backend={test_backend} seed={seed}"
+    )
     console.print()
 
-    # Check API key only for phases that generate patches.
+    if stage == "eval" and (task_evolution == "on" or skills == "evolve"):
+        console.print(
+            "[yellow]Note: evolution is train-only; eval runs frozen "
+            "(no skill/task writes).[/yellow]"
+        )
+
     config = get_config()
-    if phase in {"generate", "both", "legacy"} and not config.validate_api_key():
+    if phase in {"generate", "both"} and not config.validate_api_key():
         console.print("[red]Error: OPENAI_API_KEY not configured.[/red]")
         console.print("Please set OPENAI_API_KEY in your .env file.")
         sys.exit(1)
 
-    try:
-        from src.benchmark.swebench_runner import create_swebench_runner
-    except ImportError as e:
-        console.print(f"[red]Import error: {e}[/red]")
-        console.print("Install swebench with: pip install swebench")
-        sys.exit(1)
+    from src.benchmark.swebench_runner import ExperimentConfig
+    from src.benchmark.swebench_pro import ProEvaluationUnavailable
+    from src.benchmark.swebench_multi import MultiSWEEvaluationUnavailable
 
-    runner = create_swebench_runner(
+    experiment = ExperimentConfig(
+        agent_mode=agent_mode,
+        skills=skills,
+        memory=memory,
+        task_evolution=task_evolution,
+        controller_mode=controller_mode,
+        stage=stage,
+        seed=seed,
+        test_backend=test_backend,
+        hints=hints,
+        validate_skills=validate_skills,
+        label=f"{benchmark_name}-{dataset}-{stage}",
+    )
+
+    if benchmark_name == "swebench":
+        from src.benchmark.swebench_runner import create_swebench_runner as make_runner
+    elif benchmark_name == "swebench_live":
+        from src.benchmark.swebench_live import create_swebench_live_runner as make_runner
+    elif benchmark_name == "multi_swe_bench":
+        from src.benchmark.swebench_multi import create_multi_swe_bench_runner as make_runner
+    else:
+        from src.benchmark.swebench_pro import create_swebench_pro_runner as make_runner
+
+    runner = make_runner(
         dataset=dataset,
         output_dir=Path(output_dir),
         workspace_dir=Path(workspace_dir) if workspace_dir else None,
         model_name=model_name,
         run_id=run_id,
+        experiment=experiment,
+        reward_config=Path(reward_config) if reward_config else None,
+        train_ids_path=Path(train_ids) if train_ids else None,
     )
 
-    if phase == "legacy":
-        console.print("[bold]Loading instances...[/bold]")
-        result = runner.run_benchmark(
+    try:
+        result = runner.run_phased_benchmark(
+            phase=phase,
             num_instances=num_instances,
             split=split,
+            predictions_path=Path(predictions_path) if predictions_path else None,
+            run_id=run_id,
+            eval_workers=eval_workers,
+            resume=resume,
+            cleanup_images=cleanup_images,
         )
+    except ProEvaluationUnavailable as exc:
+        console.print(Panel(str(exc), title="SWE-bench Pro evaluation", border_style="yellow"))
+        sys.exit(2)
+    except MultiSWEEvaluationUnavailable as exc:
+        console.print(Panel(str(exc), title="Multi-SWE-bench evaluation", border_style="yellow"))
+        sys.exit(2)
 
-        table = Table(title="Benchmark Results")
-        table.add_column("Metric", style="cyan")
-        table.add_column("Value", style="green")
-        table.add_row("Total Instances", str(result.total_instances))
-        table.add_row("Successful", str(result.successful))
-        table.add_row("Failed", str(result.failed))
-        table.add_row("Errors", str(result.errors))
-        table.add_row("Success Rate", f"{result.success_rate:.1%}")
-        table.add_row("Total Tokens", str(result.total_tokens))
-        table.add_row("Duration", f"{result.total_duration_ms:.0f}ms")
-        console.print(table)
-        sys.exit(0 if result.successful > 0 else 1)
-
-    result = runner.run_phased_benchmark(
-        phase=phase,
-        num_instances=num_instances,
-        split=split,
-        predictions_path=Path(predictions_path) if predictions_path else None,
-        model_name=model_name,
-        run_id=run_id,
-        agent_workers=agent_workers,
-        eval_workers=eval_workers,
-        resume=resume,
-        cleanup_images=cleanup_images,
-        cleanup_repo=cleanup_repos,
-    )
-
-    table = Table(title="SWE-bench Phased Result")
+    table = Table(title=f"{benchmark_name} result")
     table.add_column("Metric", style="cyan")
     table.add_column("Value", style="green")
+    table.add_row("Run directory", str(runner.run_dir))
     table.add_row("Predictions", result["predictions_path"])
     if "predictions" in result:
         predictions = result["predictions"]
@@ -365,16 +389,14 @@ def benchmark(
         table.add_row("Empty Patches", str(predictions.get("empty", 0)))
     if "evaluation" in result:
         evaluation = result["evaluation"]
+        table.add_row("Backend", str(evaluation.get("backend", "")))
         table.add_row("Resolved", str(evaluation.get("resolved_count", 0)))
         table.add_row("Unresolved", str(evaluation.get("unresolved_count", 0)))
-        table.add_row("Infra Errors", str(evaluation.get("infra_error_count", 0)))
-        table.add_row("Patch Errors", str(evaluation.get("patch_error_count", 0)))
-        table.add_row(
-            "Resolve Rate excl. Infra",
-            f"{evaluation.get('resolve_rate_excluding_infra', 0.0):.1%}",
-        )
+        if "infra_error_count" in evaluation:
+            table.add_row("Infra Errors", str(evaluation.get("infra_error_count", 0)))
+            table.add_row("Patch Errors", str(evaluation.get("patch_error_count", 0)))
+        table.add_row("Resolve Rate", f"{evaluation.get('resolve_rate', 0.0):.1%}")
     console.print(table)
-
     sys.exit(0)
 
 
