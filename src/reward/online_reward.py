@@ -111,6 +111,7 @@ def _score_one(
             rollout_writer=rollout_writer,
             skill_evolver=skill_evolver,
             test_backend=test_backend,
+            verify_in_loop=True,
             stage=stage,
             seed=_int_or_none(extra_info.get("seed")),
             experiment=str(extra_info.get("experiment") or "rl_online"),
@@ -200,6 +201,15 @@ def prepare_environment(
 
     repo_dir.mkdir(parents=True, exist_ok=True)
     test_cmd = extra_info.get("test_cmd") or build_targeted_test_cmd(issue)
+    if not test_cmd:
+        # Without FAIL_TO_PASS the Verifier would fall back to a bare ``pytest``
+        # that runs the whole repository suite: slow and not the SWE-bench reward
+        # signal. Refuse it so compute_score scores the sample 0 instead.
+        raise ValueError(
+            f"{issue.id}: no FAIL_TO_PASS metadata and no explicit extra_info['test_cmd']; "
+            "refusing to run the full repository test suite. Fix the dataset's "
+            "FAIL_TO_PASS / PASS_TO_PASS or pass extra_info['test_cmd']."
+        )
     timeout = int(extra_info.get("timeout") or get_config().agent.timeout_seconds)
 
     env = ProjectEnvironment(repo_dir, test_cmd=test_cmd, timeout=timeout)
