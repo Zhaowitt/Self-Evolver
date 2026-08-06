@@ -1,48 +1,106 @@
-# Example EasyR1 GRPO overrides for online Controller training.
-# Paths are relative to the Self-Evolver repo root; run EasyR1 from there
-# (see scripts/run_rl_controller.sh).
-experiment_name: self_evolver_controller_online_grpo
-controller_model: Qwen/Qwen2.5-1.5B-Instruct
-
+# One-GPU EasyR1 GRPO configuration for the Self-Evolver Controller.
+# scripts/run_rl_controller.sh supplies absolute train/validation/reward paths.
 data:
-  # Generate with:
-  #   python -m src.rl.easyr1_dataset --output data/controller_train.jsonl \
-  #     --dataset full --split train --exclude-ids data/eval_ids.txt
-  #   python -m src.rl.easyr1_dataset --output data/controller_val.jsonl \
-  #     --dataset lite --split dev --stage eval
   train_files: data/controller_train.jsonl
   val_files: data/controller_val.jsonl
   prompt_key: prompt
   answer_key: ground_truth
-  max_prompt_length: 8192
-  max_response_length: 1536
-  rollout_batch_size: 8
+  max_prompt_length: 12288
+  max_response_length: 1024
+  rollout_batch_size: 4
+  mini_rollout_batch_size: null
+  val_batch_size: 2
+  format_prompt: null
+  shuffle: true
+  seed: 1
+  filter_overlong_prompts: true
+  filter_overlong_prompts_workers: 8
+
+algorithm:
+  adv_estimator: grpo
+  disable_kl: false
+  use_kl_loss: true
+  kl_penalty: low_var_kl
+  kl_coef: 1.0e-2
+  online_filtering: false
 
 worker:
+  actor:
+    global_batch_size: 4
+    micro_batch_size_per_device_for_update: 1
+    micro_batch_size_per_device_for_experience: 1
+    max_grad_norm: 1.0
+    padding_free: true
+    dynamic_batching: true
+    ulysses_size: 1
+    model:
+      model_path: /root/self-evolver-lab/models/Qwen2.5-1.5B-Instruct
+      enable_gradient_checkpointing: true
+      trust_remote_code: false
+      lora:
+        rank: 16
+        alpha: 32
+        target_modules: all-linear
+    optim:
+      lr: 1.0e-6
+      weight_decay: 1.0e-2
+      strategy: adamw_bf16
+      lr_warmup_ratio: 0.03
+    fsdp:
+      enable_full_shard: true
+      enable_cpu_offload: false
+      enable_rank0_init: true
+      torch_dtype: bf16
+    offload:
+      offload_params: false
+      offload_optimizer: false
+
+  rollout:
+    n: 3
+    temperature: 1.0
+    top_p: 1.0
+    limit_images: 0
+    # Leaves room on a 32 GiB card for the colocated actor and a small
+    # external worker model used by the online execution reward.
+    gpu_memory_utilization: 0.2
+    enforce_eager: true
+    enable_chunked_prefill: true
+    tensor_parallel_size: 1
+    max_model_len: 13312
+    max_num_batched_tokens: 13312
+    disable_tqdm: false
+    val_override_config:
+      temperature: 0.6
+      top_p: 0.95
+      n: 1
+
+  ref:
+    fsdp:
+      enable_full_shard: true
+      enable_cpu_offload: false
+      enable_rank0_init: true
+      torch_dtype: bf16
+    offload:
+      # LoRA reuses the actor module as the reference model in EasyR1.
+      # Keep the shared module on GPU when using the unmodified EasyR1 worker.
+      offload_params: false
+
   reward:
     reward_function: src/reward/online_reward.py:compute_score
+    num_cpus: 4
 
-# Environment variables read by compute_score (set before launching EasyR1):
-#   SELF_EVOLVER_TEST_BACKEND     apptainer (default) | docker — container
-#                                 engine for official-semantics patch grading
-#   SELF_EVOLVER_REWARD_CONFIG    reward config path (default configs/reward_config.yaml)
-#   SELF_EVOLVER_ROLLOUT_JSONL    rollout log path (default benchmark_results/online_rollouts.jsonl)
-#   SELF_EVOLVER_REWARD_WORKSPACE workspace for cached repo checkouts
-#   SELF_EVOLVER_ENABLE_SKILL_EVOLUTION  1 to evolve skills during training (default 0)
-#   SELF_EVOLVER_MAX_ITERATIONS   repair-loop budget per episode
-self_evolver:
-  rollout_jsonl: benchmark_results/online_rollouts.jsonl
-  reward_config: configs/reward_config.yaml
-  enable_skill_evolution: false
-
-serving:
-  engine: vllm
-  base_url: http://127.0.0.1:8000/v1
-  model_env: CONTROLLER_MODEL
-
-notes:
-  - rollout_jsonl is execution logging only, not the reward source.
-  - EasyR1 calls src/reward/online_reward.py:compute_score per rollout batch;
-    each sample runs a full repair episode plus one container eval, so keep
-    rollout_batch_size small.
-  - Evaluation mode must keep task_wrapper disabled (stage=eval enforces it).
+trainer:
+  total_epochs: 1
+  max_steps: 64
+  project_name: self_evolver
+  experiment_name: controller_online_grpo_qwen2_5_1_5b_round1_64step
+  logger: [console]
+  nnodes: 1
+  n_gpus_per_node: 1
+  max_try_make_batch: 20
+  val_freq: 8
+  val_before_train: false
+  val_generations_to_log: 2
+  save_freq: 4
+  save_limit: 3
+  find_last_checkpoint: true

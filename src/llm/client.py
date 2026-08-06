@@ -134,12 +134,22 @@ class LLMClient:
         
         logger.debug(f"Sending chat request to {model} with {len(messages)} messages")
         
-        response = self.client.chat.completions.create(
-            model=model,
-            messages=message_dicts,
-            temperature=temperature,
-            max_tokens=max_tokens,
+        request_kwargs: Dict[str, Any] = {
+            "model": model,
+            "messages": message_dicts,
+            "temperature": temperature,
             **kwargs,
+        }
+        # GPT-5 family Chat Completions models reject the legacy max_tokens
+        # parameter in favor of max_completion_tokens. Keep older compatible
+        # endpoints unchanged.
+        token_parameter = (
+            "max_completion_tokens" if model.lower().startswith("gpt-5") else "max_tokens"
+        )
+        request_kwargs[token_parameter] = max_tokens
+
+        response = self.client.chat.completions.create(
+            **request_kwargs,
         )
         
         # Extract response data

@@ -25,6 +25,8 @@ class SkillStats:
     revision: int = 0
     last_updated_at: str = ""
     history: List[Dict[str, Any]] = field(default_factory=list)
+    round_stats: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    completed_rounds: List[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SkillStats":
@@ -43,6 +45,8 @@ class SkillStats:
             revision=int(data.get("revision", 0) or 0),
             last_updated_at=str(data.get("last_updated_at", "")),
             history=list(data.get("history") or []),
+            round_stats=dict(data.get("round_stats") or {}),
+            completed_rounds=list(data.get("completed_rounds") or []),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -55,7 +59,13 @@ class SkillStats:
             return 0.0
         return (self.successes - self.failures) / self.usage_count
 
-    def record_credit(self, reward: float, advantage: float, success: Optional[bool] = None) -> None:
+    def record_credit(
+        self,
+        reward: float,
+        advantage: float,
+        success: Optional[bool] = None,
+        round_id: Optional[str] = None,
+    ) -> None:
         """Record one credited trial with advantage-style contribution accounting.
 
         When `success` is unknown, the sign of the advantage decides the trial
@@ -84,6 +94,25 @@ class SkillStats:
             self.successes += 1
         else:
             self.failures += 1
+        if round_id:
+            current = dict(self.round_stats.get(round_id) or {})
+            current["usage_count"] = int(current.get("usage_count", 0)) + 1
+            current["reward_sum"] = float(current.get("reward_sum", 0.0)) + float(reward)
+            current["advantage_sum"] = float(current.get("advantage_sum", 0.0)) + float(
+                advantage
+            )
+            current.setdefault("successes", 0)
+            current.setdefault("failures", 0)
+            if success is None:
+                if advantage > 0:
+                    current["successes"] += 1
+                elif advantage < 0:
+                    current["failures"] += 1
+            elif success:
+                current["successes"] += 1
+            else:
+                current["failures"] += 1
+            self.round_stats[round_id] = current
         self.last_updated_at = datetime.now().isoformat()
 
     def record_event(self, event: str, **payload: Any) -> None:

@@ -230,5 +230,11 @@ def test_easyr1_example_references_live_reward_code():
     module = importlib.import_module(module_path.replace("/", ".")[: -len(".py")])
     assert callable(getattr(module, function_name))
 
-    reward_config = data["self_evolver"]["reward_config"]
-    assert (Path(__file__).resolve().parents[1] / reward_config).exists()
+    # The runnable EasyR1 schema cannot carry arbitrary Self-Evolver top-level
+    # keys. The launcher supplies this integration setting via the environment.
+    launcher = (CONFIG_DIR.parent / "scripts" / "run_rl_controller.sh").read_text()
+    assert "SELF_EVOLVER_REWARD_CONFIG" in launcher
+    assert "SELF_EVOLVER_REWARD_WORKERS" in launcher
+    assert "configs/reward_config.yaml" in launcher
+    assert 'trainer.val_freq="${EASYR1_VAL_FREQ}"' in launcher
+    assert 'data.val_batch_size="${EASYR1_VAL_BATCH_SIZE}"' in launcher

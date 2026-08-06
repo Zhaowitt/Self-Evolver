@@ -124,6 +124,27 @@ def test_reflect_without_qualifying_cluster_skips_llm(tmp_path):
     assert result.evolution is None
 
 
+def test_reflect_records_only_uses_explicit_round_slice(tmp_path):
+    llm = ScriptedLLM(PROPOSAL_JSON)
+    reflector = _reflector(tmp_path, llm)
+    records = [
+        HardCaseRecord(
+            issue_id=f"round__issue-{index}",
+            repo_name="acme/widgets",
+            failure_type="patch_application_error",
+            reason="git apply failed malformed hunk context",
+            stage="train",
+        )
+        for index in range(3)
+    ]
+
+    result = reflector.reflect_records(records)
+
+    assert llm.calls == 1
+    assert result.qualifying_cluster_count == 1
+    assert (tmp_path / "skills" / "diagnose_apply_errors.md").exists()
+
+
 def test_reflect_ignores_other_stage_records(tmp_path):
     buffer = HardCaseBuffer(tmp_path / "hard_cases.jsonl")
     for issue_id in ("e1", "e2", "e3"):

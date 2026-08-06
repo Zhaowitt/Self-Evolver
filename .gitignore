@@ -79,6 +79,9 @@ workspace/
 benchmark_results/
 runs/
 data/
+!data/
+data/*
+!data/eval_ids.txt
 tmp/
 temp/
 

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
-from src.controller.schema import ControllerSignal, controller_signal_from_any
+from src.controller.schema import ControllerSignal, SkillSignal, controller_signal_from_any
 from src.skills.skill_bank import SkillBank, extract_procedure
+from src.skills.textnorm import slug
 
 MAX_PROCEDURE_CHARS = 800
 MAX_INJECTED_SKILLS = 2
@@ -32,7 +33,8 @@ def format_controller_guidance(
     up from ``skill_bank`` so the worker sees the actual repair discipline, not
     just a name. Pass a frozen bank during eval so guidance matches the snapshot.
     """
-    signal = controller_signal_from_any(signal_like)
+    bank = skill_bank or _default_bank()
+    signal = ground_controller_skills(signal_like, skill_bank=bank)
     if not signal or not signal.has_guidance:
         return ""
 
@@ -44,7 +46,7 @@ def format_controller_guidance(
     if signal.mode == "train" and signal.task_wrapper:
         lines.extend(["", "Task wrapper:", signal.task_wrapper])
 
-    skill_text = _format_skills(signal, skill_bank or _default_bank())
+    skill_text = _format_skills(signal, bank)
     if skill_text:
         lines.extend(["", skill_text])
 
@@ -60,6 +62,64 @@ def format_controller_guidance(
     lines.append("")
     lines.append("Keep the patch minimal and grounded in repository evidence.")
     return "\n".join(lines)
+
+
+def ground_controller_skills(
+    signal_like: Any,
+    skill_bank: Optional[SkillBank] = None,
+    allowed_skill_ids: Optional[Iterable[str]] = None,
+) -> Optional[ControllerSignal]:
+    """Replace model-authored skill metadata with canonical bank entries.
+
+    Unknown, inactive, and (when supplied) non-candidate skill IDs are dropped.
+    This is a code-level boundary: prompt instructions alone are not trusted.
+    """
+    signal = controller_signal_from_any(signal_like)
+    if signal is None:
+        return None
+
+    bank = skill_bank or _default_bank()
+    active = {skill.id: skill for skill in bank.active()}
+    if allowed_skill_ids is not None:
+        allowed = {slug(str(skill_id)) for skill_id in allowed_skill_ids}
+        active = {skill_id: skill for skill_id, skill in active.items() if skill_id in allowed}
+
+    requested = list(signal.selected_skill_ids)
+    requested.extend(skill.id for skill in signal.skills if skill and skill.id)
+    if signal.skill and signal.skill.id:
+        requested.append(signal.skill.id)
+
+    grounded = []
+    rejected = []
+    seen = set()
+    for raw_id in requested:
+        skill_id = slug(str(raw_id))
+        if not skill_id or skill_id in seen:
+            continue
+        seen.add(skill_id)
+        metadata = active.get(skill_id)
+        if metadata is None:
+            rejected.append(skill_id)
+            continue
+        grounded.append(metadata)
+        if len(grounded) >= MAX_INJECTED_SKILLS:
+            break
+
+    signal.skills = [
+        SkillSignal(
+            id=skill.id,
+            title=skill.title,
+            summary=skill.summary,
+            target_failure_type=skill.target_failure_type,
+        )
+        for skill in grounded
+    ]
+    signal.skill = signal.skills[0] if signal.skills else None
+    signal.selected_skill_ids = [skill.id for skill in grounded]
+    if rejected:
+        signal.metadata = dict(signal.metadata)
+        signal.metadata["rejected_skill_ids"] = rejected
+    return signal
 
 
 def _format_skills(signal: ControllerSignal, skill_bank: SkillBank) -> str:

@@ -18,6 +18,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from src.controller.parser import extract_json_object
 from src.llm.client import LLMClient
+from src.memory.hard_case_buffer import HardCaseRecord, resolve_hard_cases_path
 from src.memory.memory_retriever import MemoryRetriever
 from src.reflection.clustering import (
     FailureCluster,
@@ -97,17 +98,13 @@ class Reflector:
         buffer_path: Optional[Path] = None,
         min_cluster_size: int = MIN_CLUSTER_SIZE,
     ):
-        from src.config import get_config
-
         self.skill_bank = skill_bank or SkillBank()
         self.skill_evolver = skill_evolver or SkillEvolver()
         self.llm_client = llm_client
         self.embedding_client = (
             embedding_client if embedding_client is not None else EmbeddingClient.from_env()
         )
-        self.buffer_path = Path(
-            buffer_path or get_config().environment.workspace_dir / "hard_cases.jsonl"
-        )
+        self.buffer_path = Path(buffer_path or resolve_hard_cases_path())
         self.min_cluster_size = min_cluster_size
 
     def reflect(
@@ -117,6 +114,14 @@ class Reflector:
         validator: Optional[Validator] = None,
     ) -> ReflectionResult:
         records = MemoryRetriever(self.buffer_path).retrieve(stage=stage, limit=limit)
+        return self.reflect_records(records, validator=validator)
+
+    def reflect_records(
+        self,
+        records: List[HardCaseRecord],
+        validator: Optional[Validator] = None,
+    ) -> ReflectionResult:
+        """Reflect over an explicit rollout-round slice of hard cases."""
         clusters = cluster_records(records, embedding_client=self.embedding_client)
         qualifying = qualifying_clusters(clusters, self.min_cluster_size)
 

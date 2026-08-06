@@ -128,6 +128,7 @@ class SkillStore:
         utility: float,
         success: Optional[bool] = None,
         ema_alpha: float = 0.3,
+        round_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Credit skills with advantage = utility - EMA baseline, then update the baseline."""
         normalized_ids = [slug(skill_id) for skill_id in skill_ids if slug(skill_id)]
@@ -141,7 +142,9 @@ class SkillStore:
             for skill_id in normalized_ids:
                 item = stats.get(skill_id) or SkillStats(id=skill_id)
                 item.content_hash = current_hashes.get(skill_id, item.content_hash)
-                item.record_credit(float(utility), advantage, success=success)
+                item.record_credit(
+                    float(utility), advantage, success=success, round_id=round_id
+                )
                 stats[skill_id] = item
 
             new_ema = (

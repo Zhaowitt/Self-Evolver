@@ -27,8 +27,10 @@ class SkillEvolutionConfig:
     skill_write_utility_threshold: float = 0.55
     max_selected_skills: int = 2
     max_active_skills: int = 12
-    retire_min_trials: int = 5
+    retire_min_trials: int = 30
+    retire_min_rounds: int = 2
     retire_net_success_threshold: float = -0.2
+    retire_average_advantage_threshold: float = 0.0
     baseline_ema_alpha: float = 0.3
     reflect_every_n_rollouts: int = 10
 
@@ -88,8 +90,9 @@ class SkillEvolver:
         controller_signal: Any,
         reward: Any,
         success: Optional[bool] = None,
+        round_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Credit the selected skills with advantage-style utility and run retirement."""
+        """Credit selected skills without changing the frozen round's active bank."""
         signal = controller_signal_from_any(controller_signal)
         utility = _reward_total(reward)
         before = self._stats_snapshot()
@@ -123,6 +126,7 @@ class SkillEvolver:
                 utility,
                 success=success,
                 ema_alpha=self.config.baseline_ema_alpha,
+                round_id=round_id,
             )
             for skill_id in credit_ids:
                 events.append(
@@ -138,13 +142,32 @@ class SkillEvolver:
                     )
                 )
 
-        events.extend(self._retire_unhelpful_skills())
         after = self._stats_snapshot()
         return {
             "events": [event.to_dict() for event in events],
             "dedup_decisions": [],
             "skill_stats_before": before,
             "skill_stats_after": after,
+        }
+
+    def finalize_round(self, round_id: str) -> Dict[str, Any]:
+        """Close one frozen GRPO round and run conservative retirement once."""
+        if not round_id:
+            raise ValueError("round_id is required to finalize skill credit")
+        stats = self.store.load_metadata()
+        changed = False
+        for item in stats.values():
+            if round_id in item.round_stats and round_id not in item.completed_rounds:
+                item.completed_rounds.append(round_id)
+                item.record_event("round_completed", round_id=round_id)
+                changed = True
+        if changed:
+            self.store.save_metadata(stats)
+        events = self._retire_unhelpful_skills()
+        return {
+            "round_id": round_id,
+            "events": [event.to_dict() for event in events],
+            "skill_stats_after": self._stats_snapshot(),
         }
 
     def apply_proposals(
@@ -244,17 +267,22 @@ class SkillEvolver:
         )
 
     def _retire_unhelpful_skills(self) -> List[SkillEvolutionEvent]:
-        """Retire skills with trials >= N and net success rate <= threshold."""
+        """Retire only after multiple completed rounds show consistent harm."""
         stats = self.store.load_metadata()
         victims: List[str] = []
         events: List[SkillEvolutionEvent] = []
         for skill_id, item in sorted(stats.items()):
             if item.status != "active":
                 continue
-            if (
-                item.usage_count >= self.config.retire_min_trials
-                and item.net_success_rate <= self.config.retire_net_success_threshold
-            ):
+            recent_round_ids = item.completed_rounds[-self.config.retire_min_rounds :]
+            recent = [item.round_stats.get(round_id) or {} for round_id in recent_round_ids]
+            consistently_negative = len(recent) >= self.config.retire_min_rounds and all(
+                _round_net_success(entry) <= self.config.retire_net_success_threshold
+                and _round_average_advantage(entry)
+                < self.config.retire_average_advantage_threshold
+                for entry in recent
+            )
+            if item.usage_count >= self.config.retire_min_trials and consistently_negative:
                 victims.append(skill_id)
                 events.append(
                     SkillEvolutionEvent(
@@ -267,6 +295,7 @@ class SkillEvolver:
                             "successes": item.successes,
                             "failures": item.failures,
                             "net_success_rate": round(item.net_success_rate, 6),
+                            "completed_rounds": recent_round_ids,
                         },
                     )
                 )
@@ -337,3 +366,17 @@ def _reward_total(reward: Any) -> float:
     if isinstance(reward, dict):
         return float(reward.get("total", 0.0) or 0.0)
     return float(getattr(reward, "total", 0.0) or 0.0)
+
+
+def _round_net_success(stats: Dict[str, Any]) -> float:
+    count = int(stats.get("usage_count", 0) or 0)
+    if count <= 0:
+        return 0.0
+    return (int(stats.get("successes", 0)) - int(stats.get("failures", 0))) / count
+
+
+def _round_average_advantage(stats: Dict[str, Any]) -> float:
+    count = int(stats.get("usage_count", 0) or 0)
+    if count <= 0:
+        return 0.0
+    return float(stats.get("advantage_sum", 0.0) or 0.0) / count

@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Iterable, Mapping, Optional, Sequence
 
 from src.config import ControllerConfig, LLMConfig, get_config
+from src.controller.injection import ground_controller_skills
 from src.controller.parser import parse_controller_response
 from src.controller.prompt_builder import ControllerPromptBuilder
 from src.controller.schema import ControllerSignal, SkillSignal
@@ -96,7 +97,11 @@ class ControllerClient:
                 temperature=self.config.temperature,
                 max_tokens=self.config.max_tokens,
             )
-        return parse_controller_response(response.content, mode=stage, source="llm")
+        signal = parse_controller_response(response.content, mode=stage, source="llm")
+        return ground_controller_skills(
+            signal,
+            allowed_skill_ids=[item["id"] for item in skill_payloads],
+        ) or ControllerSignal.empty(mode=stage, source="llm")
 
 
 def _skill_to_signal(value: Optional[SkillMetadata | SkillSignal]) -> Optional[SkillSignal]:

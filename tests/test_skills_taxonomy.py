@@ -78,7 +78,8 @@ def test_skill_evolution_config_loads_defaults_from_repo_yaml():
     config = SkillEvolutionConfig.load()
     assert config.skill_write_utility_threshold == pytest.approx(0.55)
     assert config.max_active_skills == 12
-    assert config.retire_min_trials == 5
+    assert config.retire_min_trials == 30
+    assert config.retire_min_rounds == 2
     assert config.retire_net_success_threshold == pytest.approx(-0.2)
 
 

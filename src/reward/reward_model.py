@@ -14,6 +14,7 @@ replacing full-reward-by-naming attribution.
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -67,6 +68,7 @@ class RewardModel:
         self.skill_write_gate = float(skill_write_gate)
         self.baseline_alpha = float(baseline_alpha)
         self._baseline: Optional[float] = None
+        self._baseline_lock = threading.Lock()
 
     @classmethod
     def from_config_file(cls, path: Optional[Path] = None) -> "RewardModel":
@@ -118,13 +120,13 @@ class RewardModel:
                 for name, weight in self.weights.items()
             ) / total_weight
         total = round(max(0.0, min(1.0, total)), 6)
-        advantage = self.evolution_utility(total)
+        advantage, baseline = self._update_evolution_baseline(total)
         return RewardResult(
             total=total,
             components={key: round(float(value), 6) for key, value in components.items()},
             weights=dict(self.weights),
             evolution_utility=advantage,
-            baseline=round(self._baseline if self._baseline is not None else total, 6),
+            baseline=baseline,
         )
 
     def evolution_utility(self, utility: float) -> float:
@@ -133,13 +135,21 @@ class RewardModel:
         The first observation seeds the baseline (advantage 0), so skills are
         credited for improvement over the running level, not for showing up.
         """
-        utility = float(utility)
-        if self._baseline is None:
-            self._baseline = utility
-            return 0.0
-        advantage = utility - self._baseline
-        self._baseline = (1.0 - self.baseline_alpha) * self._baseline + self.baseline_alpha * utility
-        return round(advantage, 6)
+        advantage, _ = self._update_evolution_baseline(float(utility))
+        return advantage
+
+    def _update_evolution_baseline(self, utility: float) -> tuple[float, float]:
+        """Atomically update the EMA and return (advantage, new baseline)."""
+        with self._baseline_lock:
+            if self._baseline is None:
+                self._baseline = utility
+                return 0.0, round(utility, 6)
+            advantage = utility - self._baseline
+            self._baseline = (
+                (1.0 - self.baseline_alpha) * self._baseline
+                + self.baseline_alpha * utility
+            )
+            return round(advantage, 6), round(self._baseline, 6)
 
 
 def default_config_path() -> Path:

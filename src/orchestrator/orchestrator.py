@@ -20,7 +20,7 @@ from src.environment.models import (
 )
 from src.environment.project_env import ProjectEnvironment
 from src.llm.client import LLMClient
-from src.memory.hard_case_buffer import HardCaseBuffer
+from src.memory.hard_case_buffer import HardCaseBuffer, resolve_hard_cases_path
 from src.workers.inspector import Inspector, InspectionResult
 from src.workers.llm_judge import JudgeDecision, JudgeRoute, LLMJudge
 from src.workers.patch_generator import PatchGenerator, PatchResult
@@ -363,7 +363,7 @@ class ExecutionOrchestrator:
         ``src.skills.failure_types``.
         """
         try:
-            output_path = get_config().environment.workspace_dir / "hard_cases.jsonl"
+            output_path = resolve_hard_cases_path()
             HardCaseBuffer(output_path).append_from_execution(
                 issue=issue,
                 records=records,

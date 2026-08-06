@@ -79,6 +79,9 @@ class AgentConfig(BaseModel):
     inspector_read_max_chars: int = Field(
         default_factory=lambda: int(os.getenv("INSPECTOR_READ_MAX_CHARS", "20000"))
     )
+    patch_generator_max_tool_calls: int = Field(
+        default_factory=lambda: int(os.getenv("PATCH_GENERATOR_MAX_TOOL_CALLS", "2"))
+    )
 
 
 class EnvironmentConfig(BaseModel):

@@ -7,17 +7,31 @@ Responsible for generating code patches based on inspection results.
 import json
 import logging
 import re
+import difflib
+import textwrap
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, List, Optional
 
+from src.benchmark.datasets import source_globs
 from src.controller.injection import format_controller_guidance
+from src.config import get_config
 from src.environment.models import ExecutionContext, PatchInfo
 from src.environment.project_env import ProjectEnvironment
-from src.llm.client import LLMClient
+from src.llm.client import LLMClient, LLMResponse, Message
 from src.workers.base import BaseWorker, WorkerResult
-from src.workers.inspector import InspectionResult
+from src.workers.inspector import InspectionResult, Inspector
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class EditOperation:
+    """An exact, repository-grounded text replacement."""
+
+    path: str
+    old_text: str
+    new_text: str
 
 
 @dataclass
@@ -28,6 +42,7 @@ class PatchResult:
     modified_files: List[str] = field(default_factory=list)
     explanation: str = ""
     patch_info: Optional[PatchInfo] = None
+    edits: List[EditOperation] = field(default_factory=list)
 
 
 PATCH_GENERATOR_SYSTEM_PROMPT = """You are an expert software engineer specializing in bug fixing and code patching.
@@ -36,59 +51,35 @@ Your task is to generate a minimal, correct patch to fix the identified bug.
 
 ## Output Format
 
-You MUST respond with a valid JSON object containing the patch in unified diff format:
+You MUST respond with a valid JSON object containing exact text replacements:
 ```json
 {
-    "explanation": "Brief explanation of what the patch does and why",
-    "modified_files": ["path/to/file.py"],
-    "patch": "--- a/path/to/file.py\\n+++ b/path/to/file.py\\n@@ -line,count +line,count @@\\n context line\\n-removed line\\n+added line\\n context line"
+    "explanation": "Brief explanation of what the edits do and why",
+    "edits": [
+        {
+            "path": "src/module.py",
+            "old_text": "exact existing text copied from the provided repository context",
+            "new_text": "replacement text"
+        }
+    ]
 }
 ```
 
-## CRITICAL: Unified Diff Line Prefix Rules
-
-Every line in a hunk body MUST start with EXACTLY ONE prefix character:
-- ` ` (SPACE) — unchanged context line (this space is the prefix, NOT part of the code)
-- `-` — removed line
-- `+` — added line
-
-**WRONG** (missing space prefix on context lines):
-```
-@@ -10,4 +10,4 @@
-def example_function(x):
-    # Some context
--    return x + 1
-+    return x * 2
-    # More context
-```
-
-**CORRECT** (every context line starts with a space):
-```
-@@ -10,6 +10,6 @@
- def example_function(x):
-     # Some context
--    return x + 1  # Bug: should be x * 2
-+    return x * 2  # Fixed
-     # More context
- 
-```
-
-Key rules:
-1. Even a blank/empty line in the context MUST be written as a single space `' '`, never as an empty string `''`
-2. The `@@ -old_start,old_count +new_start,new_count @@` counts MUST be accurate:
-   - `old_count` = number of context lines + number of removed lines
-   - `new_count` = number of context lines + number of added lines
-3. Include 3 context lines before and after each change
+The program will convert these edits into a canonical unified diff. Do not write
+hunk headers or a patch string yourself.
 
 ## Guidelines
 
-1. Generate patches in UNIFIED DIFF format (git diff style)
-2. Make MINIMAL changes - only fix what's necessary
-3. Preserve existing code style and formatting
-4. Include sufficient context lines (3 lines before and after each change)
-5. If multiple files need changes, include all diffs in one patch string
-6. Test your logic mentally before generating the patch
-7. If this is a retry, avoid the same mistakes from previous attempts"""
+1. Make MINIMAL changes - only fix what's necessary
+2. Preserve existing code style and formatting
+3. `old_text` must occur exactly once in the named file
+4. Copy `old_text` verbatim from Relevant Code or Full File Contents, including indentation and line breaks
+5. For an insertion, replace a unique nearby anchor with that anchor plus the insertion
+6. Never edit tests unless the issue explicitly requires a test change
+7. Prefer a small 1-10 line `old_text`; do not reconstruct code that was not shown
+8. Use the repository tools to locate and read the exact target code before finalizing
+9. Copy `old_text` only from the exact-content section returned by `read_file`
+10. If this is a retry, use the exact repository context in the error and avoid the same mistake"""
 
 
 def _normalize_patch(patch: str) -> str:
@@ -96,6 +87,41 @@ def _normalize_patch(patch: str) -> str:
     if patch and not patch.endswith("\n"):
         return patch + "\n"
     return patch
+
+
+def _patch_result_from_json(data: Any) -> Optional[PatchResult]:
+    """Build a patch result from the documented JSON object shape."""
+    if not isinstance(data, dict):
+        return None
+
+    patch = data.get("patch", "")
+    if not isinstance(patch, str):
+        return None
+    if "\n" not in patch and "\\n" in patch:
+        patch = patch.replace("\\n", "\n")
+
+    modified_files = data.get("modified_files", [])
+    if not isinstance(modified_files, list):
+        modified_files = []
+
+    edits = []
+    raw_edits = data.get("edits", [])
+    if isinstance(raw_edits, list):
+        for item in raw_edits:
+            if not isinstance(item, dict):
+                continue
+            path = item.get("path")
+            old_text = item.get("old_text")
+            new_text = item.get("new_text")
+            if all(isinstance(value, str) for value in (path, old_text, new_text)):
+                edits.append(EditOperation(path=path, old_text=old_text, new_text=new_text))
+
+    return PatchResult(
+        patch_content=_normalize_patch(patch),
+        modified_files=[str(path) for path in modified_files],
+        explanation=str(data.get("explanation", "")),
+        edits=edits,
+    )
 
 
 def parse_patch_response(content: str) -> PatchResult:
@@ -107,19 +133,22 @@ def parse_patch_response(content: str) -> PatchResult:
     unescape, so a legitimate backslash-n inside code (e.g. ``print("\\n")``) in
     a proper multi-line diff is never turned into a real newline.
     """
+    # The documented format is a JSON object. Parse that standard form first;
+    # Markdown fences remain supported for models that add them anyway.
+    try:
+        raw_json_result = _patch_result_from_json(json.loads(content.strip()))
+        if raw_json_result is not None:
+            return raw_json_result
+    except (json.JSONDecodeError, TypeError):
+        pass
+
     json_match = re.search(r'```json\s*(.*?)\s*```', content, re.DOTALL)
     if json_match:
         try:
-            data = json.loads(json_match.group(1))
-            patch = data.get("patch", "")
-            if "\n" not in patch and "\\n" in patch:
-                patch = patch.replace("\\n", "\n")
-            return PatchResult(
-                patch_content=_normalize_patch(patch),
-                modified_files=data.get("modified_files", []),
-                explanation=data.get("explanation", ""),
-            )
-        except json.JSONDecodeError:
+            fenced_json_result = _patch_result_from_json(json.loads(json_match.group(1)))
+            if fenced_json_result is not None:
+                return fenced_json_result
+        except (json.JSONDecodeError, TypeError):
             pass
 
     # Fallback: a fenced ```diff block, then a bare unified diff anywhere.
@@ -155,6 +184,13 @@ class PatchGenerator(BaseWorker):
         super().__init__(llm_client=llm_client, name="PatchGenerator")
         self.env = env
         self.skill_bank = skill_bank
+        self.max_tool_calls = max(
+            0,
+            get_config().agent.patch_generator_max_tool_calls,
+        )
+        # Reuse Inspector's single, repo-scoped implementation of the read-only
+        # repository tools. The PatchGenerator owns the conversation and prompt.
+        self.repo_tools = Inspector(env, self.llm_client, skill_bank=skill_bank)
     
     @property
     def system_prompt(self) -> str:
@@ -174,8 +210,17 @@ class PatchGenerator(BaseWorker):
             if context.has_previous_attempt:
                 additional_context = self._build_retry_context(context)
             
-            response = self._call_llm(user_message, additional_context)
+            response, tool_trace = self._call_llm_with_repo_tools(
+                user_message,
+                additional_context,
+            )
             result = self._parse_response(response.content)
+
+            if result.edits:
+                result.patch_content = self._diff_from_edits(result.edits)
+                result.modified_files = PatchInfo.from_diff(
+                    result.patch_content
+                ).modified_files
             
             if result.patch_content:
                 result.patch_info = PatchInfo.from_diff(result.patch_content)
@@ -184,11 +229,117 @@ class PatchGenerator(BaseWorker):
                 f"Patch generated: {len(result.modified_files)} files modified"
             )
             
-            return WorkerResult(success=True, data=result, llm_response=response)
+            return WorkerResult(
+                success=True,
+                data=result,
+                llm_response=response,
+                metadata={"tool_trace": tool_trace},
+            )
             
         except Exception as e:
             self.logger.error(f"Patch generation failed: {e}")
             return WorkerResult(success=False, error=str(e))
+
+    def _call_llm_with_repo_tools(
+        self,
+        user_message: str,
+        additional_context: Optional[str] = None,
+    ) -> tuple[LLMResponse, List[dict[str, Any]]]:
+        """Generate edits after a bounded, read-only repository inspection."""
+        if additional_context:
+            user_message = f"{user_message}\n\n{additional_context}"
+
+        messages = [
+            Message(role="system", content=self.system_prompt),
+            Message(role="user", content=user_message),
+        ]
+        tool_trace: List[dict[str, Any]] = []
+        total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        tools = self.repo_tools._repo_tool_schemas()
+        tool_calls_used = 0
+        forced_read_prompt_sent = False
+
+        for _ in range(self.max_tool_calls + 1):
+            response = self.llm_client.chat(messages, tools=tools, tool_choice="auto")
+            Inspector._accumulate_usage(total_usage, response)
+
+            if not response.tool_calls:
+                read_performed = any(
+                    item["name"] == "read_file" and not item["result_preview"].startswith("ERROR:")
+                    for item in tool_trace
+                )
+                if (
+                    not read_performed
+                    and self.max_tool_calls > tool_calls_used
+                    and not forced_read_prompt_sent
+                ):
+                    forced_read_prompt_sent = True
+                    messages.append(Message(role="assistant", content=response.content))
+                    messages.append(Message(
+                        role="user",
+                        content=(
+                            "Before finalizing, call read_file on the exact source file "
+                            "you intend to edit. Copy old_text from the returned file "
+                            "content, without the display-only line-number prefix."
+                        ),
+                    ))
+                    continue
+                response.usage = total_usage
+                return response, tool_trace
+
+            messages.append(Message(
+                role="assistant",
+                content=response.content,
+                tool_calls=response.tool_calls,
+            ))
+            for tool_call in response.tool_calls:
+                if tool_calls_used >= self.max_tool_calls:
+                    result = Inspector._tool_error("Tool call budget exhausted.")
+                else:
+                    result = self.repo_tools._execute_repo_tool(tool_call)
+                    tool_calls_used += 1
+                if Inspector._tool_call_name(tool_call) == "read_file":
+                    result = self._exact_read_file_result(result)
+                tool_trace.append({
+                    "name": Inspector._tool_call_name(tool_call),
+                    "arguments": Inspector._tool_call_arguments_text(tool_call),
+                    "result_preview": result[:500],
+                })
+                messages.append(Message(
+                    role="tool",
+                    content=result,
+                    tool_call_id=tool_call.get("id", ""),
+                ))
+
+            if tool_calls_used >= self.max_tool_calls:
+                break
+
+        messages.append(Message(
+            role="user",
+            content=(
+                "Repository tool budget is exhausted. Respond now with the required "
+                "JSON edits using only exact code already read. If no file was read, "
+                "return an empty edits array instead of inventing code."
+            ),
+        ))
+        final_response = self.llm_client.chat(messages)
+        Inspector._accumulate_usage(total_usage, final_response)
+        final_response.usage = total_usage
+        return final_response, tool_trace
+
+    @staticmethod
+    def _exact_read_file_result(result: str) -> str:
+        """Remove Inspector's display line numbers so copied text stays exact."""
+        if result.startswith("ERROR:"):
+            return result
+        lines = result.splitlines()
+        if not lines or not lines[0].startswith("FILE: "):
+            return result
+        exact_lines = [
+            re.sub(r"^\s*\d+: ?", "", line)
+            for line in lines[1:]
+        ]
+        return f"{lines[0]}\nEXACT CONTENT (copy verbatim):\n" + "\n".join(exact_lines)
     
     def _build_patch_prompt(
         self,
@@ -207,6 +358,23 @@ class PatchGenerator(BaseWorker):
         )
         if controller_guidance:
             parts.append("\n" + controller_guidance)
+
+        # Give the smaller worker model real paths even when localization fails;
+        # otherwise it may copy a schema example path into a tool call.
+        try:
+            language = (
+                context.issue.metadata.get("repo_language")
+                if context.issue.metadata else None
+            )
+            source_files: List[str] = []
+            for glob in source_globs(language):
+                source_files.extend(self.env.list_files(glob))
+            source_files = list(dict.fromkeys(source_files))
+            if source_files:
+                parts.append("\n## Real Source Paths (use these exact paths with tools)")
+                parts.append("\n".join(f"- {path}" for path in source_files[:80]))
+        except Exception as e:
+            self.logger.warning(f"Could not list source paths: {e}")
         
         if inspection_result:
             parts.append("\n## Fault Localization Results")
@@ -233,18 +401,26 @@ class PatchGenerator(BaseWorker):
             for file_path in inspection_result.suspected_files[:3]:
                 try:
                     content = self.env.get_file_content(file_path)
-                    # Limit content size
-                    if len(content) > 5000:
-                        content = content[:5000] + "\n... (truncated)"
-                    parts.append(f"\n### {file_path}")
-                    parts.append(f"```python\n{content}\n```")
+                    if len(content) <= 12000:
+                        parts.append(f"\n### {file_path}")
+                        parts.append(f"```python\n{content}\n```")
+                    else:
+                        parts.append(
+                            f"\n### {file_path}\n"
+                            "(Large file: use the line-targeted Relevant Code snippet above.)"
+                        )
                 except FileNotFoundError:
                     self.logger.warning(f"File not found: {file_path}")
                 except Exception as e:
                     self.logger.warning(f"Error reading {file_path}: {e}")
         
         parts.append("\n## Task")
-        parts.append("Generate a minimal patch in unified diff format to fix this issue.")
+        parts.append(
+            "Return the minimal fix as JSON exact text replacements described in the "
+            "system prompt. Use read_file on every target file and only copy old_text "
+            "from its EXACT CONTENT section. The JSON path above is only a schema "
+            "example; never use it unless that exact file exists."
+        )
         
         return "\n".join(parts)
     
@@ -264,8 +440,8 @@ class PatchGenerator(BaseWorker):
 
             if judge_route == "repair_patch_format":
                 parts.append(
-                    "Focus on producing a syntactically valid unified diff with correct "
-                    "file headers, hunk headers, context prefixes, and complete hunks."
+                    "Return valid JSON with an edits array. Do not write a unified diff. "
+                    "Copy each old_text exactly from the repository context in this prompt."
                 )
             elif judge_route == "empty_patch_reprompt":
                 parts.append(
@@ -283,6 +459,11 @@ class PatchGenerator(BaseWorker):
             for i, patch in enumerate(context.previous_patches, 1):
                 parts.append(f"\n### Patch {i}:")
                 parts.append(f"```diff\n{patch.content[:2000]}\n```")
+
+        if context.previous_errors:
+            parts.append("\n## Exact Previous Errors:")
+            for error in context.previous_errors[-3:]:
+                parts.append(str(error)[:1500])
         
         if context.last_test_result:
             parts.append("\n## Last Test Result:")
@@ -295,3 +476,171 @@ class PatchGenerator(BaseWorker):
     def _parse_response(self, content: str) -> PatchResult:
         """Parse LLM response into PatchResult."""
         return parse_patch_response(content)
+
+    def _diff_from_edits(self, edits: List[EditOperation]) -> str:
+        """Apply uniquely grounded replacements and emit a program-generated diff.
+
+        Exact matching remains the primary path. A whitespace-only fallback tolerates
+        model changes to indentation, trailing spaces, or surrounding blank lines, but
+        is accepted only when it identifies one repository span.
+        """
+        originals: dict[str, str] = {}
+        updated: dict[str, str] = {}
+        for edit in edits:
+            path = self._validated_edit_path(edit.path)
+            if not edit.old_text:
+                raise ValueError(f"{path}: old_text must not be empty")
+            if path not in originals:
+                originals[path] = self.env.get_file_content(path)
+                updated[path] = originals[path]
+            updated[path] = self._apply_grounded_edit(
+                path,
+                updated[path],
+                edit.old_text,
+                edit.new_text,
+            )
+
+        chunks = []
+        for path in originals:
+            if originals[path] == updated[path]:
+                continue
+            chunks.append("".join(difflib.unified_diff(
+                originals[path].splitlines(keepends=True),
+                updated[path].splitlines(keepends=True),
+                fromfile=f"a/{path}",
+                tofile=f"b/{path}",
+            )))
+        patch = "".join(chunks)
+        if not patch.strip():
+            raise ValueError("structured edits produced no changes")
+        return _normalize_patch(patch)
+
+    def _apply_grounded_edit(
+        self,
+        path: str,
+        content: str,
+        old_text: str,
+        new_text: str,
+    ) -> str:
+        """Replace one exact or whitespace-equivalent repository span."""
+        old_text = old_text.replace("\r\n", "\n").replace("\r", "\n")
+        new_text = new_text.replace("\r\n", "\n").replace("\r", "\n")
+        occurrences = content.count(old_text)
+        if occurrences == 1:
+            return content.replace(old_text, new_text, 1)
+        if occurrences > 1:
+            raise ValueError(
+                f"{path}: old_text must match exactly once, found {occurrences}"
+            )
+
+        matches = self._whitespace_equivalent_spans(content, old_text)
+        if len(matches) == 1:
+            start, end, matched_text = matches[0]
+            replacement = self._align_replacement_indent(
+                old_text,
+                new_text,
+                matched_text,
+            )
+            self.logger.info(
+                "%s: applied unique whitespace-normalized old_text match", path
+            )
+            return content[:start] + replacement + content[end:]
+        if len(matches) > 1:
+            raise ValueError(
+                f"{path}: old_text has {len(matches)} whitespace-equivalent matches; "
+                "use a longer unique repository excerpt"
+            )
+        raise ValueError(self._no_match_error(path, content, old_text))
+
+    @staticmethod
+    def _normalized_lines(text: str) -> tuple[str, ...]:
+        lines = text.splitlines()
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        if not lines:
+            return ()
+        dedented = textwrap.dedent("\n".join(lines)).splitlines()
+        return tuple(line.rstrip() for line in dedented)
+
+    def _whitespace_equivalent_spans(
+        self,
+        content: str,
+        old_text: str,
+    ) -> list[tuple[int, int, str]]:
+        target = self._normalized_lines(old_text)
+        if not target:
+            return []
+        content_lines = content.splitlines(keepends=True)
+        target_line_count = len(target)
+        matches: list[tuple[int, int, str]] = []
+        offsets = [0]
+        for line in content_lines:
+            offsets.append(offsets[-1] + len(line))
+        for start_line in range(0, len(content_lines) - target_line_count + 1):
+            end_line = start_line + target_line_count
+            candidate = "".join(content_lines[start_line:end_line])
+            if self._normalized_lines(candidate) == target:
+                start = offsets[start_line]
+                end = offsets[end_line]
+                # A model excerpt normally omits the final newline; keep that
+                # newline outside the replaced span unless it explicitly supplied one.
+                if not old_text.endswith("\n") and candidate.endswith("\n"):
+                    candidate = candidate[:-1]
+                    end -= 1
+                matches.append((start, end, candidate))
+        return matches
+
+    @staticmethod
+    def _align_replacement_indent(
+        old_text: str,
+        new_text: str,
+        matched_text: str,
+    ) -> str:
+        def first_indent(value: str) -> int:
+            for line in value.splitlines():
+                if line.strip():
+                    return len(line) - len(line.lstrip())
+            return 0
+
+        delta = first_indent(matched_text) - first_indent(old_text)
+        if delta <= 0:
+            return new_text
+        prefix = " " * delta
+        return "\n".join(prefix + line if line.strip() else line for line in new_text.split("\n"))
+
+    @staticmethod
+    def _no_match_error(path: str, content: str, old_text: str) -> str:
+        requested = next((line.strip() for line in old_text.splitlines() if line.strip()), "")
+        lines = content.splitlines()
+        if not requested or not lines:
+            return f"{path}: old_text must match exactly once, found 0"
+        scored = [
+            (difflib.SequenceMatcher(None, requested, line.strip()).ratio(), index)
+            for index, line in enumerate(lines)
+            if line.strip()
+        ]
+        _, best = max(scored, default=(0.0, 0))
+        start = max(0, best - 4)
+        end = min(len(lines), best + 5)
+        context = "\n".join(
+            f"{index + 1}: {lines[index]}" for index in range(start, end)
+        )
+        return (
+            f"{path}: old_text must match exactly once, found 0. "
+            f"Closest repository context (copy from this on retry):\n{context}"
+        )
+
+    def _validated_edit_path(self, raw_path: str) -> str:
+        path = Path(raw_path)
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError(f"unsafe edit path: {raw_path}")
+        resolved = (self.env.repo_path / path).resolve()
+        try:
+            relative = resolved.relative_to(self.env.repo_path)
+        except ValueError as exc:
+            raise ValueError(f"edit path escapes repository: {raw_path}") from exc
+        if not resolved.is_file():
+            raise ValueError(f"edit file does not exist: {raw_path}")
+        return relative.as_posix()

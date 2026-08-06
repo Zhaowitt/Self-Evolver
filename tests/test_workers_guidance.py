@@ -27,6 +27,10 @@ def _init_repo(tmp_path: Path) -> Path:
 
 class FakeSkill:
     def __init__(self, content):
+        self.id = "reproduce_first"
+        self.title = "Reproduce First"
+        self.summary = "repro"
+        self.target_failure_type = None
         self.content = content
 
 
@@ -42,6 +46,9 @@ class SpyBank:
     def get(self, skill_id):
         self.gets.append(skill_id)
         return self.skill
+
+    def active(self):
+        return [self.skill]
 
 
 def _signal_metadata():

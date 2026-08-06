@@ -654,8 +654,8 @@ class Inspector(BaseWorker):
         snippets = {}
         for location in result.suspected_locations[:5]:
             try:
-                start = max(1, location.start_line - 5)
-                end = (location.end_line or location.start_line) + 5
+                start = max(1, location.start_line - 30)
+                end = (location.end_line or location.start_line) + 30
                 content = self.env.get_file_content_with_lines(
                     location.file_path, start_line=start, end_line=end
                 )

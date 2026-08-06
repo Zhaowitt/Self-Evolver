@@ -7,6 +7,7 @@ from src.memory.hard_case_buffer import (
     LOW_PROGRESS_MIN_ITERATIONS,
     HardCaseBuffer,
     HardCaseRecord,
+    resolve_hard_cases_path,
     should_admit,
 )
 from src.memory.memory_retriever import MemoryRetriever
@@ -24,6 +25,17 @@ def _record(repo="acme/widgets", failure_type="test_failure", iterations=1, stag
     return HardCaseRecord(
         repo_name=repo, failure_type=failure_type, iterations=iterations, stage=stage
     )
+
+
+def test_explicit_hard_case_path_overrides_workspace(monkeypatch, tmp_path):
+    explicit = tmp_path / "round" / "hard_cases.jsonl"
+    monkeypatch.setenv("SELF_EVOLVER_HARD_CASES_PATH", str(explicit))
+    assert resolve_hard_cases_path(tmp_path / "fallback") == explicit
+
+
+def test_hard_case_path_falls_back_to_workspace(monkeypatch, tmp_path):
+    monkeypatch.delenv("SELF_EVOLVER_HARD_CASES_PATH", raising=False)
+    assert resolve_hard_cases_path(tmp_path) == tmp_path / "hard_cases.jsonl"
 
 
 # --------------------------------------------------------------------- stage field

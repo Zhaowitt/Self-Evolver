@@ -29,7 +29,7 @@ bash scripts/download_benchmarks.sh
 
 | `--benchmark`    | `--dataset`          | Role                         | Grading |
 | ---------------- | -------------------- | ---------------------------- | ------- |
-| `swebench`       | `full` (`--split train`) | RL / evolution training pool | apptainer/docker |
+| `swebench`       | `full` (`--split test`) | labeled RL pool; exclude final-eval IDs | apptainer/docker |
 | `swebench`       | `verified`           | primary eval (Python)        | apptainer/docker |
 | `swebench`       | `lite`               | fast dev (`dev`/`test`)      | apptainer/docker |
 | `swebench_live`  | `lite`\|`full`\|`test` | contamination-free held-out | apptainer/docker |
@@ -94,4 +94,12 @@ Multi-SWE-bench and SWE-bench Pro grade with their own Docker harnesses: the run
 generates predictions and writes a harness-ready patch file, then prints the exact
 official command.
 
-
+For Controller GRPO, `scripts/run_rl_controller.sh` records the hard-case boundary
+before EasyR1 starts and runs one train-only Reflector pass after a successful
+training exit. The resulting skill changes are stored in `skills/`, with an audit
+report under `runs/skill_reflections/`. A later invocation rebuilds its prompt
+JSONL from that updated skill bank; validation and final evaluation remain frozen.
+Online rewards run different instance checkouts concurrently while keeping all
+rollouts for one instance serial. `REWARD_WORKERS` controls the launcher setting
+(default `4`; for `rollout_batch_size: 4` and `rollout.n: 3`, this gives four
+parallel queues of three rollouts).

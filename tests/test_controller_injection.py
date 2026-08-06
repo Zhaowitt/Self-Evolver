@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from src.controller.injection import MAX_PROCEDURE_CHARS, format_controller_guidance
+from src.controller.injection import (
+    MAX_PROCEDURE_CHARS,
+    format_controller_guidance,
+    ground_controller_skills,
+)
 from src.controller.prompt_builder import CONTROLLER_SYSTEM_PROMPT
 from src.controller.schema import ControllerSignal
 from src.skills.skill_bank import SkillBank
@@ -36,7 +40,8 @@ def test_injection_includes_procedure_block(tmp_path):
     signal = _signal([{"id": "alpha", "title": "Alpha", "summary": "do alpha"}])
     text = format_controller_guidance(signal, skill_bank=SkillBank(skills_dir=tmp_path))
     assert "Skill 1: Alpha" in text
-    assert "do alpha" in text
+    assert "\nd\n" in text
+    assert "do alpha" not in text
     assert "How to apply:" in text
     assert "Reproduce, then localize, then patch." in text
 
@@ -68,11 +73,31 @@ def test_at_most_two_skills_injected(tmp_path):
     assert "Gamma" not in text
 
 
-def test_unknown_skill_id_falls_back_to_title_summary(tmp_path):
+def test_unknown_skill_id_is_not_injected(tmp_path):
     signal = _signal([{"id": "missing", "title": "Missing", "summary": "no file"}])
     text = format_controller_guidance(signal, skill_bank=SkillBank(skills_dir=tmp_path))
-    assert "Skill 1: Missing" in text
+    assert "Missing" not in text
     assert "How to apply:" not in text
+
+
+def test_grounding_uses_candidate_allowlist_and_canonical_metadata(tmp_path):
+    _write(tmp_path / "alpha.md", "Canonical Alpha", "Inspect first.", "canonical")
+    _write(tmp_path / "beta.md", "Beta", "Patch second.")
+    signal = _signal([
+        {"id": "alpha", "title": "Spoofed", "summary": "spoofed"},
+        {"id": "beta", "title": "Beta", "summary": "beta"},
+    ])
+
+    grounded = ground_controller_skills(
+        signal,
+        skill_bank=SkillBank(skills_dir=tmp_path),
+        allowed_skill_ids=["alpha"],
+    )
+
+    assert grounded.selected_skill_ids == ["alpha"]
+    assert grounded.skill.title == "Canonical Alpha"
+    assert [skill.id for skill in grounded.skills] == ["alpha"]
+    assert grounded.metadata["rejected_skill_ids"] == ["beta"]
 
 
 def test_empty_signal_yields_no_block(tmp_path):

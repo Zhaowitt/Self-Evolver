@@ -8,6 +8,9 @@ ema_alpha: 0.3
 boundary_sigma: 0.2
 # Instance boost = 1 + boost_factor * cluster_hits (reflection signal).
 boost_factor: 2.0
+# Keep the original formula, but prevent a few recurring instances from
+# dominating the next round's sampling distribution.
+max_instance_boost: 3.0
 # Too-hard weight decay multiplier after too_hard_attempts consecutive failures.
 decay_factor: 0.3
 too_hard_attempts: 3

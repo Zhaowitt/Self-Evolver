@@ -6,7 +6,7 @@ distribution over them:
 
   weight(i) = exp(-(s_f - 0.5)^2 / (2 * sigma^2))   # family capability boundary
             * family_boost(f)                        # reflection signal
-            * (1 + boost_factor * cluster_hits_i)    # reflection signal
+            * min(1 + boost_factor * cluster_hits_i, max_instance_boost)
             * decay_multiplier_i                     # too-hard decay
 
 where s_f is the EMA of resolved outcomes for instance i's family. After
@@ -138,7 +138,10 @@ class TaskPool:
         return (
             self.family_weight(stats.family)
             * family.boost
-            * (1.0 + self.config.boost_factor * stats.cluster_hits)
+            * min(
+                1.0 + self.config.boost_factor * stats.cluster_hits,
+                self.config.max_instance_boost,
+            )
             * stats.decay_multiplier
         )
 
@@ -171,6 +174,22 @@ class TaskPool:
                         break
             chosen.append(candidates.pop(index))
             weights.pop(index)
+        return [self._instances[instance_id] for instance_id in chosen]
+
+    def sample_with_replacement(self, n: int, rng: random.Random) -> List[dict]:
+        """Draw ``n`` weighted instances, allowing repeats.
+
+        GRPO consumes a frozen JSONL rather than this live pool. Sampling with
+        replacement materializes the pool's distribution into a fixed-size,
+        reproducible next-round dataset without modifying EasyR1's sampler.
+        """
+        if n <= 0 or not self._instances:
+            return []
+        candidates = list(self._instances)
+        weights = [self._weight(instance_id) for instance_id in candidates]
+        if sum(weights) <= 0.0:
+            return [self._instances[rng.choice(candidates)] for _ in range(n)]
+        chosen = rng.choices(candidates, weights=weights, k=n)
         return [self._instances[instance_id] for instance_id in chosen]
 
     # -------------------------------------------------------------- outcomes
@@ -263,6 +282,14 @@ class TaskPool:
         reflection cycle), not accumulated. Unknown ids/families are logged
         and skipped.
         """
+        # Each reflection report describes the complete signal for the next
+        # cycle. Clear stale boosts before applying it so old clusters do not
+        # remain overweight forever when a state file is reused.
+        for stats in self._stats.values():
+            stats.cluster_hits = 0
+        for family in self._families.values():
+            family.boost = 1.0
+
         for instance_id, hits in (signals.get("instance_boosts") or {}).items():
             if instance_id not in self._stats:
                 logger.warning("Reflection boost for unknown instance: %s", instance_id)
@@ -280,6 +307,14 @@ class TaskPool:
         """Atomically persist evolution state as deterministic JSON."""
         state = {
             "schema_version": _STATE_SCHEMA_VERSION,
+            # Persist the source pool so post-GRPO outcome ingestion can resume
+            # state even though the frozen weighted JSONL may contain repeats
+            # and omit some base instances.
+            "base_instances": {
+                instance_id: instance
+                for instance_id, instance in self._instances.items()
+                if not self._stats[instance_id].is_variant
+            },
             "families": {name: asdict(stats) for name, stats in self._families.items()},
             "instances": {name: asdict(stats) for name, stats in self._stats.items()},
             "variants": {

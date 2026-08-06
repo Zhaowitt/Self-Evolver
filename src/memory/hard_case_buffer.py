@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +21,15 @@ HARD_CASE_SCHEMA_VERSION = "hard_case_v1"
 # repeated failure, shows many interactions with little progress, or exhausted
 # the fixed repair budget.
 LOW_PROGRESS_MIN_ITERATIONS = 2
+
+
+def resolve_hard_cases_path(workspace_dir: Optional[Path] = None) -> Path:
+    """Return the canonical hard-case buffer shared by writers and readers."""
+    configured = os.getenv("SELF_EVOLVER_HARD_CASES_PATH", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    root = Path(workspace_dir or get_config().environment.workspace_dir)
+    return root / "hard_cases.jsonl"
 
 
 @dataclass

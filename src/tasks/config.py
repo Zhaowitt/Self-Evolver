@@ -24,6 +24,7 @@ class TaskEvolutionConfig:
     ema_alpha: float = 0.3            # EMA step for per-family success rate
     boundary_sigma: float = 0.2       # sigma of exp(-(s-0.5)^2 / (2*sigma^2))
     boost_factor: float = 2.0         # instance boost = 1 + boost_factor * cluster_hits
+    max_instance_boost: float = 3.0   # cap the cluster-driven instance multiplier
     decay_factor: float = 0.3         # too-hard weight decay multiplier
     too_hard_attempts: int = 3        # consecutive failures before decay + focus variant
     initial_success_ema: float = 0.5  # neutral prior: family starts at peak weight
@@ -37,6 +38,10 @@ class TaskEvolutionConfig:
             raise ValueError(f"boundary_sigma must be > 0, got {self.boundary_sigma}")
         if self.boost_factor < 0.0:
             raise ValueError(f"boost_factor must be >= 0, got {self.boost_factor}")
+        if self.max_instance_boost < 1.0:
+            raise ValueError(
+                f"max_instance_boost must be >= 1, got {self.max_instance_boost}"
+            )
         if not 0.0 < self.decay_factor <= 1.0:
             raise ValueError(f"decay_factor must be in (0, 1], got {self.decay_factor}")
         if self.too_hard_attempts < 1:

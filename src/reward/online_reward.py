@@ -8,13 +8,15 @@ default ``apptainer``), and returns the execution utility (Proposal 2.6).
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from src.config import get_config
+from src.controller.injection import ground_controller_skills
 from src.controller.parser import parse_controller_response
 from src.environment.models import Issue
 from src.environment.project_env import ProjectEnvironment
@@ -56,20 +58,107 @@ def compute_score(
         None,
     )
 
-    scores: List[Dict[str, float]] = []
-    for reward_input in reward_inputs:
-        scores.append(
-            _score_one(
-                reward_input,
-                reward_model=reward_model,
-                rollout_writer=rollout_writer,
-                skill_evolver=skill_evolver,
-                test_backend=test_backend,
-                default_workspace=kwargs.get("workspace_root"),
-                max_iterations=kwargs.get("max_iterations"),
+    default_workspace = kwargs.get("workspace_root")
+    groups = _group_reward_inputs(reward_inputs, default_workspace)
+    max_workers = _parallel_workers(kwargs.get("parallel_workers"))
+
+    def score_group(
+        group: List[Tuple[int, Dict[str, Any]]],
+    ) -> List[Tuple[int, Dict[str, float]]]:
+        # Samples sharing an instance checkout must remain sequential: every
+        # episode resets and mutates that checkout before official evaluation.
+        return [
+            (
+                index,
+                _score_one(
+                    reward_input,
+                    reward_model=reward_model,
+                    rollout_writer=rollout_writer,
+                    skill_evolver=skill_evolver,
+                    test_backend=test_backend,
+                    default_workspace=default_workspace,
+                    max_iterations=kwargs.get("max_iterations"),
+                ),
             )
-        )
+            for index, reward_input in group
+        ]
+
+    scores: List[Dict[str, float]] = [{} for _ in reward_inputs]
+    worker_count = min(max_workers, len(groups))
+    if worker_count <= 1:
+        completed_groups = (score_group(group) for group in groups)
+        for completed in completed_groups:
+            for index, score in completed:
+                scores[index] = score
+        return scores
+
+    logger.info(
+        "Scoring %d online rollouts in %d instance-safe parallel groups",
+        len(reward_inputs),
+        worker_count,
+    )
+    with ThreadPoolExecutor(
+        max_workers=worker_count,
+        thread_name_prefix="online-reward",
+    ) as executor:
+        futures = [executor.submit(score_group, group) for group in groups]
+        for future in as_completed(futures):
+            for index, score in future.result():
+                scores[index] = score
     return scores
+
+
+def _group_reward_inputs(
+    reward_inputs: List[Dict[str, Any]],
+    default_workspace: Any = None,
+) -> List[List[Tuple[int, Dict[str, Any]]]]:
+    """Group samples that may mutate the same cached checkout."""
+    groups: Dict[str, List[Tuple[int, Dict[str, Any]]]] = {}
+    for index, reward_input in enumerate(reward_inputs):
+        extra_info = _coerce_dict(
+            reward_input.get("extra_info") or reward_input.get("metadata")
+        )
+        ground_truth = _coerce_dict(
+            reward_input.get("ground_truth")
+            or reward_input.get("answer")
+            or extra_info.get("ground_truth")
+        )
+        repo_path = extra_info.get("repo_path") or ground_truth.get("repo_path")
+        instance_id = (
+            ground_truth.get("instance_id")
+            or ground_truth.get("id")
+            or extra_info.get("instance_id")
+        )
+        if repo_path:
+            key = f"repo:{Path(str(repo_path)).expanduser().resolve()}"
+        elif instance_id:
+            workspace = (
+                default_workspace
+                or extra_info.get("workspace_root")
+                or os.getenv("SELF_EVOLVER_REWARD_WORKSPACE")
+                or (get_config().environment.workspace_dir / "online_reward")
+            )
+            checkout = Path(workspace).expanduser().resolve() / str(instance_id).replace("/", "_")
+            key = f"repo:{checkout}"
+        else:
+            # Malformed samples do not reach a checkout, so they need not block
+            # otherwise independent reward work.
+            key = f"input:{index}"
+        groups.setdefault(key, []).append((index, reward_input))
+    return list(groups.values())
+
+
+def _parallel_workers(kwargs_value: Any) -> int:
+    value = (
+        kwargs_value
+        if kwargs_value is not None
+        else os.getenv("SELF_EVOLVER_REWARD_WORKERS", "2")
+    )
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        logger.warning("Invalid online reward worker count %r; using 2", value)
+        return 2
 
 
 def _score_one(
@@ -94,6 +183,15 @@ def _score_one(
     if signal.parse_error:
         logger.warning("Invalid Controller response: %s", signal.parse_error)
         return _failure_score(parse_valid=0.0, worker_executed=0.0)
+    allowed_skill_ids = ground_truth.get("allowed_skill_ids")
+    if allowed_skill_ids is None:
+        allowed_skill_ids = extra_info.get("allowed_skill_ids")
+    signal = ground_controller_skills(
+        signal,
+        allowed_skill_ids=(
+            allowed_skill_ids if isinstance(allowed_skill_ids, list) else None
+        ),
+    )
 
     try:
         issue = issue_from_payload(ground_truth, extra_info)
@@ -109,7 +207,9 @@ def _score_one(
             ),
             reward_model=reward_model,
             rollout_writer=rollout_writer,
-            skill_evolver=skill_evolver,
+            # Validation/final evaluation must be frozen even when the process
+            # has train-time skill credit enabled globally.
+            skill_evolver=skill_evolver if stage == "train" else None,
             test_backend=test_backend,
             verify_in_loop=True,
             stage=stage,

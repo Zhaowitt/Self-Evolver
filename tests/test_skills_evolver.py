@@ -84,11 +84,19 @@ def test_ratchet_retires_persistently_unhelpful_skill(tmp_path):
     _write(tmp_path / "good.md", "Good")
     _write(tmp_path / "bad.md", "Bad")
     store = SkillStore(skills_dir=tmp_path)
-    for _ in range(5):
-        store.credit_skills(["bad"], utility=0.1, success=False)
-
-    evolver = _evolver(tmp_path, retire_min_trials=5, retire_net_success_threshold=-0.2)
-    result = evolver.update_from_rollout(_signal(["good"]), {"total": 0.9})
+    store.credit_skills(["good"], utility=1.0, success=True, round_id="seed")
+    evolver = _evolver(
+        tmp_path,
+        retire_min_trials=30,
+        retire_min_rounds=2,
+        retire_net_success_threshold=-0.2,
+    )
+    for round_id in ("round-1", "round-2"):
+        for _ in range(15):
+            store.credit_skills(["bad"], utility=0.0, success=False, round_id=round_id)
+        result = evolver.finalize_round(round_id)
+        if round_id == "round-1":
+            assert store.load_metadata()["bad"].status == "active"
 
     retired = {e["skill_id"] for e in result["events"] if e["action"] == "retire_unhelpful"}
     assert retired == {"bad"}
@@ -99,11 +107,21 @@ def test_ratchet_retires_persistently_unhelpful_skill(tmp_path):
 def test_ratchet_leaves_untried_skill_alone(tmp_path):
     _write(tmp_path / "fresh.md", "Fresh")
     store = SkillStore(skills_dir=tmp_path)
-    for _ in range(4):  # below the 5-trial floor
-        store.credit_skills(["fresh"], utility=0.0, success=False)
-    evolver = _evolver(tmp_path, retire_min_trials=5)
-    evolver.update_from_rollout(_signal([]), {"total": 0.0})
+    for _ in range(29):  # below the 30-trial floor
+        store.credit_skills(["fresh"], utility=0.0, success=False, round_id="round-1")
+    evolver = _evolver(tmp_path, retire_min_trials=30)
+    evolver.finalize_round("round-1")
     assert store.load_metadata()["fresh"].status == "active"
+
+
+def test_update_from_rollout_never_retires_mid_round(tmp_path):
+    _write(tmp_path / "bad.md", "Bad")
+    evolver = _evolver(tmp_path, retire_min_trials=1, retire_min_rounds=1)
+    result = evolver.update_from_rollout(
+        _signal(["bad"]), {"total": 0.0}, success=False, round_id="round-1"
+    )
+    assert all(event["action"] != "retire_unhelpful" for event in result["events"])
+    assert evolver.store.load_metadata()["bad"].status == "active"
 
 
 # --------------------------------------------------------------- active-skill cap

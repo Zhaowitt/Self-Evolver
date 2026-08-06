@@ -10,9 +10,14 @@ max_selected_skills: 2
 # Hard cap on active skills; lowest-contribution skills are evicted past this.
 max_active_skills: 12
 # Retirement: minimum credited trials before a skill can be retired.
-retire_min_trials: 5
+retire_min_trials: 30
+# A skill must be harmful across multiple completed GRPO rounds; it is never
+# retired while a round is still running.
+retire_min_rounds: 2
 # Retirement: retire when (successes - failures) / trials <= this.
 retire_net_success_threshold: -0.2
+# Also require negative mean reward advantage in every considered round.
+retire_average_advantage_threshold: 0.0
 # EMA smoothing for the advantage baseline over rollout utilities.
 baseline_ema_alpha: 0.3
 # Reflector cadence: reflect every N completed train rollouts.

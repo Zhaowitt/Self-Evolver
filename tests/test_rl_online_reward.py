@@ -1,6 +1,7 @@
 """Online reward glue: flag parsing, failure scores, rollout record schema."""
 
 import json
+import threading
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
@@ -11,6 +12,9 @@ from src.reward.online_reward import (
     _as_bool,
     _env_flag,
     _failure_score,
+    _group_reward_inputs,
+    _parallel_workers,
+    compute_score,
     issue_from_payload,
 )
 from src.reward.reward_model import DEFAULT_REWARD_WEIGHTS, RewardModel
@@ -48,6 +52,64 @@ def test_env_flag_kwarg_false_beats_env(monkeypatch):
     assert _env_flag(True, ENV_FLAG) is True
     monkeypatch.delenv(ENV_FLAG)
     assert _env_flag(None, ENV_FLAG) is False
+
+
+def test_parallel_workers_kwarg_beats_env_and_clamps(monkeypatch):
+    monkeypatch.setenv("SELF_EVOLVER_REWARD_WORKERS", "4")
+    assert _parallel_workers(None) == 4
+    assert _parallel_workers(1) == 1
+    assert _parallel_workers(0) == 1
+    assert _parallel_workers("invalid") == 2
+
+
+def test_group_reward_inputs_serializes_shared_checkout(tmp_path):
+    shared = tmp_path / "shared"
+    inputs = [
+        {"ground_truth": {"instance_id": "a"}},
+        {"ground_truth": {"instance_id": "a"}},
+        {
+            "ground_truth": {"instance_id": "b"},
+            "extra_info": {"repo_path": str(shared)},
+        },
+        {
+            "ground_truth": {"instance_id": "c"},
+            "extra_info": {"repo_path": str(shared)},
+        },
+    ]
+    groups = _group_reward_inputs(inputs, tmp_path / "workspace")
+    assert [[index for index, _ in group] for group in groups] == [[0, 1], [2, 3]]
+
+
+def test_compute_score_parallelizes_instances_but_preserves_order(monkeypatch):
+    barrier = threading.Barrier(2, timeout=2)
+    starts = {"a": [], "b": []}
+    starts_lock = threading.Lock()
+
+    def fake_score(reward_input, **_kwargs):
+        instance_id = reward_input["ground_truth"]["instance_id"]
+        sequence = reward_input["sequence"]
+        with starts_lock:
+            starts[instance_id].append(sequence)
+        if sequence == 1:
+            barrier.wait()
+        return {"overall": float(reward_input["value"])}
+
+    monkeypatch.setattr("src.reward.online_reward._score_one", fake_score)
+    monkeypatch.setattr(
+        "src.environment.test_backend.resolve_backend",
+        lambda *_args, **_kwargs: object(),
+    )
+    inputs = [
+        {"ground_truth": {"instance_id": "a"}, "sequence": 1, "value": 1},
+        {"ground_truth": {"instance_id": "a"}, "sequence": 2, "value": 2},
+        {"ground_truth": {"instance_id": "b"}, "sequence": 1, "value": 3},
+        {"ground_truth": {"instance_id": "b"}, "sequence": 2, "value": 4},
+    ]
+
+    scores = compute_score(inputs, parallel_workers=2)
+
+    assert [score["overall"] for score in scores] == [1.0, 2.0, 3.0, 4.0]
+    assert starts == {"a": [1, 2], "b": [1, 2]}
 
 
 def test_failure_score_matches_utility_components():

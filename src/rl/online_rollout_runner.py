@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -93,7 +94,19 @@ def run_online_rollout(
 
     skill_evolution = None
     if skill_evolver and controller_signal:
-        skill_evolution = skill_evolver.update_from_rollout(controller_signal, reward)
+        official_success = None
+        if eval_outcome is not None:
+            official_success = bool(
+                eval_outcome.get("resolved", False)
+                if isinstance(eval_outcome, dict)
+                else getattr(eval_outcome, "resolved", False)
+            )
+        skill_evolution = skill_evolver.update_from_rollout(
+            controller_signal,
+            reward,
+            success=official_success,
+            round_id=os.getenv("SELF_EVOLVER_ROUND_ID") or None,
+        )
 
     rollout_record = build_rollout_record(
         issue,

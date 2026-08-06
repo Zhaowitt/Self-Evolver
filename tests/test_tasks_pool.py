@@ -186,14 +186,37 @@ def test_apply_reflection_boosts(tmp_path):
     )
     weights = pool.weights()
 
-    # instance: x(1 + 2*2), family: x1.5
-    assert weights["org__single-1"] == pytest.approx(1.5 * 5.0)
+    # Original x(1 + 2*hits) formula, capped at x3; family remains x1.5.
+    assert weights["org__single-1"] == pytest.approx(1.5 * 3.0)
     assert weights["org__single-2"] == pytest.approx(1.5)
     assert weights["org__multi-1"] == pytest.approx(1.0)
 
     # Signals are set, not accumulated: reapplying is idempotent.
     pool.apply_reflection({"instance_boosts": {"org__single-1": 2}})
-    assert pool.weights()["org__single-1"] == pytest.approx(1.5 * 5.0)
+    assert pool.weights()["org__single-1"] == pytest.approx(3.0)
+
+    # A new cycle replaces the full signal; omitted boosts do not leak forward.
+    pool.apply_reflection({"instance_boosts": {}})
+    assert pool.weights()["org__single-1"] == pytest.approx(1.0)
+    assert pool.weights()["org__single-2"] == pytest.approx(1.0)
+
+
+def test_instance_boost_cap_keeps_original_formula_below_cap(tmp_path):
+    config = TaskEvolutionConfig(boost_factor=0.5, max_instance_boost=3.0)
+    pool = TaskPool.from_instances(
+        make_instances(), tmp_path / "capped.json", config=config, verifier=accept_all
+    )
+    pool.apply_reflection({"instance_boosts": {"org__single-1": 2}})
+    assert pool.weights()["org__single-1"] == pytest.approx(2.0)
+
+
+def test_sampling_with_replacement_is_deterministic_and_weighted(tmp_path):
+    pool = build_pool(tmp_path)
+    pool.apply_reflection({"instance_boosts": {"org__single-1": 3}})
+    first = [item["instance_id"] for item in pool.sample_with_replacement(100, random.Random(9))]
+    second = [item["instance_id"] for item in pool.sample_with_replacement(100, random.Random(9))]
+    assert first == second
+    assert first.count("org__single-1") > first.count("org__single-2")
 
 
 # ---------------------------------------------------------------- sampling

@@ -1,6 +1,7 @@
 """EasyR1 dataset builder: split validation, contamination exclusion, prompt contract."""
 
 import json
+from collections import Counter
 
 import pytest
 
@@ -10,9 +11,13 @@ from src.rl.easyr1_dataset import (
     issue_from_swebench_item,
     issues_from_rows,
     iter_swebench_issues,
+    load_task_signals,
     read_id_file,
+    sample_issues_with_task_pool,
     validate_split,
+    write_swebench_prompt_dataset,
 )
+import src.rl.easyr1_dataset as dataset_module
 
 
 def _row(instance_id: str) -> dict:
@@ -60,6 +65,12 @@ def test_exclude_ids_filters_before_limit():
     assert [issue.id for issue in issues] == ["b__2", "c__3"]
 
 
+def test_include_ids_filters_before_limit():
+    rows = [_row("a__1"), _row("b__2"), _row("c__3")]
+    issues = list(issues_from_rows(rows, limit=1, include_ids={"b__2", "c__3"}))
+    assert [issue.id for issue in issues] == ["b__2"]
+
+
 def test_read_id_file_line_and_json_formats(tmp_path):
     lines = tmp_path / "ids.txt"
     lines.write_text("# eval ids\na__1\n\nb__2\n", encoding="utf-8")
@@ -89,8 +100,85 @@ def test_prompt_record_keeps_easyr1_contract():
     assert ground_truth["instance_id"] == "octo__widgets-7"
     assert ground_truth["FAIL_TO_PASS"] == '["tests/test_x.py::test_a"]'
     assert ground_truth["environment_setup_commit"] == "def456"
+    assert ground_truth["stage"] == "train"
+    assert ground_truth["split"] == "train"
 
     extra_info = record["extra_info"]
+    assert ground_truth["allowed_skill_ids"] == extra_info["allowed_skill_ids"]
+    assert len(ground_truth["allowed_skill_ids"]) <= 2
     assert extra_info["stage"] == "train"
     assert extra_info["split"] == "train"
     assert "tests/test_x.py::test_a" in extra_info["test_cmd"]
+
+
+def test_load_task_signals_from_reflection_report(tmp_path):
+    report = tmp_path / "reflection.json"
+    report.write_text(
+        json.dumps({"reflection": {"task_signals": {
+            "instance_boosts": {"a__1": 2}, "family_boosts": {}
+        }}}),
+        encoding="utf-8",
+    )
+    assert load_task_signals(report)["instance_boosts"] == {"a__1": 2}
+
+
+def test_task_pool_materializes_fixed_size_deterministic_round(tmp_path):
+    issues = [issue_from_swebench_item(_row(f"repo__{index}")) for index in range(8)]
+    signals = {"instance_boosts": {"repo__0": 3}, "family_boosts": {}}
+    first = sample_issues_with_task_pool(
+        issues, signals, tmp_path / "first.json", seed=7
+    )
+    second = sample_issues_with_task_pool(
+        issues, signals, tmp_path / "second.json", seed=7
+    )
+    assert [item.id for item in first] == [item.id for item in second]
+    assert len(first) == len(issues)
+
+
+def test_task_pool_mixed_sample_is_repo_balanced_and_repeat_bounded(tmp_path):
+    issues = []
+    for repo in ("alpha", "beta", "gamma", "delta"):
+        for index in range(4):
+            row = _row(f"{repo}__{index}")
+            row["repo"] = f"org/{repo}"
+            issues.append(issue_from_swebench_item(row))
+
+    sampled = sample_issues_with_task_pool(
+        issues,
+        {"instance_boosts": {"alpha__0": 99}, "family_boosts": {}},
+        tmp_path / "pool.json",
+        seed=11,
+        num_samples=24,
+        uniform_fraction=0.5,
+        max_instance_repeats=2,
+    )
+    counts = Counter(item.id for item in sampled)
+    assert len(sampled) == 24
+    assert max(counts.values()) <= 2
+    assert {item.repo_name for item in sampled} == {
+        "org/alpha", "org/beta", "org/gamma", "org/delta"
+    }
+
+
+def test_task_pool_loads_complete_candidate_split_before_sampling(tmp_path, monkeypatch):
+    issues = [issue_from_swebench_item(_row(f"repo__{index}")) for index in range(6)]
+    observed_limits = []
+
+    def fake_iter(*, dataset, split, limit, exclude_ids, include_ids):
+        observed_limits.append(limit)
+        return iter(issues)
+
+    monkeypatch.setattr(dataset_module, "iter_swebench_issues", fake_iter)
+    monkeypatch.setattr(
+        dataset_module,
+        "build_easyr1_prompt_record",
+        lambda issue, **kwargs: {"prompt": issue.id, "ground_truth": "{}", "extra_info": {}},
+    )
+    count = write_swebench_prompt_dataset(
+        tmp_path / "train.jsonl",
+        num_instances=3,
+        task_signals={"instance_boosts": {}, "family_boosts": {}},
+        task_pool_state_path=tmp_path / "pool.json",
+    )
+    assert observed_limits == [None]
+    assert count == 3
