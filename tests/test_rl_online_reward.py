@@ -112,6 +112,40 @@ def test_compute_score_parallelizes_instances_but_preserves_order(monkeypatch):
     assert starts == {"a": [1, 2], "b": [1, 2]}
 
 
+def test_compute_score_optionally_removes_only_managed_checkout(monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    managed = workspace / "a"
+    managed.mkdir(parents=True)
+    explicit = tmp_path / "caller-owned"
+    explicit.mkdir()
+
+    monkeypatch.setattr(
+        "src.reward.online_reward._score_one",
+        lambda *_args, **_kwargs: {"overall": 0.1},
+    )
+    monkeypatch.setattr(
+        "src.environment.test_backend.resolve_backend",
+        lambda *_args, **_kwargs: object(),
+    )
+    inputs = [
+        {"ground_truth": {"instance_id": "a"}},
+        {
+            "ground_truth": {"instance_id": "b"},
+            "extra_info": {"repo_path": str(explicit)},
+        },
+    ]
+
+    compute_score(
+        inputs,
+        workspace_root=workspace,
+        cleanup_reward_workspaces=True,
+        parallel_workers=1,
+    )
+
+    assert not managed.exists()
+    assert explicit.is_dir()
+
+
 def test_failure_score_matches_utility_components():
     score = _failure_score(parse_valid=0.0, worker_executed=0.0)
     assert score["overall"] == 0.0

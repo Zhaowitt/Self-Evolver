@@ -13,6 +13,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import shutil
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.config import get_config
@@ -67,21 +68,28 @@ def compute_score(
     ) -> List[Tuple[int, Dict[str, float]]]:
         # Samples sharing an instance checkout must remain sequential: every
         # episode resets and mutates that checkout before official evaluation.
-        return [
-            (
-                index,
-                _score_one(
-                    reward_input,
-                    reward_model=reward_model,
-                    rollout_writer=rollout_writer,
-                    skill_evolver=skill_evolver,
-                    test_backend=test_backend,
-                    default_workspace=default_workspace,
-                    max_iterations=kwargs.get("max_iterations"),
-                ),
-            )
-            for index, reward_input in group
-        ]
+        try:
+            return [
+                (
+                    index,
+                    _score_one(
+                        reward_input,
+                        reward_model=reward_model,
+                        rollout_writer=rollout_writer,
+                        skill_evolver=skill_evolver,
+                        test_backend=test_backend,
+                        default_workspace=default_workspace,
+                        max_iterations=kwargs.get("max_iterations"),
+                    ),
+                )
+                for index, reward_input in group
+            ]
+        finally:
+            if _env_flag(
+                kwargs.get("cleanup_reward_workspaces"),
+                "SELF_EVOLVER_CLEANUP_REWARD_WORKSPACES",
+            ):
+                _cleanup_group_checkout(group, default_workspace)
 
     scores: List[Dict[str, float]] = [{} for _ in reward_inputs]
     worker_count = min(max_workers, len(groups))
@@ -159,6 +167,50 @@ def _parallel_workers(kwargs_value: Any) -> int:
     except (TypeError, ValueError):
         logger.warning("Invalid online reward worker count %r; using 2", value)
         return 2
+
+
+def _cleanup_group_checkout(
+    group: List[Tuple[int, Dict[str, Any]]],
+    default_workspace: Any = None,
+) -> None:
+    """Remove only an auto-created checkout after its instance group finishes.
+
+    Explicit ``repo_path`` inputs are caller-owned and are never removed.  The
+    resolved-parent check prevents a malformed instance id from escaping the
+    configured reward workspace.
+    """
+    if not group:
+        return
+    reward_input = group[0][1]
+    extra_info = _coerce_dict(reward_input.get("extra_info") or reward_input.get("metadata"))
+    ground_truth = _coerce_dict(
+        reward_input.get("ground_truth")
+        or reward_input.get("answer")
+        or extra_info.get("ground_truth")
+    )
+    if extra_info.get("repo_path") or ground_truth.get("repo_path"):
+        return
+    instance_id = (
+        ground_truth.get("instance_id")
+        or ground_truth.get("id")
+        or extra_info.get("instance_id")
+    )
+    if not instance_id:
+        return
+    workspace = Path(
+        default_workspace
+        or extra_info.get("workspace_root")
+        or os.getenv("SELF_EVOLVER_REWARD_WORKSPACE")
+        or (get_config().environment.workspace_dir / "online_reward")
+    ).expanduser().resolve()
+    checkout = (workspace / str(instance_id).replace("/", "_")).resolve()
+    if checkout.parent != workspace or not checkout.is_dir():
+        return
+    try:
+        shutil.rmtree(checkout)
+        logger.info("Removed completed online-reward checkout %s", checkout)
+    except OSError as exc:
+        logger.warning("Could not remove completed checkout %s: %s", checkout, exc)
 
 
 def _score_one(
