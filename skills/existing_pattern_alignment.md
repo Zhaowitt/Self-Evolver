@@ -1,12 +1,32 @@
 # Existing Pattern Alignment
 
 ## Description
-This skill helps ensure that any fixes made align with the existing patterns in the repository, which can help prevent regression issues.
+
+Repo-level repair skill for making a fix follow the repository's existing implementation, test, style, naming, and error-handling patterns.
+
+## Purpose
+
+Keep patches compatible with the surrounding project by reusing established conventions instead of introducing unnecessary abstractions, dependencies, or one-off designs.
+
+## When to Use
+
+  * Use after localizing the likely failure region and before writing a repair plan.
+  * Use when nearby code, related tests, helper functions, or similar bug fixes can guide the patch.
+  * Use when the localized fix could be implemented in multiple ways and the worker must choose the repo-native one.
 
 ## How to Apply
-1. Review the existing implementation patterns in the repository.
-2. Identify the areas where the fix will be applied and ensure it follows the same style and structure.
-3. Test the changes thoroughly to ensure no regressions are introduced.
-4. Document any deviations from the existing patterns and justify them if necessary.
 
-Target failure type: regression_introduced
+  * Inspect nearby implementations that solve similar problems.
+  * Inspect related tests to learn the expected behavior and assertion style.
+  * Reuse existing helpers, data structures, naming conventions, control flow, and error-handling patterns when appropriate.
+  * Match the surrounding file's level of abstraction and avoid stylistic cleanup unrelated to the repair.
+  * Introduce a new helper or abstraction only when existing patterns are insufficient for the localized fix.
+
+## Constraints
+
+  * Do not introduce a new pattern when an existing repository pattern is available.
+  * Do not change public behavior outside the localized failure path without justification.
+  * Do not add dependencies, broad abstractions, or large rewrites for a localized issue.
+  * Do not perform unrelated formatting or cleanup.
+
+Action type: ALIGN only.
