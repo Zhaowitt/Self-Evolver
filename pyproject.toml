@@ -24,8 +24,8 @@ classifiers = [
 ]
 
 dependencies = [
-    # pandas/datasets in the supported SWE-bench stack still ships NumPy 1.x
-    # extension binaries in common Conda environments.
+    # Qwen3.5/vLLM requires OpenCV builds that use NumPy 2 on Python 3.12.
+    # Keep the upper bound below 2.5 for the Numba version in the training stack.
     "numpy>=1.24,<2.5",
     "openai>=1.0.0",
     "pydantic>=2.0.0",

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 from importlib import metadata, util
+from inspect import signature
 from pathlib import Path
 import sys
 from typing import Iterable
@@ -76,6 +77,26 @@ def _check_easyr1_multimodal_loader() -> str | None:
     return None
 
 
+def _inspect_vllm_model(model: str, architectures: list[str]) -> None:
+    """Inspect a registered model across old and new vLLM APIs.
+
+    vLLM 0.20 requires a ``ModelConfig`` argument, while newer releases build
+    enough context internally and accept only the architecture list.
+    """
+    from vllm.model_executor.models import ModelRegistry
+
+    inspect_model_cls = ModelRegistry.inspect_model_cls
+    parameters = signature(inspect_model_cls).parameters
+    if "model_config" not in parameters:
+        inspect_model_cls(architectures)
+        return
+
+    from vllm.engine.arg_utils import EngineArgs
+
+    model_config = EngineArgs(model=model).create_model_config()
+    inspect_model_cls(architectures, model_config)
+
+
 def check(model: str) -> None:
     try:
         import transformers
@@ -114,9 +135,7 @@ def check(model: str) -> None:
         errors.append("Transformers does not expose: " + ", ".join(missing_transformers_classes))
 
     try:
-        from vllm.model_executor.models import ModelRegistry
-
-        ModelRegistry.inspect_model_cls(architectures)
+        _inspect_vllm_model(model, architectures)
     except Exception as exc:
         errors.append(f"vLLM cannot inspect {architectures}: {exc}")
 
