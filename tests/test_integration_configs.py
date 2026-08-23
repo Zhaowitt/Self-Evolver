@@ -45,8 +45,7 @@ def test_no_unaccounted_config_files():
     documented external example; a decorative config trips this guard."""
     shipped = {path.name for path in CONFIG_DIR.glob("*.yaml")}
     assert shipped == CODE_LOADED | EXTERNAL_EXAMPLE, (
-        "unaccounted config files: "
-        f"{sorted(shipped - (CODE_LOADED | EXTERNAL_EXAMPLE))}"
+        "unaccounted config files: " f"{sorted(shipped - (CODE_LOADED | EXTERNAL_EXAMPLE))}"
     )
 
 
@@ -82,8 +81,8 @@ def test_reward_config_value_change_changes_scoring(tmp_path):
     tight_reward = RewardModel.from_config_file(tight).score(_execution(20000))
     loose_reward = RewardModel.from_config_file(loose).score(_execution(20000))
 
-    assert tight_reward.components["cost_efficiency"] == 0.0   # 20k/10k clamps to 1
-    assert loose_reward.components["cost_efficiency"] == 0.5   # 1 - 20k/40k
+    assert tight_reward.components["cost_efficiency"] == 0.0  # 20k/10k clamps to 1
+    assert loose_reward.components["cost_efficiency"] == 0.5  # 1 - 20k/40k
     assert loose_reward.total > tight_reward.total
 
 
@@ -151,9 +150,7 @@ def test_skill_write_threshold_value_change_gates_writes(tmp_path):
 
     low_dir = tmp_path / "skills_low"
     low_dir.mkdir()
-    low_result = _evolver_from_yaml(low, low_dir).apply_proposals(
-        [_create_proposal()], utility=0.5
-    )
+    low_result = _evolver_from_yaml(low, low_dir).apply_proposals([_create_proposal()], utility=0.5)
     assert low_result["events"][0]["applied"] is True
     assert (low_dir / "new_skill.md").exists()
 
@@ -230,6 +227,8 @@ def test_easyr1_example_references_live_reward_code():
     real entrypoints (compute_score + the reward config) instead of being dead."""
     data = yaml.safe_load((CONFIG_DIR / "easyr1_online_grpo_example.yaml").read_text())
     assert isinstance(data, dict)
+    assert data["worker"]["actor"]["model"]["model_path"] == "Qwen/Qwen3.5-4B"
+    assert "/root/" not in data["worker"]["actor"]["model"]["model_path"]
 
     reward_function = data["worker"]["reward"]["reward_function"]
     module_path, function_name = reward_function.split(":")
@@ -245,3 +244,11 @@ def test_easyr1_example_references_live_reward_code():
     assert "configs/reward_config.yaml" in launcher
     assert 'trainer.val_freq="${EASYR1_VAL_FREQ}"' in launcher
     assert 'data.val_batch_size="${EASYR1_VAL_BATCH_SIZE}"' in launcher
+    assert 'worker.actor.model.model_path="${CONTROLLER_MODEL_PATH}"' in launcher
+    assert "scripts/preflight_qwen35.py" in launcher
+
+
+def test_controller_sft_uses_the_same_portable_base_model():
+    data = yaml.safe_load((CONFIG_DIR / "controller_sft.yaml").read_text())
+    assert data["model_path"] == "Qwen/Qwen3.5-4B"
+    assert "/root/" not in data["model_path"]

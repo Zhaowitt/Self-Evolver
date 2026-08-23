@@ -1,4 +1,4 @@
-# One-GPU EasyR1 GRPO configuration for the Self-Evolver Controller.
+# One-A100 EasyR1 GRPO configuration for the Self-Evolver Controller.
 # scripts/run_rl_controller.sh supplies absolute train/validation/reward paths.
 data:
   train_files: data/controller_train.jsonl
@@ -34,7 +34,9 @@ worker:
     dynamic_batching: true
     ulysses_size: 1
     model:
-      model_path: /root/self-evolver-lab/models/Qwen2.5-1.5B-Instruct
+      # Portable default. CONTROLLER_MODEL_PATH can override this with either
+      # another Hugging Face ID or a cluster-local snapshot path.
+      model_path: Qwen/Qwen3.5-4B
       enable_gradient_checkpointing: true
       trust_remote_code: false
       lora:
@@ -60,8 +62,8 @@ worker:
     temperature: 1.0
     top_p: 1.0
     limit_images: 0
-    # Leaves room on a 32 GiB card for the colocated actor and a small
-    # external worker model used by the online execution reward.
+    # Reserve a bounded fraction of an 80 GiB A100 for the colocated vLLM
+    # rollout engine while the FSDP actor remains resident on the same GPU.
     gpu_memory_utilization: 0.2
     enforce_eager: true
     enable_chunked_prefill: true
@@ -93,7 +95,7 @@ trainer:
   total_epochs: 1
   max_steps: 64
   project_name: self_evolver
-  experiment_name: controller_online_grpo_qwen2_5_1_5b_round1_64step
+  experiment_name: controller_online_grpo_qwen3_5_4b_round1_64step
   logger: [console]
   nnodes: 1
   n_gpus_per_node: 1

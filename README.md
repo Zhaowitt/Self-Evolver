@@ -103,3 +103,11 @@ Online rewards run different instance checkouts concurrently while keeping all
 rollouts for one instance serial. `REWARD_WORKERS` controls the launcher setting
 (default `4`; for `rollout_batch_size: 4` and `rollout.n: 3`, this gives four
 parallel queues of three rollouts).
+
+### NeSI + Qwen3.5
+
+The portable Controller default is `Qwen/Qwen3.5-4B`.  On NeSI, first run the
+Qwen3.5 compatibility check and a one-step GPU smoke test, then submit the
+64-step A100 job with `scripts/run_nesi_qwen35_4b.sl`.  See
+[`docs/NESI_QWEN35_RUNBOOK.md`](docs/NESI_QWEN35_RUNBOOK.md) for storage paths,
+environment prerequisites, fresh-run versus checkpoint rules, and commands.

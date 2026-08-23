@@ -7,7 +7,8 @@
 # eval -- and drives the GRPO launch only when EASYR1_DIR points at a checkout.
 #
 # Knobs: TRAIN_DATASET/TRAIN_SPLIT, NUM_TRAIN, VAL_DATASET/VAL_SPLIT, NUM_VAL,
-#        EXCLUDE_IDS, EASYR1_DIR, EASYR1_CONFIG, CONTROLLER_BASE_URL,
+#        EXCLUDE_IDS, EASYR1_DIR, EASYR1_CONFIG, CONTROLLER_MODEL_PATH,
+#        CONTROLLER_BASE_URL, QWEN35_PREFLIGHT,
 #        REWARD_WORKERS, REBUILD_DATASETS (0/1),
 #        HARD_CASE_START_OFFSET (byte offset for round reflection),
 #        TASK_SIGNALS_REPORT (previous-round reflection report),
@@ -17,6 +18,8 @@
 #        EASYR1_LOAD_CHECKPOINT_PATH (optional prior-round global_step_*),
 #        EASYR1_MAX_STEPS (optional cumulative trainer step target),
 #        EASYR1_VAL_FREQ/EASYR1_VAL_BATCH_SIZE (optional validation overrides),
+#        EASYR1_GPU_MEMORY_UTILIZATION/EASYR1_NUM_GPUS/
+#        EASYR1_TENSOR_PARALLEL_SIZE (optional hardware overrides),
 #        ENABLE_SKILL_REFLECTION (0/1), REFLECT_MIN_CLUSTER_SIZE, ROUND_ID,
 #        RUN_EVAL (0/1), EVAL_DATASET/EVAL_SPLIT, NUM_EVAL, SEED, TEST_BACKEND.
 set -euo pipefail
@@ -31,6 +34,8 @@ NUM_VAL="${NUM_VAL:-}"
 EXCLUDE_IDS="${EXCLUDE_IDS:-${DATA_DIR}/eval_ids.txt}"
 EASYR1_DIR="${EASYR1_DIR:-}"
 EASYR1_CONFIG="${EASYR1_CONFIG:-${REPO_ROOT}/configs/easyr1_online_grpo_example.yaml}"
+CONTROLLER_MODEL_PATH="${CONTROLLER_MODEL_PATH:-}"
+QWEN35_PREFLIGHT="${QWEN35_PREFLIGHT:-1}"
 RUN_EVAL="${RUN_EVAL:-0}"
 EVAL_DATASET="${EVAL_DATASET:-verified}"
 EVAL_SPLIT="${EVAL_SPLIT:-test}"
@@ -62,6 +67,9 @@ EASYR1_LOAD_CHECKPOINT_PATH="${EASYR1_LOAD_CHECKPOINT_PATH:-}"
 EASYR1_MAX_STEPS="${EASYR1_MAX_STEPS:-}"
 EASYR1_VAL_FREQ="${EASYR1_VAL_FREQ:-}"
 EASYR1_VAL_BATCH_SIZE="${EASYR1_VAL_BATCH_SIZE:-}"
+EASYR1_GPU_MEMORY_UTILIZATION="${EASYR1_GPU_MEMORY_UTILIZATION:-}"
+EASYR1_NUM_GPUS="${EASYR1_NUM_GPUS:-}"
+EASYR1_TENSOR_PARALLEL_SIZE="${EASYR1_TENSOR_PARALLEL_SIZE:-}"
 
 require_python
 require_data
@@ -142,6 +150,14 @@ if [ -n "${EASYR1_DIR}" ]; then
     [ -d "${EASYR1_DIR}" ] || die "EASYR1_DIR='${EASYR1_DIR}' does not exist."
     require_container_engine
     require_api_key
+    if [ "${QWEN35_PREFLIGHT}" = "1" ]; then
+        PREFLIGHT_ARGS=(--config "${EASYR1_CONFIG}")
+        if [ -n "${CONTROLLER_MODEL_PATH}" ]; then
+            PREFLIGHT_ARGS+=(--model "${CONTROLLER_MODEL_PATH}")
+        fi
+        info "Checking Controller model compatibility before EasyR1 launch"
+        "${PYTHON}" "${REPO_ROOT}/scripts/preflight_qwen35.py" "${PREFLIGHT_ARGS[@]}"
+    fi
     export SELF_EVOLVER_TEST_BACKEND="${TEST_BACKEND}"
     export SELF_EVOLVER_REWARD_CONFIG="${REPO_ROOT}/configs/reward_config.yaml"
     export SELF_EVOLVER_ROLLOUT_JSONL="${RUNS_DIR}/online_rollouts.jsonl"
@@ -161,6 +177,9 @@ if [ -n "${EASYR1_DIR}" ]; then
     mkdir -p "${TMPDIR}"
     info "Launching EasyR1 GRPO from ${EASYR1_DIR}"
     EASYR1_OVERRIDES=()
+    if [ -n "${CONTROLLER_MODEL_PATH}" ]; then
+        EASYR1_OVERRIDES+=(worker.actor.model.model_path="${CONTROLLER_MODEL_PATH}")
+    fi
     if [ -n "${EASYR1_EXPERIMENT_NAME}" ]; then
         EASYR1_OVERRIDES+=(trainer.experiment_name="${EASYR1_EXPERIMENT_NAME}")
     fi
@@ -175,6 +194,15 @@ if [ -n "${EASYR1_DIR}" ]; then
     fi
     if [ -n "${EASYR1_VAL_BATCH_SIZE}" ]; then
         EASYR1_OVERRIDES+=(data.val_batch_size="${EASYR1_VAL_BATCH_SIZE}")
+    fi
+    if [ -n "${EASYR1_GPU_MEMORY_UTILIZATION}" ]; then
+        EASYR1_OVERRIDES+=(worker.rollout.gpu_memory_utilization="${EASYR1_GPU_MEMORY_UTILIZATION}")
+    fi
+    if [ -n "${EASYR1_NUM_GPUS}" ]; then
+        EASYR1_OVERRIDES+=(trainer.n_gpus_per_node="${EASYR1_NUM_GPUS}")
+    fi
+    if [ -n "${EASYR1_TENSOR_PARALLEL_SIZE}" ]; then
+        EASYR1_OVERRIDES+=(worker.rollout.tensor_parallel_size="${EASYR1_TENSOR_PARALLEL_SIZE}")
     fi
     ( cd "${EASYR1_DIR}" && "${PYTHON}" -m verl.trainer.main \
         config="${EASYR1_CONFIG}" \
