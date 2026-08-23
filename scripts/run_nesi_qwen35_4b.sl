@@ -33,7 +33,9 @@ ROUND_ID="${ROUND_ID:-qwen35-round01}"
 
 module purge
 module load Miniforge3/25.3.1-0
-module load CUDA
+# vLLM is built from source against the PyTorch cu126 ABI; do not use NeSI's
+# moving default CUDA module (currently newer than the compiled extension).
+module load CUDA/12.6.3
 module load Apptainer
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "${CONDA_ENV}"
