@@ -7,12 +7,15 @@ import json
 import os
 import random
 from collections import Counter, defaultdict
+from dataclasses import replace
+from math import ceil
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 from src.config import get_config
 from src.controller.prompt_builder import ControllerPromptBuilder
 from src.environment.models import Issue
+from src.environment.f2p_subset import F2P_SUBSET_POLICY, F2PSubsetSelector
 from src.memory.hard_case_buffer import resolve_hard_cases_path
 from src.memory.memory_retriever import MemoryRetriever
 from src.rl.online_rollout_runner import build_targeted_test_cmd
@@ -56,7 +59,7 @@ def build_easyr1_prompt_record(
     prompt_builder = prompt_builder or ControllerPromptBuilder()
     candidate_skills = (skill_selector or SkillSelector()).select_many(
         memory_query=issue.description,
-        limit=2,
+        limit=6,
     )
     hard_case_items = list(hard_cases or retrieve_hard_cases(issue))
     skill_payloads = [skill.to_dict() for skill in candidate_skills]
@@ -73,6 +76,13 @@ def build_easyr1_prompt_record(
         },
     ]
     ground_truth = issue_to_ground_truth(issue)
+    round_id = str(issue.metadata.get("round_id") or os.getenv("SELF_EVOLVER_ROUND_ID") or "0")
+    train_subset = F2PSubsetSelector().select(
+        issue.metadata.get("fail_to_pass"), issue.id, round_id=round_id
+    )
+    ground_truth["TRAIN_FAIL_TO_PASS_SUBSET"] = train_subset
+    ground_truth["F2P_SUBSET_POLICY"] = F2P_SUBSET_POLICY
+    ground_truth["round_id"] = round_id
     # EasyR1's batch reward input does not reliably preserve arbitrary
     # ``extra_info`` fields. Keep the lifecycle boundary in ground_truth too so
     # validation can never be mistaken for train-time skill evolution.
@@ -88,6 +98,9 @@ def build_easyr1_prompt_record(
         "workspace_root": str(workspace_root) if workspace_root else "",
         "test_cmd": test_cmd or build_targeted_test_cmd(issue) or "",
         "allowed_skill_ids": [skill.id for skill in candidate_skills],
+        "TRAIN_FAIL_TO_PASS_SUBSET": train_subset,
+        "F2P_SUBSET_POLICY": F2P_SUBSET_POLICY,
+        "round_id": round_id,
     }
     return {
         "prompt": json.dumps(messages, ensure_ascii=False),
@@ -109,6 +122,9 @@ def issue_to_ground_truth(issue: Issue) -> Dict[str, Any]:
         "environment_setup_commit": issue.metadata.get("environment_setup_commit"),
         "FAIL_TO_PASS": issue.metadata.get("fail_to_pass"),
         "PASS_TO_PASS": issue.metadata.get("pass_to_pass"),
+        "observed_failure_label": issue.metadata.get("observed_failure_label", ""),
+        "stable_cluster_id": issue.metadata.get("stable_cluster_id", ""),
+        "sampling_source": issue.metadata.get("sampling_source", ""),
     }
 
 
@@ -134,7 +150,7 @@ def write_swebench_prompt_dataset(
     # ``num_instances`` here used to truncate full/test before sampling; because
     # SWE-bench rows are repository-grouped, NUM_TRAIN=320 silently restricted
     # the pool to Astropy and Django.
-    pool_sampling = stage == "train" and task_pool_state_path and task_signals
+    pool_sampling = stage == "train" and bool(task_pool_state_path)
     issues = list(
         iter_swebench_issues(
             dataset=dataset,
@@ -148,14 +164,14 @@ def write_swebench_prompt_dataset(
         pool = _task_pool_for_issues(issues, task_pool_state_path)
         if task_signals:
             pool.apply_reflection(task_signals)
-            issues = _issues_from_pool_sample(
-                issues,
-                pool,
-                sampling_seed,
-                num_samples=num_instances,
-                uniform_fraction=task_pool_uniform_fraction,
-                max_instance_repeats=max_instance_repeats,
-            )
+        issues = _issues_from_pool_sample(
+            issues,
+            pool,
+            sampling_seed,
+            num_samples=num_instances,
+            uniform_fraction=task_pool_uniform_fraction,
+            max_instance_repeats=max_instance_repeats,
+        )
         pool.save()
     count = 0
     with output_path.open("w", encoding="utf-8") as out:
@@ -232,32 +248,121 @@ def _issues_from_pool_sample(
         return []
 
     rng = random.Random(seed)
-    uniform_target = min(target, round(target * uniform_fraction), len(by_id))
-    chosen_ids = _repo_balanced_ids(list(by_id.values()), uniform_target, rng)
-    counts = Counter(chosen_ids)
+    unseen_ids = [instance_id for instance_id in pool.unseen_instance_ids() if instance_id in by_id]
+    failure_groups = {
+        label: [instance_id for instance_id in ids if instance_id in by_id]
+        for label, ids in pool.observed_failure_groups().items()
+    }
+    failure_groups = {label: ids for label, ids in failure_groups.items() if ids}
 
-    # Fill the remaining quota using the evolved TaskPool weights.  The hard
-    # cap is on materialized records, not merely on the weight multiplier.
-    weights_by_id = pool.weights()
-    while len(chosen_ids) < target:
+    unseen_target = round(target * uniform_fraction)
+    unseen_issues = [by_id[instance_id] for instance_id in unseen_ids]
+    unseen_chosen = _repo_balanced_ids(unseen_issues, min(unseen_target, len(unseen_ids)), rng)
+    chosen: List[tuple[str, str, str]] = [
+        (instance_id, "unseen_random", "") for instance_id in unseen_chosen
+    ]
+    counts = Counter(unseen_chosen)
+
+    failure_target = target - unseen_target
+    replay_ids = _failure_balanced_ids(
+        failure_groups,
+        failure_target,
+        counts,
+        by_id,
+        max_instance_repeats,
+        rng,
+    )
+    for instance_id, label in replay_ids:
+        chosen.append((instance_id, "observed_failure_replay", label))
+        counts[instance_id] += 1
+
+    # Explicit fallback when U or F cannot fill its half. Prefer the other
+    # valid pool, then the complete eligible set, always respecting repeat cap.
+    label_by_id = {
+        instance_id: label for label, ids in failure_groups.items() for instance_id in ids
+    }
+    while len(chosen) < target:
         candidates = [
             instance_id
-            for instance_id in by_id
+            for instance_id in [*unseen_ids, *label_by_id, *sorted(by_id)]
             if counts[instance_id] < max_instance_repeats
         ]
+        candidates = list(dict.fromkeys(candidates))
         if not candidates:
             raise RuntimeError("TaskPool repeat cap exhausted before sample was full")
-        weights = [max(0.0, weights_by_id.get(instance_id, 0.0)) for instance_id in candidates]
-        selected = (
-            rng.choices(candidates, weights=weights, k=1)[0]
-            if sum(weights) > 0.0
-            else rng.choice(candidates)
-        )
-        chosen_ids.append(selected)
+        selected = rng.choice(candidates)
+        if selected in unseen_ids:
+            source, label = "unseen_random_fallback", ""
+        elif selected in label_by_id:
+            source, label = "observed_failure_replay_fallback", label_by_id[selected]
+        else:
+            source, label = "eligible_pool_fallback", ""
+        chosen.append((selected, source, label))
         counts[selected] += 1
 
-    rng.shuffle(chosen_ids)
-    return [by_id[instance_id] for instance_id in chosen_ids]
+    rng.shuffle(chosen)
+    result: List[Issue] = []
+    for instance_id, source, label in chosen:
+        issue = by_id[instance_id]
+        metadata = {
+            **issue.metadata,
+            "sampling_source": source,
+            "observed_failure_label": label,
+            "stable_cluster_id": pool.stable_cluster_id_of(instance_id),
+        }
+        result.append(replace(issue, metadata=metadata))
+    return result
+
+
+def _failure_balanced_ids(
+    groups: Dict[str, List[str]],
+    target: int,
+    counts: Counter,
+    by_id: Dict[str, Issue],
+    repeat_cap: int,
+    rng: random.Random,
+    label_fraction_cap: float = 0.5,
+) -> List[tuple[str, str]]:
+    """Allocate label quotas first, then draw repo-balanced within each label."""
+    if target <= 0 or not groups:
+        return []
+    labels = sorted(groups)
+    rng.shuffle(labels)
+    label_cap = max(1, ceil(target * label_fraction_cap))
+    label_counts: Counter = Counter()
+    repo_counts: Dict[str, Counter] = {label: Counter() for label in labels}
+    chosen: List[tuple[str, str]] = []
+    cursor = 0
+    stalled = 0
+    while len(chosen) < target and stalled < len(labels):
+        label = labels[cursor % len(labels)]
+        cursor += 1
+        if label_counts[label] >= label_cap:
+            stalled += 1
+            continue
+        candidates = [
+            instance_id
+            for instance_id in groups[label]
+            if counts[instance_id] + sum(1 for item, _ in chosen if item == instance_id) < repeat_cap
+        ]
+        if not candidates:
+            stalled += 1
+            continue
+        min_repo_count = min(
+            repo_counts[label][by_id[instance_id].repo_name or "unknown"]
+            for instance_id in candidates
+        )
+        candidates = [
+            instance_id
+            for instance_id in candidates
+            if repo_counts[label][by_id[instance_id].repo_name or "unknown"] == min_repo_count
+        ]
+        selected = rng.choice(candidates)
+        chosen.append((selected, label))
+        label_counts[label] += 1
+        repo_counts[label][by_id[selected].repo_name or "unknown"] += 1
+        stalled = 0
+    return chosen
 
 
 def _repo_balanced_ids(issues: List[Issue], n: int, rng: random.Random) -> List[str]:
@@ -296,6 +401,8 @@ def load_task_signals(path: Path) -> Dict[str, Any]:
     return {
         "instance_boosts": dict(signals.get("instance_boosts") or {}),
         "family_boosts": dict(signals.get("family_boosts") or {}),
+        "observed_failure_labels": dict(signals.get("observed_failure_labels") or {}),
+        "stable_cluster_ids": dict(signals.get("stable_cluster_ids") or {}),
     }
 
 
@@ -425,6 +532,9 @@ def issue_from_swebench_item(item: Dict[str, Any]) -> Issue:
             "environment_setup_commit": item.get("environment_setup_commit"),
             "fail_to_pass": item.get("FAIL_TO_PASS"),
             "pass_to_pass": item.get("PASS_TO_PASS"),
+            "train_fail_to_pass_subset": item.get("TRAIN_FAIL_TO_PASS_SUBSET"),
+            "f2p_subset_policy": item.get("F2P_SUBSET_POLICY"),
+            "round_id": item.get("round_id"),
         },
     )
 
@@ -461,9 +571,10 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser.add_argument("--sampling-seed", type=int, default=42)
     parser.add_argument(
         "--task-pool-uniform-fraction",
+        "--task-pool-unseen-fraction",
         type=float,
         default=0.5,
-        help="Fraction drawn without replacement, balanced across repositories.",
+        help="Fraction drawn from U={attempts==0}, repository-balanced (default 0.5).",
     )
     parser.add_argument(
         "--max-instance-repeats",

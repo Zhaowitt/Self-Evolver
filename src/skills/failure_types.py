@@ -19,6 +19,13 @@ class FailureType(str, Enum):
     TIMEOUT = "timeout"
     UNKNOWN = "unknown"
     GENERAL = "general"
+    LOCALIZATION_FAILURE = "localization_failure"
+    WRONG_ROOT_CAUSE = "wrong_root_cause"
+    PATCH_GENERATION_FAILURE = "patch_generation_failure"
+    PATCH_APPLICATION_FAILURE = "patch_application_failure"
+    INCOMPLETE_FIX = "incomplete_fix"
+    TEST_INTERPRETATION_FAILURE = "test_interpretation_failure"
+    ENVIRONMENT_FAILURE = "environment_failure"
 
 
 FAILURE_TYPE_VALUES = frozenset(item.value for item in FailureType)
@@ -32,6 +39,13 @@ TARGET_FAILURE_TYPES: tuple[str, ...] = (
     FailureType.REGRESSION_INTRODUCED.value,
     FailureType.UNKNOWN.value,
     FailureType.GENERAL.value,
+    FailureType.LOCALIZATION_FAILURE.value,
+    FailureType.WRONG_ROOT_CAUSE.value,
+    FailureType.PATCH_GENERATION_FAILURE.value,
+    FailureType.PATCH_APPLICATION_FAILURE.value,
+    FailureType.INCOMPLETE_FIX.value,
+    FailureType.TEST_INTERPRETATION_FAILURE.value,
+    FailureType.ENVIRONMENT_FAILURE.value,
 )
 
 # Verifier status strings -> taxonomy.
@@ -45,7 +59,10 @@ _VERIFICATION_STATUS_MAP = {
 }
 
 # Explicit per-skill declaration, e.g. a standalone line "Target failure type: test_failure".
-_MARKER_RE = re.compile(r"^\s*target failure type:\s*([a-z_]+)\s*\.?\s*$", re.IGNORECASE | re.MULTILINE)
+_MARKER_RE = re.compile(
+    r"^\s*(?:target failure type|applicable capability label):\s*([a-z_]+)\s*\.?\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 # Keyword heuristic for skills without an explicit marker (ordered for deterministic ties).
 _SKILL_KEYWORDS: tuple[tuple[FailureType, tuple[str, ...]], ...] = (

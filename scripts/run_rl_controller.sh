@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Controller RL pipeline. The high-level Controller (task/skill/budget cues) is
+# Controller RL pipeline. The Controller selects grounded skills and an optional
+# short strategy; the worker iteration cap is system-owned (maximum three).
 # trained with EasyR1 GRPO against the online execution reward, then served and
 # evaluated frozen. EasyR1 is an external trainer (not vendored), so this script
 # does the in-repo parts for real -- build the prompt datasets and run the frozen
@@ -42,6 +43,7 @@ REWARD_WORKERS="${REWARD_WORKERS:-4}"
 REBUILD_DATASETS="${REBUILD_DATASETS:-1}"
 REFLECT_MIN_CLUSTER_SIZE="${REFLECT_MIN_CLUSTER_SIZE:-3}"
 ROUND_ID="${ROUND_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
+export SELF_EVOLVER_ROUND_ID="${ROUND_ID}"
 SKILL_REFLECTION_DIR="${SKILL_REFLECTION_DIR:-${RUNS_DIR}/skill_reflections}"
 WORKSPACE_DIR="${WORKSPACE_DIR:-${WORKSPACE_ROOT}}"
 HARD_CASES_PATH="${HARD_CASES_PATH:-${WORKSPACE_DIR}/hard_cases.jsonl}"
@@ -117,9 +119,8 @@ else
     info "Reusing frozen Controller prompt datasets for checkpoint resume"
 fi
 
-# 2) GRPO training with EasyR1. The online reward runs a full repair episode plus
-#    one container eval per policy sample, so the container engine and an API key
-#    for the worker LLM must be available on the trainer host.
+# 2) GRPO training with EasyR1. Each candidate patch uses the frozen F2P subset
+#    gate; promising/final patches receive a full official F2P+P2P evaluation.
 REWARD_FN="src/reward/online_reward.py:compute_score"
 cat <<EOF
 --------------------------------------------------------------------------------
@@ -145,7 +146,6 @@ if [ -n "${EASYR1_DIR}" ]; then
     export SELF_EVOLVER_REWARD_CONFIG="${REPO_ROOT}/configs/reward_config.yaml"
     export SELF_EVOLVER_ROLLOUT_JSONL="${RUNS_DIR}/online_rollouts.jsonl"
     export SELF_EVOLVER_ENABLE_SKILL_EVOLUTION="${ENABLE_SKILL_CREDIT}"
-    export SELF_EVOLVER_ROUND_ID="${ROUND_ID}"
     export SELF_EVOLVER_REWARD_WORKERS="${REWARD_WORKERS}"
     export WORKSPACE_DIR
     HARD_CASE_START_OFFSET="${HARD_CASE_START_OFFSET:-}"

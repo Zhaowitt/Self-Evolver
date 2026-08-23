@@ -104,7 +104,11 @@ def test_empty_signal_yields_no_block(tmp_path):
     assert format_controller_guidance(None, skill_bank=SkillBank(skills_dir=tmp_path)) == ""
 
 
-def test_system_prompt_drops_skill_updates_and_adds_budget():
+def test_system_prompt_exposes_only_shallow_controller_action():
     assert "skill_updates" not in CONTROLLER_SYSTEM_PROMPT
-    assert '"budget"' in CONTROLLER_SYSTEM_PROMPT
+    assert '"budget"' not in CONTROLLER_SYSTEM_PROMPT
+    assert '"target_failure_type"' not in CONTROLLER_SYSTEM_PROMPT
+    assert '"memory_query"' not in CONTROLLER_SYSTEM_PROMPT
+    assert '"task_wrapper"' not in CONTROLLER_SYSTEM_PROMPT
+    assert '"selected_skill_ids"' in CONTROLLER_SYSTEM_PROMPT
     assert "You do not create, update, or deprecate skills" in CONTROLLER_SYSTEM_PROMPT

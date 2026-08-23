@@ -13,6 +13,7 @@ path never fabricates a regression verdict.
 
 import json
 import logging
+import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, List, Optional
@@ -26,6 +27,7 @@ from src.environment.models import (
     TestStatus,
 )
 from src.environment.project_env import ProjectEnvironment
+from src.environment.f2p_subset import F2PSubsetSelector, parse_test_ids
 from src.llm.client import LLMClient
 from src.workers.base import BaseWorker, WorkerResult
 from src.workers.patch_generator import PatchResult
@@ -67,7 +69,11 @@ class VerificationResult:
     canonical_patch_info: Optional[PatchInfo] = None
     patch_apply_result: Optional[PatchApplyResult] = None
     test_result: Optional[TestResult] = None
+    subset_eval_outcome: Optional[Any] = None
+    full_eval_outcome: Optional[Any] = None
     eval_outcome: Optional[Any] = None
+    evaluation_scope: str = "none"
+    official_eval_executed: bool = False
     error_message: str = ""
     summary: str = ""
 
@@ -159,7 +165,7 @@ class Verifier(BaseWorker):
             # in isolation, so revert the host apply first.
             if self._use_backend(context.issue):
                 self.env.revert_changes()
-                result = self._verify_with_backend(context.issue, canonical_diff)
+                result = self._verify_with_backend(context, canonical_diff)
             else:
                 self.logger.info("Running tests...")
                 result = self._verify_on_host(self.env.run_tests())
@@ -196,9 +202,68 @@ class Verifier(BaseWorker):
         """Grade with the official backend only for SWE-bench instances."""
         return self.test_backend is not None and bool(_fail_to_pass(issue))
 
-    def _verify_with_backend(self, issue, model_patch: str) -> VerificationResult:
-        """Grade the canonical patch with official per-test F2P/P2P semantics."""
-        outcome = self.test_backend.run_swebench_eval(_swebench_instance(issue), model_patch)
+    def _verify_with_backend(
+        self,
+        context: ExecutionContext,
+        model_patch: str,
+    ) -> VerificationResult:
+        """Run the train-time subset gate, then full official verification.
+
+        A subset-only result is deliberately not stored in ``eval_outcome``;
+        that field is reserved for full outcomes consumed by final reward.
+        Validation/evaluation stages bypass the subset gate entirely.
+        """
+        issue = context.issue
+        instance = _swebench_instance(issue)
+        stage = str(context.metadata.get("stage") or "train").lower()
+        final_iteration = context.iteration + 1 >= context.max_iterations
+        subset_outcome = None
+
+        if stage == "train" and hasattr(self.test_backend, "run_subset_eval"):
+            selected = _training_subset(issue)
+            if selected:
+                try:
+                    subset_outcome = self.test_backend.run_subset_eval(
+                        instance,
+                        model_patch,
+                        selected,
+                    )
+                except Exception:
+                    if not final_iteration:
+                        raise
+                    self.logger.exception(
+                        "Final-iteration subset failed to execute; continuing to full eval"
+                    )
+                    subset_outcome = None
+            if subset_outcome is not None:
+                subset_passed = (
+                    subset_outcome.f2p_total > 0
+                    and subset_outcome.f2p_passed == subset_outcome.f2p_total
+                )
+                if not subset_passed and not final_iteration:
+                    summary = (
+                        "Subset gate failed: "
+                        f"F2P {subset_outcome.f2p_passed}/{subset_outcome.f2p_total}; "
+                        "full official evaluation skipped."
+                    )
+                    return VerificationResult(
+                        status=VerificationStatus.TESTS_FAILED,
+                        tests_passed=False,
+                        original_issue_fixed=False,
+                        test_result=_test_result_from_outcome(subset_outcome),
+                        subset_eval_outcome=subset_outcome,
+                        eval_outcome=None,
+                        evaluation_scope="subset",
+                        official_eval_executed=False,
+                        summary=summary,
+                    )
+
+        if hasattr(self.test_backend, "run_full_eval"):
+            outcome = self.test_backend.run_full_eval(instance, model_patch)
+        else:
+            # Compatibility for external/legacy backends.  They perform the
+            # complete old evaluation, never masquerading as a subset run.
+            outcome = self.test_backend.run_swebench_eval(instance, model_patch)
         if outcome.resolved:
             status = VerificationStatus.SUCCESS
         elif not outcome.p2p_no_regression:
@@ -215,7 +280,11 @@ class Verifier(BaseWorker):
             original_issue_fixed=bool(outcome.resolved),
             new_issues_introduced=not outcome.p2p_no_regression,
             test_result=_test_result_from_outcome(outcome),
+            subset_eval_outcome=subset_outcome,
+            full_eval_outcome=outcome,
             eval_outcome=outcome,
+            evaluation_scope="full",
+            official_eval_executed=True,
             summary=summary,
         )
 
@@ -258,6 +327,22 @@ def _test_result_from_outcome(outcome) -> TestResult:
 
 def _fail_to_pass(issue) -> List[str]:
     return _id_list((getattr(issue, "metadata", None) or {}).get("fail_to_pass"))
+
+
+def _training_subset(issue) -> List[str]:
+    metadata = getattr(issue, "metadata", None) or {}
+    frozen = parse_test_ids(
+        metadata.get("train_fail_to_pass_subset")
+        or metadata.get("TRAIN_FAIL_TO_PASS_SUBSET")
+    )
+    if frozen:
+        return frozen
+    round_id = metadata.get("round_id") or os.getenv("SELF_EVOLVER_ROUND_ID") or "0"
+    return F2PSubsetSelector().select(
+        metadata.get("fail_to_pass"),
+        instance_id=issue.id,
+        round_id=round_id,
+    )
 
 
 def _id_list(raw) -> List[str]:

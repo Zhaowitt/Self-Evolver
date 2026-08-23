@@ -87,6 +87,30 @@ def test_eval_script_has_output_markers():
     assert ">>>>> End Test Output" in spec.eval_script
 
 
+def test_subset_script_replaces_only_official_test_command():
+    official = (
+        "activate env\napply test patch\n: '>>>>> Start Test Output'\n"
+        "python -m pytest whole_file.py\n: '>>>>> End Test Output'\ncleanup\n"
+    )
+    script = tb.RepositoryTestCommandBuilder().eval_script(
+        {"repo": "psf/requests"},
+        ["tests/test_api.py::test_one"],
+        official_eval_script=official,
+    )
+    assert "activate env\napply test patch" in script
+    assert "cleanup" in script
+    assert "whole_file.py" not in script
+    assert "tests/test_api.py::test_one" in script
+
+
+def test_django_log_ids_become_runnable_dotted_labels():
+    command = tb.RepositoryTestCommandBuilder().build(
+        {"repo": "django/django"},
+        ["test_redirect (admin_views.tests.AdminViewPermissionsTest)"],
+    )
+    assert "admin_views.tests.AdminViewPermissionsTest.test_redirect" in command
+
+
 # --- image naming / sif cache ----------------------------------------------
 
 def test_image_key_uses_swebench_namespace():

@@ -13,19 +13,24 @@ from src.skills.skill_store import SkillStore
 
 PROPOSAL_JSON = json.dumps(
     {
-        "skill_updates": [
+        "cluster_decisions": [
             {
                 "operation": "create",
+                "cluster_id": "__CLUSTER_ID__",
                 "skill_id": "diagnose_apply_errors",
                 "title": "Diagnose Apply Errors",
-                "summary": "Read patch-apply diagnostics before retrying.",
-                "target_failure_type": "patch_application_error",
-                "content": (
-                    "# Diagnose Apply Errors\n\n## Description\n"
-                    "Repair malformed diffs from apply diagnostics.\n\n"
-                    "## How to Apply\nInspect the apply error, fix hunk context, retry.\n"
-                ),
+                "description": "Repair malformed diffs from apply diagnostics.",
+                "purpose": "Prevent retries of a structurally invalid patch.",
+                "when_to_use": ["The canonical diff fails to apply."],
+                "how_to_apply": [
+                    "Read the first rejected hunk and compare its context with the current file.",
+                    "Regenerate only that hunk and rerun the apply check."
+                ],
+                "constraints": ["Do not change code semantics until the diff applies cleanly."],
+                "action_type": "PATCH|RETRY",
+                "applicable_capability_label": "patch_application_failure",
                 "rationale": "Recurring apply failures in the cluster.",
+                "evidence_provenance": ["acme__widgets-1", "acme__widgets-2"],
                 "source": "reflector",
                 "confidence": 0.7,
             }
@@ -44,7 +49,11 @@ class ScriptedLLM:
     def chat_with_system(self, system_prompt: str, user_message: str, **kwargs) -> LLMResponse:
         self.calls += 1
         self.last_user = user_message
-        return LLMResponse(content=self._content, model="scripted")
+        content = self._content
+        if "__CLUSTER_ID__" in content:
+            cluster_id = json.loads(user_message)["failure_clusters"][0]["cluster_id"]
+            content = content.replace("__CLUSTER_ID__", cluster_id)
+        return LLMResponse(content=content, model="scripted")
 
 
 def _seed_buffer(path, reason, ids):
@@ -54,9 +63,16 @@ def _seed_buffer(path, reason, ids):
             HardCaseRecord(
                 issue_id=issue_id,
                 repo_name="acme/widgets",
-                failure_type="patch_application_error",
+                failure_type="patch_application_failure",
                 reason=reason,
                 stage="train",
+                failure_diagnosis={
+                    "mechanism": "patch_application_failure",
+                    "summary": reason,
+                    "error_signatures": ["git apply: malformed hunk"],
+                    "evidence": {"patch_applied": [False]},
+                    "confidence": 0.9,
+                },
             )
         )
 
@@ -97,7 +113,7 @@ def test_reflect_applies_proposals_from_qualifying_cluster(tmp_path):
     assert any(e["skill_id"] == "diagnose_apply_errors" for e in applied)
 
 
-def test_reflect_emits_instance_boosts(tmp_path):
+def test_reflect_emits_observed_labels_and_stable_cluster_ids(tmp_path):
     _seed_buffer(
         tmp_path / "hard_cases.jsonl",
         "git apply failed malformed hunk context",
@@ -105,7 +121,14 @@ def test_reflect_emits_instance_boosts(tmp_path):
     )
     reflector = _reflector(tmp_path, ScriptedLLM(PROPOSAL_JSON))
     result = reflector.reflect(stage="train")
-    assert result.task_signals["instance_boosts"] == {"acme__widgets-1": 2, "acme__widgets-2": 1}
+    assert result.task_signals["observed_failure_labels"] == {
+        "acme__widgets-1": "patch_application_failure",
+        "acme__widgets-2": "patch_application_failure",
+    }
+    assert set(result.task_signals["stable_cluster_ids"]) == {
+        "acme__widgets-1", "acme__widgets-2"
+    }
+    assert result.task_signals["instance_boosts"] == {}
     assert result.task_signals["family_boosts"] == {}
 
 
@@ -131,9 +154,16 @@ def test_reflect_records_only_uses_explicit_round_slice(tmp_path):
         HardCaseRecord(
             issue_id=f"round__issue-{index}",
             repo_name="acme/widgets",
-            failure_type="patch_application_error",
+            failure_type="patch_application_failure",
             reason="git apply failed malformed hunk context",
             stage="train",
+            failure_diagnosis={
+                "mechanism": "patch_application_failure",
+                "summary": "git apply failed malformed hunk context",
+                "error_signatures": ["git apply: malformed hunk"],
+                "evidence": {"patch_applied": [False]},
+                "confidence": 0.9,
+            },
         )
         for index in range(3)
     ]
@@ -152,9 +182,16 @@ def test_reflect_ignores_other_stage_records(tmp_path):
             HardCaseRecord(
                 issue_id=issue_id,
                 repo_name="acme/widgets",
-                failure_type="patch_application_error",
+                failure_type="patch_application_failure",
                 reason="git apply failed malformed hunk context",
                 stage="eval",
+                failure_diagnosis={
+                    "mechanism": "patch_application_failure",
+                    "summary": "git apply failed malformed hunk context",
+                    "error_signatures": ["git apply: malformed hunk"],
+                    "evidence": {"patch_applied": [False]},
+                    "confidence": 0.9,
+                },
             )
         )
     llm = ScriptedLLM(PROPOSAL_JSON)
@@ -171,7 +208,8 @@ def test_reflect_survives_non_json_llm_output(tmp_path):
     )
     reflector = _reflector(tmp_path, ScriptedLLM("sorry, I cannot help with that"))
     result = reflector.reflect(stage="train")
-    assert result.proposals == []
+    assert len(result.proposals) == 1
+    assert result.proposals[0]["operation"] == "no-op"
     assert result.evolution is None
     assert result.rejected_proposals  # the parse failure is recorded, not raised
 
@@ -188,6 +226,8 @@ def test_reflect_validator_gates_and_selects(tmp_path):
         return [], 0.0
 
     result = reflector.reflect(stage="train", validator=reject_all)
-    assert result.proposals == []
+    assert len(result.proposals) == 1
+    assert result.proposals[0]["operation"] == "no-op"
+    assert result.proposals[0]["rationale"] == "validator rejected write"
     assert result.evolution is None
     assert not (tmp_path / "skills" / "diagnose_apply_errors.md").exists()

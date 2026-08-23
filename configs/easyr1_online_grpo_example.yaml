@@ -98,7 +98,8 @@ trainer:
   nnodes: 1
   n_gpus_per_node: 1
   max_try_make_batch: 20
-  val_freq: 8
+  # Full official validation once at the 64-step round boundary.
+  val_freq: 64
   val_before_train: false
   val_generations_to_log: 2
   save_freq: 4

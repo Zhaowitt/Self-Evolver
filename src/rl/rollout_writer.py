@@ -32,7 +32,6 @@ as absent/null. Writers must only add fields, never repurpose existing ones.
 
 from __future__ import annotations
 
-import fcntl
 import json
 import uuid
 from dataclasses import asdict, is_dataclass
@@ -43,6 +42,8 @@ from typing import Any, Dict, Optional
 from src.config import get_config
 from src.controller.schema import controller_signal_from_any
 from src.environment.models import Issue
+from src.reflection.failure_diagnosis import diagnose_failed_trajectory
+from src.skills.file_lock import file_lock
 
 SCHEMA_VERSION = "rollout_record_v2"
 
@@ -56,13 +57,10 @@ class RolloutWriter:
     def append(self, record: Dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(_json_safe(record), ensure_ascii=False) + "\n"
-        with self.path.open("a", encoding="utf-8") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            try:
+        with file_lock(self.path):
+            with self.path.open("a", encoding="utf-8") as f:
                 f.write(line)
                 f.flush()
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def build_rollout_record(
@@ -84,6 +82,13 @@ def build_rollout_record(
     reward_payload = reward.to_dict() if hasattr(reward, "to_dict") else reward
     evaluation_payload = _evaluation_payload(evaluation)
     skill_updates = getattr(signal, "skill_updates", []) if signal else []
+    records = list(getattr(execution_result, "iteration_records", []) or [])
+    status_value = getattr(getattr(execution_result, "status", None), "value", "")
+    failure_diagnosis = (
+        None
+        if bool(getattr(execution_result, "success", False))
+        else diagnose_failed_trajectory(records, status_value or "failed").to_dict()
+    )
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -99,6 +104,10 @@ def build_rollout_record(
         "mode": signal.mode if signal else "",
         "controller_signal": signal.to_dict() if signal else None,
         "selected_skill_ids": signal.selected_skill_ids if signal else [],
+        "skill_set_key": sorted(signal.selected_skill_ids) if signal else [],
+        "observed_failure_label": issue.metadata.get("observed_failure_label", ""),
+        "stable_cluster_id": issue.metadata.get("stable_cluster_id", ""),
+        "sampling_source": issue.metadata.get("sampling_source", ""),
         "skill_updates": [
             proposal.to_dict() if hasattr(proposal, "to_dict") else proposal
             for proposal in skill_updates
@@ -113,6 +122,8 @@ def build_rollout_record(
             "final_patch_files": list(getattr(final_patch, "modified_files", []) or []),
         },
         "eval_outcome": _eval_outcome_payload(eval_outcome),
+        "verification_evidence": _verification_evidence(records),
+        "failure_diagnosis": failure_diagnosis,
         "evaluation": evaluation_payload,
         "reward": reward_payload,
         "skill_evolution": skill_evolution or {
@@ -143,7 +154,34 @@ def _eval_outcome_payload(eval_outcome: Any) -> Optional[Dict[str, Any]]:
         "p2p_passed": int(getter("p2p_passed") or 0),
         "p2p_total": int(getter("p2p_total") or 0),
         "resolved": bool(getter("resolved") or False),
+        "evaluation_scope": str(getter("evaluation_scope", "full") or "full"),
+        "selected_f2p_ids": list(getter("selected_f2p_ids", []) or []),
     }
+
+
+def _verification_evidence(records: list[Any]) -> list[Dict[str, Any]]:
+    evidence: list[Dict[str, Any]] = []
+    for record in records:
+        verification = getattr(record, "verification_result", None)
+        if not verification:
+            continue
+        item: Dict[str, Any] = {
+            "iteration": int(getattr(record, "iteration", 0) or 0),
+            "status": getattr(getattr(verification, "status", None), "value", ""),
+            "patch_applied": bool(getattr(verification, "patch_applied", False)),
+            "evaluation_scope": getattr(verification, "evaluation_scope", "none"),
+            "official_eval_executed": bool(
+                getattr(verification, "official_eval_executed", False)
+            ),
+        }
+        subset = getattr(verification, "subset_eval_outcome", None)
+        full = getattr(verification, "full_eval_outcome", None)
+        if subset is not None:
+            item["subset"] = _eval_outcome_payload(subset)
+        if full is not None:
+            item["full"] = _eval_outcome_payload(full)
+        evidence.append(item)
+    return evidence
 
 
 def _evaluation_payload(evaluation: Any) -> Optional[Dict[str, Any]]:

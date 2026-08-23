@@ -65,4 +65,11 @@ def test_canonical_vocabulary_is_stable():
         "timeout",
         "unknown",
         "general",
+        "localization_failure",
+        "wrong_root_cause",
+        "patch_generation_failure",
+        "patch_application_failure",
+        "incomplete_fix",
+        "test_interpretation_failure",
+        "environment_failure",
     }

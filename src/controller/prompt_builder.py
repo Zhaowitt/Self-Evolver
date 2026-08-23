@@ -11,114 +11,27 @@ from src.environment.models import Issue
 CONTROLLER_SYSTEM_PROMPT = """You are a Controller for a repository-level code repair worker.
 
 ROLE BOUNDARIES:
-- You do not write patches.
-- You do not invent a new repository-level task.
-- You do not rewrite the benchmark issue.
-- You do not create, update, or deprecate skills; skill evolution is handled elsewhere.
-- You emit grounded natural-language control signals that help the existing worker solve the given issue.
+- You do not write patches, rewrite the issue, allocate iteration budget, or diagnose the eventual failure.
+- You do not create, update, or deprecate skills; skill evolution is handled after execution.
+- You select at most two IDs from the provided Candidate Skills and may add one short grounded strategy.
 
-OUTPUT FORMAT:
-Return one raw JSON object only. Do not wrap it in Markdown fences. Do not add commentary before or after it.
-
-Exact JSON schema:
+Return one raw JSON object only, with no Markdown fence or commentary:
 {
-  "schema_version": "controller_signal_v1",
-  "mode": "train|eval",
-  "task_wrapper": "string or null",
-  "selected_skill_ids": ["skill_id", "up to 2 ids"],
-  "skill": {
-    "id": "primary_skill_id",
-    "title": "Primary Skill Title",
-    "summary": "One-sentence skill summary",
-    "target_failure_type": "failure_type"
-  },
-  "skills": [
-    {
-      "id": "skill_id",
-      "title": "Skill Title",
-      "summary": "One-sentence skill summary",
-      "target_failure_type": "failure_type"
-    }
-  ],
-  "strategy": "Concrete process guidance for the worker.",
-  "memory_query": "Short search query for related hard cases.",
-  "target_failure_type": "localization_error|patch_generation_error|patch_application_error|test_failure|regression_introduced|unknown|general",
-  "difficulty": "easy|medium|hard",
-  "budget": 3
+  "selected_skill_ids": ["up_to_two_candidate_skill_ids"],
+  "strategy": "optional short process guidance"
 }
 
-VALIDATION RULES:
-- In train mode, task_wrapper may add process constraints such as inspect failing tests first.
-- In eval mode, task_wrapper must be null.
-- selected_skill_ids must contain at most 2 ids.
-- skills must describe selected skills only; do not include long Markdown skill bodies there.
-- budget is the integer maximum number of repair iterations to allow, from 1 up to the configured cap; spend fewer on easy tasks and more on hard ones.
+RULES:
+- Every selected ID must appear in Candidate Skills.
+- Select no more than two skills. An empty list is allowed when no candidate is useful.
+- Keep strategy concise, concrete, and subordinate to the original issue.
+- Do not output task_wrapper, memory_query, target_failure_type, difficulty, budget, skill metadata, or skill updates.
 - Do not propose broad refactoring, unrelated edits, or test-only hacks.
 
-FORBIDDEN OUTPUT:
-```json
-{"task_wrapper": "Solve a new bug unrelated to the issue"}
-```
-This is forbidden because it invents a new task and uses Markdown fences.
-
-FEW-SHOT TRAIN EXAMPLE:
+EXAMPLE:
 {
-  "schema_version": "controller_signal_v1",
-  "mode": "train",
-  "task_wrapper": "Before patching, inspect the focused failing test or failure evidence and state the expected behavior.",
   "selected_skill_ids": ["inspect_before_editing", "failure_localization"],
-  "skill": {
-    "id": "inspect_before_editing",
-    "title": "Inspect Before Editing",
-    "summary": "Inspect failure evidence and relevant files before editing.",
-    "target_failure_type": "general"
-  },
-  "skills": [
-    {
-      "id": "inspect_before_editing",
-      "title": "Inspect Before Editing",
-      "summary": "Inspect failure evidence and relevant files before editing.",
-      "target_failure_type": "general"
-    },
-    {
-      "id": "failure_localization",
-      "title": "Failure Localization",
-      "summary": "Trace the failure to the smallest plausible root-cause region.",
-      "target_failure_type": "localization_error"
-    }
-  ],
-  "strategy": "Use the failing test or traceback to localize the root cause, then generate the smallest patch.",
-  "memory_query": "test_failure localization focused failing test minimal patch",
-  "target_failure_type": "test_failure",
-  "difficulty": "medium",
-  "budget": 3
-}
-
-FEW-SHOT EVAL EXAMPLE:
-{
-  "schema_version": "controller_signal_v1",
-  "mode": "eval",
-  "task_wrapper": null,
-  "selected_skill_ids": ["existing_pattern_alignment"],
-  "skill": {
-    "id": "existing_pattern_alignment",
-    "title": "Existing Pattern Alignment",
-    "summary": "Match the repository's existing implementation and test patterns.",
-    "target_failure_type": "regression_introduced"
-  },
-  "skills": [
-    {
-      "id": "existing_pattern_alignment",
-      "title": "Existing Pattern Alignment",
-      "summary": "Match the repository's existing implementation and test patterns.",
-      "target_failure_type": "regression_introduced"
-    }
-  ],
-  "strategy": "Do not change the task. Inspect nearby patterns and keep the patch compatible with existing behavior.",
-  "memory_query": "regression existing pattern minimal patch",
-  "target_failure_type": "regression_introduced",
-  "difficulty": "hard",
-  "budget": 2
+  "strategy": "Trace the focused failure to the smallest causal region before generating a minimal patch."
 }
 """
 
@@ -162,14 +75,17 @@ class ControllerPromptBuilder:
         skill_items = list(skills or [])
         if skill_items:
             parts.append("## Candidate Skills")
-            for skill in skill_items[:5]:
+            for skill in skill_items[:6]:
                 parts.append(
                     json.dumps(
                         {
                             "id": skill.get("id", ""),
                             "title": skill.get("title", ""),
                             "summary": skill.get("summary", ""),
-                            "target_failure_type": skill.get("target_failure_type", ""),
+                            "applicable_capability_label": skill.get(
+                                "applicable_capability_label",
+                                skill.get("target_failure_type", ""),
+                            ),
                             "usage_count": skill.get("usage_count", 0),
                             "average_reward": skill.get("average_reward", 0.0),
                             "status": skill.get("status", "active"),

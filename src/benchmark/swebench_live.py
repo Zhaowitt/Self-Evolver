@@ -20,6 +20,10 @@ import tempfile
 from pathlib import Path
 from typing import Any, List, Optional
 
+from src.environment.swebench_compat import ensure_swebench_importable
+
+ensure_swebench_importable()
+
 from swebench.harness.constants import APPLY_PATCH_FAIL, APPLY_PATCH_PASS, TESTS_TIMEOUT
 
 from src.benchmark.swebench_runner import SWEBenchRunner
@@ -73,7 +77,13 @@ def _test_ids(value: Any) -> List[str]:
     return [str(item) for item in value if str(item).strip()]
 
 
-def grade_pytest_log(instance: dict, output: str, applied: bool) -> EvalOutcome:
+def grade_pytest_log(
+    instance: dict,
+    output: str,
+    applied: bool,
+    evaluation_scope: str = "full",
+    selected_f2p_ids: Optional[List[str]] = None,
+) -> EvalOutcome:
     """Grade a captured ``pytest -rA`` log with official swebench report logic."""
     f2p = _test_ids(instance.get("FAIL_TO_PASS"))
     p2p = _test_ids(instance.get("PASS_TO_PASS"))
@@ -87,6 +97,8 @@ def grade_pytest_log(instance: dict, output: str, applied: bool) -> EvalOutcome:
         instance.get("repo", ""),
         instance.get("instance_id", ""),
         log_tail=output[-4000:],
+        evaluation_scope=evaluation_scope,
+        selected_f2p_ids=selected_f2p_ids,
     )
 
 
@@ -181,13 +193,46 @@ class LiveTestBackend:
         model_patch: str,
         timeout: Optional[int] = None,
     ) -> EvalOutcome:
+        return self.run_full_eval(instance, model_patch, timeout=timeout)
+
+    def run_full_eval(
+        self,
+        instance: dict,
+        model_patch: str,
+        timeout: Optional[int] = None,
+    ) -> EvalOutcome:
+        return self._run_eval(instance, model_patch, timeout, "full", [])
+
+    def run_subset_eval(
+        self,
+        instance: dict,
+        model_patch: str,
+        selected_f2p_ids: List[str],
+        timeout: Optional[int] = None,
+    ) -> EvalOutcome:
+        selected = _test_ids(selected_f2p_ids)
+        subset = {**instance, "FAIL_TO_PASS": selected, "PASS_TO_PASS": []}
+        return self._run_eval(subset, model_patch, timeout, "subset", selected)
+
+    def _run_eval(
+        self,
+        instance: dict,
+        model_patch: str,
+        timeout: Optional[int],
+        evaluation_scope: str,
+        selected_f2p_ids: List[str],
+    ) -> EvalOutcome:
         timeout = timeout or default_eval_timeout()
         f2p = _test_ids(instance.get("FAIL_TO_PASS"))
         p2p = _test_ids(instance.get("PASS_TO_PASS"))
         repo = instance.get("repo", "")
         instance_id = instance.get("instance_id", "")
         if not (model_patch or "").strip():
-            return build_outcome({}, False, f2p, p2p, repo, instance_id, "Empty model patch")
+            return build_outcome(
+                {}, False, f2p, p2p, repo, instance_id, "Empty model patch",
+                evaluation_scope=evaluation_scope,
+                selected_f2p_ids=selected_f2p_ids,
+            )
 
         image_ref = self.image_key(instance)
         ids = " ".join(shlex.quote(test) for test in [*f2p, *p2p])
@@ -210,7 +255,13 @@ class LiveTestBackend:
                 output = f"{partial}\n\n{TESTS_TIMEOUT}: {timeout} seconds exceeded."
 
         applied = APPLY_PATCH_PASS in output and APPLY_PATCH_FAIL not in output
-        return grade_pytest_log(instance, output, applied)
+        return grade_pytest_log(
+            instance,
+            output,
+            applied,
+            evaluation_scope=evaluation_scope,
+            selected_f2p_ids=selected_f2p_ids,
+        )
 
 
 class SWEBenchLiveRunner(SWEBenchRunner):

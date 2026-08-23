@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
 from src.tasks.task_pool import TaskPool
+from src.reward.cluster_baseline import ClusterBaselineStore
 
 
 def read_round_rollouts(path: Path, start_offset: int) -> list[Dict[str, Any]]:
@@ -40,6 +41,7 @@ def update_task_pool_after_grpo(
     rollouts_path: Path,
     start_offset: int,
     round_id: str,
+    cluster_baselines_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Update family EMA and too-hard decay from this round's official outcomes."""
     instances = _state_instances(state_path) or _instances_from_train_jsonl(train_jsonl)
@@ -50,6 +52,7 @@ def update_task_pool_after_grpo(
     applied = 0
     skipped = 0
     duplicates = 0
+    baseline_samples: list[Dict[str, Any]] = []
     for record in records:
         rollout_id = str(record.get("rollout_id") or "")
         if rollout_id and rollout_id in processed:
@@ -61,15 +64,25 @@ def update_task_pool_after_grpo(
             continue
         outcome = record.get("eval_outcome") or {}
         reward = record.get("reward") or {}
+        diagnosis = record.get("failure_diagnosis") or {}
+        cluster_id = str(reward.get("cluster_id") or record.get("stable_cluster_id") or "")
         pool.record_outcome(
             instance_id,
             resolved=bool(outcome.get("resolved", False)),
-            utility=float(reward.get("total", 0.0) or 0.0),
+            utility=float(reward.get("task_reward", reward.get("total", 0.0)) or 0.0),
+            observed_failure_label=str(diagnosis.get("mechanism") or ""),
+            stable_cluster_id=cluster_id,
         )
+        if cluster_id and reward.get("task_reward") is not None:
+            baseline_samples.append(
+                {"cluster_id": cluster_id, "task_reward": reward.get("task_reward")}
+            )
         applied += 1
         if rollout_id:
             processed.add(rollout_id)
     pool.save()
+    baseline_store = ClusterBaselineStore(cluster_baselines_path)
+    baseline_store.update_round(baseline_samples, round_id=round_id)
     _save_processed_rollouts(ingestion_path, processed)
     return {
         "round_id": round_id,
@@ -78,6 +91,8 @@ def update_task_pool_after_grpo(
         "skipped_outcomes": skipped,
         "duplicate_outcomes": duplicates,
         "task_pool_state": str(state_path),
+        "cluster_baselines": str(baseline_store.path),
+        "cluster_baseline_samples": len(baseline_samples),
     }
 
 
@@ -155,6 +170,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     parser.add_argument("--rollouts", type=Path, required=True)
     parser.add_argument("--start-offset", type=int, required=True)
     parser.add_argument("--round-id", required=True)
+    parser.add_argument("--cluster-baselines", type=Path, default=None)
     args = parser.parse_args(list(argv) if argv is not None else None)
     result = update_task_pool_after_grpo(
         args.task_pool_state,
@@ -162,6 +178,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         args.rollouts,
         args.start_offset,
         args.round_id,
+        args.cluster_baselines,
     )
     print(
         "GRPO TaskPool update: "

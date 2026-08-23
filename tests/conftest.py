@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import pytest
 
+from src.environment.swebench_compat import ensure_swebench_importable
 from src.config import reset_config
+
+ensure_swebench_importable()
 
 
 @pytest.fixture(autouse=True)

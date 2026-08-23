@@ -129,6 +129,8 @@ def _skill_list(
             continue
         seen.add(key)
         selected.append(signal)
-        if len(selected) >= 2:
+        # Give the Controller a real matching problem (relevant candidates plus
+        # distractors); grounding still caps the chosen action at two skills.
+        if len(selected) >= 6:
             break
     return selected

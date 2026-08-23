@@ -47,7 +47,7 @@ from src.rl.online_rollout_runner import (
 )
 from src.rl.rollout_writer import RolloutWriter, build_rollout_record
 from src.skills.skill_bank import SkillBank
-from src.skills.skill_evolver import SkillEvolutionConfig, SkillEvolver
+from src.skills.skill_evolver import SkillEvolver
 from src.skills.skill_selector import SkillSelector
 from src.skills.skill_store import SkillStore
 from src.tasks.task_pool import TaskPool
@@ -101,10 +101,30 @@ class _ImageBaseAdapter:
         self.backend = backend
 
     def run_swebench_eval(self, instance: dict, model_patch: str, timeout: Optional[int] = None):
+        return self.run_full_eval(instance, model_patch, timeout=timeout)
+
+    def _base_instance(self, instance: dict) -> dict:
         base = base_instance_id(instance)
         if base and base != instance.get("instance_id"):
             instance = {**instance, "instance_id": base}
-        return self.backend.run_swebench_eval(instance, model_patch, timeout=timeout)
+        return instance
+
+    def run_full_eval(self, instance: dict, model_patch: str, timeout: Optional[int] = None):
+        instance = self._base_instance(instance)
+        evaluator = getattr(self.backend, "run_full_eval", self.backend.run_swebench_eval)
+        return evaluator(instance, model_patch, timeout=timeout)
+
+    def run_subset_eval(
+        self,
+        instance: dict,
+        model_patch: str,
+        selected_f2p_ids: List[str],
+        timeout: Optional[int] = None,
+    ):
+        instance = self._base_instance(instance)
+        return self.backend.run_subset_eval(
+            instance, model_patch, selected_f2p_ids, timeout=timeout
+        )
 
 
 class SWEBenchRunner(BenchmarkRunner):
@@ -274,7 +294,7 @@ class SWEBenchRunner(BenchmarkRunner):
             query = " ".join(str(c.get("failure_type", "")) for c in hard_cases) or issue.description
             selected = [
                 skill.to_skill_signal()
-                for skill in self._selector.select_many(memory_query=query, limit=2)
+                for skill in self._selector.select_many(memory_query=query, limit=6)
             ]
 
         if self._controller_client is not None:
@@ -299,9 +319,9 @@ class SWEBenchRunner(BenchmarkRunner):
 
     @staticmethod
     def _max_iterations(signal: Optional[ControllerSignal]) -> int:
-        if signal and signal.budget:
-            return signal.budget
-        return get_config().agent.max_iterations
+        # Kept as a helper for call-site compatibility.  The Controller no
+        # longer owns resource allocation.
+        return min(3, max(1, get_config().agent.max_iterations))
 
     # -------------------------------------------------------------- episode
 
@@ -410,16 +430,30 @@ class SWEBenchRunner(BenchmarkRunner):
             pool.apply_reflection(signals)
 
     def _task_signals_from_memory(self) -> Dict[str, Any]:
-        """Instance boosts from hard-case clusters (task evolution without skill writes)."""
+        """Observed labels from v2 diagnoses (task evolution without skill writes)."""
         from src.reflection.clustering import cluster_records, qualifying_clusters
 
         records = MemoryRetriever(self._hard_cases_path).retrieve(stage="train", limit=200)
-        clusters = qualifying_clusters(cluster_records(records))
-        boosts: Dict[str, int] = defaultdict(int)
-        for cluster in clusters:
+        labels: Dict[str, str] = {}
+        stable: Dict[str, str] = {}
+        all_clusters = cluster_records(
+            records,
+            registry_path=self._hard_cases_path.with_name("cluster_registry.json"),
+        )
+        qualifying_ids = {cluster.cluster_id for cluster in qualifying_clusters(all_clusters)}
+        for cluster in all_clusters:
+            if not cluster.diagnosis_available or cluster.mechanism == "unknown":
+                continue
             for instance_id in cluster.instance_ids:
-                boosts[instance_id] += 1
-        return {"instance_boosts": dict(boosts), "family_boosts": {}}
+                labels[instance_id] = cluster.mechanism
+                if cluster.cluster_id in qualifying_ids:
+                    stable[instance_id] = cluster.cluster_id
+        return {
+            "observed_failure_labels": labels,
+            "stable_cluster_ids": stable,
+            "instance_boosts": {},
+            "family_boosts": {},
+        }
 
     def _validate_skills(self, proposals, clusters):
         """Replay held-out cluster instances with the candidates forced in; gate on mean utility."""
@@ -486,7 +520,6 @@ class SWEBenchRunner(BenchmarkRunner):
             self.logger.warning("No container backend: focused task variants will not be verified.")
         pool = TaskPool.from_instances(rows, self.run_dir / "task_pool.json", verifier=verifier)
         rng = random.Random(self.experiment.seed)
-        reflect_every = max(1, SkillEvolutionConfig.load().reflect_every_n_rollouts)
         budget = num_rollouts or len(pool)
         predictions = self._load_predictions(predictions_path)
 
@@ -505,11 +538,11 @@ class SWEBenchRunner(BenchmarkRunner):
             pool.record_outcome(instance["instance_id"], episode.resolved, episode.utility)
             predictions[issue.id] = self._prediction_dict(issue.id, episode.patch)
             self._save_predictions(predictions_path, predictions)
-            if self.experiment.task_evolution == "on" and (step + 1) % reflect_every == 0:
-                self._run_reflection(pool)
             pool.save()
 
-        self._run_reflection(pool)  # end-of-iteration reflection
+        # SkillBank and cluster decisions stay frozen during the round.  One
+        # batch reflection is applied only after every rollout has completed.
+        self._run_reflection(pool)
         pool.save()
 
     def _generate_direct(

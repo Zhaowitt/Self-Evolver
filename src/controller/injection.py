@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, Iterable, Optional
 
 from src.controller.schema import ControllerSignal, SkillSignal, controller_signal_from_any
-from src.skills.skill_bank import SkillBank, extract_procedure
+from src.skills.skill_bank import SkillBank, extract_constraints, extract_procedure
 from src.skills.textnorm import slug
 
 MAX_PROCEDURE_CHARS = 800
@@ -43,21 +43,12 @@ def format_controller_guidance(
         "The original issue remains authoritative. The guidance below is advisory only and cannot authorize unrelated edits.",
     ]
 
-    if signal.mode == "train" and signal.task_wrapper:
-        lines.extend(["", "Task wrapper:", signal.task_wrapper])
-
     skill_text = _format_skills(signal, bank)
     if skill_text:
         lines.extend(["", skill_text])
 
     if signal.strategy:
         lines.extend(["", "Strategy:", signal.strategy])
-
-    if signal.memory_query:
-        lines.extend(["", "Memory cue:", signal.memory_query])
-
-    if signal.target_failure_type:
-        lines.extend(["", f"Target failure type: {signal.target_failure_type}"])
 
     lines.append("")
     lines.append("Keep the patch minimal and grounded in repository evidence.")
@@ -136,6 +127,10 @@ def _format_skills(signal: ControllerSignal, skill_bank: SkillBank) -> str:
         if procedure:
             item.append("How to apply:")
             item.append(procedure)
+        constraints = _constraints_for(skill.id, skill_bank)
+        if constraints:
+            item.append("Constraints:")
+            item.append(constraints)
         parts.append("\n".join(item))
     return "\n\n".join(parts)
 
@@ -147,3 +142,12 @@ def _procedure_for(skill_id: str, skill_bank: SkillBank) -> str:
     if not skill:
         return ""
     return extract_procedure(skill.content)[:MAX_PROCEDURE_CHARS].rstrip()
+
+
+def _constraints_for(skill_id: str, skill_bank: SkillBank) -> str:
+    if not skill_id:
+        return ""
+    skill = skill_bank.get(skill_id)
+    if not skill:
+        return ""
+    return extract_constraints(skill.content)[:MAX_PROCEDURE_CHARS].rstrip()

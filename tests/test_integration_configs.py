@@ -37,7 +37,7 @@ CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
 CODE_LOADED = {"reward_config.yaml", "skill_evolution.yaml", "task_evolution.yaml"}
 # The external EasyR1 trainer reads this; our code does not load it. Proven live
 # (references compute_score + reward_config) rather than decorative.
-EXTERNAL_EXAMPLE = {"easyr1_online_grpo_example.yaml"}
+EXTERNAL_EXAMPLE = {"easyr1_online_grpo_example.yaml", "controller_sft.yaml"}
 
 
 def test_no_unaccounted_config_files():
@@ -91,8 +91,13 @@ def test_reward_config_value_change_changes_scoring(tmp_path):
 
 
 _SKILL_MD = (
-    "# New Skill\n\n## Description\nd\n\n## How to Apply\np\n\n"
-    "Target failure type: test_failure\n"
+    "# New Skill\n\n## Description\nA concrete repair procedure.\n\n"
+    "## Purpose\nPrevent a repeated failure pattern.\n\n"
+    "## When to Use\n  * Use for the matching observed mechanism.\n\n"
+    "## How to Apply\n  * Inspect the recorded evidence.\n  * Verify the scoped fix.\n\n"
+    "## Constraints\n  * Keep the patch minimal.\n\n"
+    "Action type: INSPECT|VERIFY.\n\n"
+    "Applicable capability label: incomplete_fix\n"
 )
 
 
@@ -106,6 +111,8 @@ def _create_proposal() -> SkillUpdateProposal:
         content=_SKILL_MD,
         rationale="cluster evidence",
         source="reflector",
+        cluster_id="cluster-config-test",
+        evidence_provenance=["issue-1", "issue-2"],
     )
 
 

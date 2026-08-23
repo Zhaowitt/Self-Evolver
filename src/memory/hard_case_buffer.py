@@ -13,9 +13,10 @@ from src.config import get_config
 from src.environment.models import Issue
 from src.skills.failure_types import FailureType, failure_type_from_statuses
 from src.skills.file_lock import file_lock
+from src.reflection.failure_diagnosis import diagnose_failed_trajectory
 
 
-HARD_CASE_SCHEMA_VERSION = "hard_case_v1"
+HARD_CASE_SCHEMA_VERSION = "hard_case_v2"
 
 # Admission policy (Proposal 2.5.1): a failed run is worth keeping when it is a
 # repeated failure, shows many interactions with little progress, or exhausted
@@ -48,6 +49,7 @@ class HardCaseRecord:
     verification_statuses: List[str] = field(default_factory=list)
     patch_apply_strategies: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    failure_diagnosis: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         payload = asdict(self)
@@ -73,6 +75,7 @@ class HardCaseRecord:
                 verification_statuses=list(data.get("verification_statuses") or []),
                 patch_apply_strategies=list(data.get("patch_apply_strategies") or []),
                 metadata=dict(data.get("metadata") or {}),
+                failure_diagnosis=dict(data.get("failure_diagnosis") or {}),
             )
         return cls.from_legacy(data)
 
@@ -93,6 +96,8 @@ class HardCaseRecord:
             verification_statuses=verification_statuses,
             patch_apply_strategies=list(data.get("patch_apply_strategies") or []),
             metadata={"legacy_schema": True},
+            # Do not fabricate v2 diagnosis from a lossy legacy summary.
+            failure_diagnosis={},
         )
 
 
@@ -169,7 +174,13 @@ class HardCaseBuffer:
                 and getattr(item.verification_result, "patch_apply_result", None)
             ],
             metadata=dict(metadata or {}),
+            failure_diagnosis=diagnose_failed_trajectory(
+                record_list, termination_reason=reason
+            ).to_dict(),
         )
+        mechanism = str(payload.failure_diagnosis.get("mechanism") or "unknown")
+        # Keep the old field readable, while v2 consumers use mechanism.
+        payload.failure_type = mechanism
         if payload.failure_type == FailureType.UNKNOWN.value:
             payload.failure_type = failure_type_from_statuses(payload.verification_statuses)
 

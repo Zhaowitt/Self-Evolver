@@ -113,6 +113,15 @@ def extract_procedure(content: str) -> str:
     return "\n".join(lines)
 
 
+def extract_constraints(content: str) -> str:
+    """Return the canonical Constraints block without its heading."""
+    match = re.search(r"^## Constraints\s*(.*?)(?:\n## |\nAction type:|\Z)", content, re.DOTALL | re.MULTILINE)
+    if not match:
+        return ""
+    lines = [line.rstrip() for line in match.group(1).splitlines() if line.strip()]
+    return "\n".join(lines)
+
+
 def _extract_title(content: str) -> str:
     match = re.search(r"^#\s+(.+)$", content, re.MULTILINE)
     return match.group(1).strip() if match else ""

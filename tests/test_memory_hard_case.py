@@ -101,7 +101,9 @@ def test_append_from_execution_respects_admission(tmp_path):
     assert buffer.read() == []
 
     # Second identical failure is now a repeat -> admitted with stage tagged.
-    buffer.append(_record())  # prior similar case in history
+    # With no verifier evidence the structured diagnosis is ``unknown``; repeat
+    # admission compares that observed mechanism, not the caller's legacy label.
+    buffer.append(_record(failure_type="unknown"))
     admitted = buffer.append_from_execution(
         _issue(), records=[_Iter()], reason="gave up again", failure_type="test_failure",
         stage="train", budget=5,

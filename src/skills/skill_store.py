@@ -129,14 +129,25 @@ class SkillStore:
         success: Optional[bool] = None,
         ema_alpha: float = 0.3,
         round_id: Optional[str] = None,
+        contribution: Optional[float] = None,
+        skill_set_key: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        """Credit skills with advantage = utility - EMA baseline, then update the baseline."""
+        """Record joint skill-set contribution.
+
+        ``contribution`` is the cluster-relative signal computed by RewardModel.
+        The legacy global EMA path remains readable for old callers, but the
+        training path always supplies the explicit frozen-baseline value.
+        """
         normalized_ids = [slug(skill_id) for skill_id in skill_ids if slug(skill_id)]
         with file_lock(self.metadata_path):
             stats = self.load_metadata()
             baseline = self.load_baseline()
             has_baseline = baseline["count"] > 0
-            advantage = float(utility) - baseline["ema"] if has_baseline else 0.0
+            advantage = (
+                float(contribution)
+                if contribution is not None
+                else (float(utility) - baseline["ema"] if has_baseline else 0.0)
+            )
 
             current_hashes = {skill.id: skill.content_hash for skill in self.load_skills()}
             for skill_id in normalized_ids:
@@ -145,14 +156,24 @@ class SkillStore:
                 item.record_credit(
                     float(utility), advantage, success=success, round_id=round_id
                 )
+                if skill_set_key:
+                    item.record_event(
+                        "joint_skill_set_credit",
+                        skill_set_key=sorted(set(skill_set_key)),
+                        contribution=advantage,
+                        round_id=round_id,
+                    )
                 stats[skill_id] = item
 
-            new_ema = (
-                float(utility)
-                if not has_baseline
-                else (1.0 - ema_alpha) * baseline["ema"] + ema_alpha * float(utility)
-            )
-            new_baseline = {"ema": new_ema, "count": baseline["count"] + 1}
+            if contribution is not None:
+                new_baseline = baseline
+            else:
+                new_ema = (
+                    float(utility)
+                    if not has_baseline
+                    else (1.0 - ema_alpha) * baseline["ema"] + ema_alpha * float(utility)
+                )
+                new_baseline = {"ema": new_ema, "count": baseline["count"] + 1}
             self.save_metadata(stats, baseline=new_baseline)
         return {
             "advantage": advantage,
@@ -168,6 +189,7 @@ class SkillStore:
         source: str = "reflector",
         archive_existing: bool = True,
         target_failure_type: Optional[str] = None,
+        provenance: Optional[Dict[str, Any]] = None,
     ) -> SkillStats:
         normalized_id = slug(skill_id)
         path = self.get_skill_path(normalized_id)
@@ -189,7 +211,7 @@ class SkillStore:
             existing.source = source
             existing.revision += 1
             existing.content_hash = content_hash(normalized_content)
-            existing.record_event("skill_written", path=str(path))
+            existing.record_event("skill_written", path=str(path), **dict(provenance or {}))
             stats[normalized_id] = existing
             self.save_metadata(stats)
         return existing

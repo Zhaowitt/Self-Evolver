@@ -1,4 +1,4 @@
-"""Execution-utility math, skill-write gate, evolution utility, config loading."""
+"""Official-outcome reward, cluster-relative contribution, and config loading."""
 
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -53,27 +53,17 @@ def test_full_resolve_scores_one():
     outcome = {"f2p_passed": 3, "f2p_total": 3, "p2p_passed": 10, "p2p_total": 10, "resolved": True}
     reward = RewardModel().score(_execution(tokens=0), eval_outcome=outcome)
     assert reward.total == 1.0
-    assert reward.components == {
-        "resolved": 1.0,
-        "f2p_fraction": 1.0,
-        "p2p_no_regression": 1.0,
-        "cost_efficiency": 1.0,
-        "process": 1.0,
-    }
+    assert reward.components["official_resolved"] == 1.0
+    assert reward.components["official_f2p_fraction"] == 1.0
+    assert reward.components["token_cost"] == 0.0
 
 
-def test_gate_reachable_without_full_resolve():
-    """A focused-subset pass (partial progress) + clean process clears the gate.
-
-    Official resolution over the full suite is False, but all targeted F2P
-    tests pass with no observed P2P regression, so the in-loop resolved
-    predicate holds and the utility exceeds the 0.55 skill-write gate.
-    """
+def test_full_official_f2p_credit_exists_without_resolution():
     model = RewardModel()
     outcome = {"f2p_passed": 1, "f2p_total": 1, "p2p_passed": 0, "p2p_total": 0, "resolved": False}
     reward = model.score(_execution(tokens=30000), eval_outcome=outcome)
-    assert reward.components["resolved"] == 1.0
-    assert reward.total == pytest.approx(0.5 + 0.2 + 0.1 + 0.05 + 0.1)
+    assert reward.components["official_resolved"] == 0.0
+    assert reward.total == pytest.approx(0.7 - 0.05 * 0.5)
     assert reward.total >= model.skill_write_gate
 
 
@@ -81,24 +71,23 @@ def test_partial_f2p_progress_stays_below_gate():
     model = RewardModel()
     outcome = {"f2p_passed": 1, "f2p_total": 2, "p2p_passed": 3, "p2p_total": 3, "resolved": False}
     reward = model.score(_execution(tokens=0), eval_outcome=outcome)
-    assert reward.total == pytest.approx(0.2 * 0.5 + 0.1 + 0.1 + 0.1)
+    assert reward.total == pytest.approx(0.7 * 0.5)
     assert reward.total < model.skill_write_gate
 
 
 def test_p2p_regression_blocks_resolved_and_p2p_credit():
     outcome = {"f2p_passed": 2, "f2p_total": 2, "p2p_passed": 2, "p2p_total": 3, "resolved": False}
     reward = RewardModel().score(_execution(tokens=0), eval_outcome=outcome)
-    assert reward.components["resolved"] == 0.0
+    assert reward.components["official_resolved"] == 0.0
     assert reward.components["p2p_no_regression"] == 0.0
-    assert reward.total == pytest.approx(0.2 + 0.1 + 0.1)
+    assert reward.total == pytest.approx(0.7)
 
 
 def test_no_eval_outcome_gives_no_test_credit():
     reward = RewardModel().score(_execution(tokens=0))
-    assert reward.components["resolved"] == 0.0
-    assert reward.components["f2p_fraction"] == 0.0
-    assert reward.components["p2p_no_regression"] == 0.0
-    assert reward.total == pytest.approx(0.1 + 0.1)  # cost + process only
+    assert reward.components["official_resolved"] == 0.0
+    assert reward.components["official_f2p_fraction"] == 0.0
+    assert reward.total == 0.0
 
 
 def test_cost_efficiency_hits_zero_at_budget():
@@ -115,8 +104,7 @@ def test_process_requires_applied_patch_and_budget():
     assert RewardModel().score(over_budget, eval_outcome=outcome).components["process"] == 0.0
 
 
-def test_view_derived_from_real_per_test_statuses():
-    """Without an attached EvalOutcome, per-test statuses + F2P/P2P lists decide."""
+def test_raw_test_statuses_do_not_become_official_reward():
     test_result = models.TestResult(
         passed=False,
         test_cases=[
@@ -138,9 +126,9 @@ def test_view_derived_from_real_per_test_statuses():
         },
     )
     reward = RewardModel().score(execution, issue=issue)
-    assert reward.components["f2p_fraction"] == 0.5
-    assert reward.components["p2p_no_regression"] == 1.0  # only run P2P tests count
-    assert reward.components["resolved"] == 0.0
+    assert reward.components["official_f2p_fraction"] == 0.0
+    assert reward.components["official_resolved"] == 0.0
+    assert reward.total == 0.0
 
 
 def test_explicit_eval_outcome_wins_over_derived():
@@ -157,21 +145,23 @@ def test_explicit_eval_outcome_wins_over_derived():
     assert reward.components["f2p_fraction"] == 0.0
 
 
-def test_evolution_utility_is_advantage_over_ema_baseline():
-    model = RewardModel(baseline_alpha=0.3)
-    assert model.evolution_utility(0.5) == 0.0  # first observation seeds baseline
-    assert model.evolution_utility(0.9) == pytest.approx(0.4)
-    # baseline is now 0.7*0.5 + 0.3*0.9 = 0.62
-    assert model.evolution_utility(0.9) == pytest.approx(0.28)
+def test_global_evolution_utility_is_disabled():
+    assert RewardModel().evolution_utility(0.9) == 0.0
 
 
-def test_score_exposes_evolution_utility():
-    model = RewardModel()
-    outcome = {"f2p_passed": 1, "f2p_total": 1, "p2p_passed": 1, "p2p_total": 1, "resolved": True}
-    first = model.score(_execution(tokens=0), eval_outcome=outcome)
-    assert first.evolution_utility == 0.0
-    second = model.score(FakeExecution(), eval_outcome=None)
-    assert second.evolution_utility == pytest.approx(second.total - first.total)
+def test_score_exposes_cluster_relative_skill_contribution():
+    model = RewardModel(cluster_baselines={"cluster-a": {"ema": 0.5, "count": 3}})
+    outcome = {"f2p_passed": 1, "f2p_total": 1, "p2p_passed": 0, "p2p_total": 0, "resolved": False}
+    reward = model.score(
+        _execution(tokens=0),
+        eval_outcome=outcome,
+        cluster_id="cluster-a",
+        selected_skill_ids=["inspect_first"],
+    )
+    assert reward.task_reward == pytest.approx(0.7)
+    assert reward.skill_contribution == pytest.approx(0.2)
+    assert reward.evolution_utility == pytest.approx(0.2)
+    assert reward.total == pytest.approx(0.72)
 
 
 def test_repo_config_is_loaded_by_default_and_matches_code_defaults():
@@ -180,7 +170,9 @@ def test_repo_config_is_loaded_by_default_and_matches_code_defaults():
     assert model.weights == DEFAULT_REWARD_WEIGHTS
     assert model.cost_token_budget == 60000
     assert model.skill_write_gate == 0.55
-    assert model.baseline_alpha == 0.3
+    assert model.token_cost_weight == 0.05
+    assert model.contribution_weight == 0.1
+    assert model.cluster_baseline_min_count == 3
 
 
 def test_config_file_overrides_and_parser_features(tmp_path):
@@ -188,16 +180,15 @@ def test_config_file_overrides_and_parser_features(tmp_path):
     path.write_text(
         "# comment line\n"
         "weights:\n"
-        "  resolved: 0.6  # inline comment\n"
-        "  f2p_fraction: 0.1\n"
+        "  official_resolved: 0.6  # inline comment\n"
+        "  official_f2p_fraction: 0.1\n"
         'cost_token_budget: "40000"\n'
         "skill_write_gate: 0.7\n",
         encoding="utf-8",
     )
     model = RewardModel.from_config_file(path)
-    assert model.weights["resolved"] == 0.6
-    assert model.weights["f2p_fraction"] == 0.1
-    assert model.weights["process"] == 0.1  # unspecified keys keep defaults
+    assert model.weights["official_resolved"] == 0.6
+    assert model.weights["official_f2p_fraction"] == 0.1
     assert model.cost_token_budget == 40000
     assert model.skill_write_gate == 0.7
 

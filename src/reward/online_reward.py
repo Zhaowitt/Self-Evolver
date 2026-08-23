@@ -252,11 +252,8 @@ def _score_one(
             issue,
             env,
             controller_signal=signal,
-            max_iterations=_int_or_none(
-                max_iterations
-                or extra_info.get("max_iterations")
-                or os.getenv("SELF_EVOLVER_MAX_ITERATIONS")
-            ),
+            # Controller/payload output cannot alter the system-owned cap.
+            max_iterations=3,
             reward_model=reward_model,
             rollout_writer=rollout_writer,
             # Validation/final evaluation must be frozen even when the process
@@ -327,6 +324,28 @@ def issue_from_payload(
                 ground_truth.get("PASS_TO_PASS")
                 or ground_truth.get("pass_to_pass")
                 or extra_info.get("pass_to_pass")
+            ),
+            "train_fail_to_pass_subset": (
+                ground_truth.get("TRAIN_FAIL_TO_PASS_SUBSET")
+                or ground_truth.get("train_fail_to_pass_subset")
+                or extra_info.get("TRAIN_FAIL_TO_PASS_SUBSET")
+                or extra_info.get("train_fail_to_pass_subset")
+            ),
+            "f2p_subset_policy": (
+                ground_truth.get("F2P_SUBSET_POLICY")
+                or extra_info.get("F2P_SUBSET_POLICY")
+            ),
+            "round_id": ground_truth.get("round_id") or extra_info.get("round_id"),
+            "observed_failure_label": (
+                ground_truth.get("observed_failure_label")
+                or extra_info.get("observed_failure_label")
+            ),
+            "stable_cluster_id": (
+                ground_truth.get("stable_cluster_id")
+                or extra_info.get("stable_cluster_id")
+            ),
+            "sampling_source": (
+                ground_truth.get("sampling_source") or extra_info.get("sampling_source")
             ),
         },
     )

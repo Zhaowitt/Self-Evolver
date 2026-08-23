@@ -196,6 +196,8 @@ def test_rollout_record_gains_stage_seed_arm_models_and_eval_outcome():
         "p2p_passed": 3,
         "p2p_total": 3,
         "resolved": False,
+        "evaluation_scope": "full",
+        "selected_f2p_ids": [],
     }
     assert record["reward"]["evolution_utility"] == 0.0
 

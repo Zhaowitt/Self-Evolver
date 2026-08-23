@@ -17,6 +17,7 @@ fallback for benchmarks.
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -25,6 +26,10 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Union
+
+from src.environment.swebench_compat import ensure_swebench_importable
+
+ensure_swebench_importable()
 
 from swebench.harness.constants import (
     APPLY_PATCH_FAIL,
@@ -45,6 +50,7 @@ from swebench.harness.grading import (
 from swebench.harness.test_spec.test_spec import TestSpec, make_test_spec
 
 from src.environment.models import TestStatus
+from src.environment.f2p_subset import parse_test_ids
 from src.environment.project_env import ProjectEnvironment
 
 logger = logging.getLogger(__name__)
@@ -113,6 +119,8 @@ class EvalOutcome:
     resolved: bool
     per_test: Dict[str, str] = field(default_factory=dict)
     log_tail: str = ""
+    evaluation_scope: str = "full"
+    selected_f2p_ids: List[str] = field(default_factory=list)
 
     @property
     def f2p_pass_fraction(self) -> float:
@@ -131,6 +139,8 @@ def build_outcome(
     repo: str,
     instance_id: str,
     log_tail: str = "",
+    evaluation_scope: str = "full",
+    selected_f2p_ids: Optional[List[str]] = None,
 ) -> EvalOutcome:
     """
     Grade a test-status map against the instance's F2P/P2P sets using the
@@ -156,10 +166,17 @@ def build_outcome(
         resolved=resolved,
         per_test=per_test,
         log_tail=log_tail,
+        evaluation_scope=evaluation_scope,
+        selected_f2p_ids=list(selected_f2p_ids or []),
     )
 
 
-def outcome_from_eval_log(spec: TestSpec, log_text: str) -> EvalOutcome:
+def outcome_from_eval_log(
+    spec: TestSpec,
+    log_text: str,
+    evaluation_scope: str = "full",
+    selected_f2p_ids: Optional[List[str]] = None,
+) -> EvalOutcome:
     """
     Grade a raw container eval log (patch-apply markers + eval.sh output)
     with the official swebench log parsers.
@@ -184,7 +201,66 @@ def outcome_from_eval_log(spec: TestSpec, log_text: str) -> EvalOutcome:
         repo=spec.repo,
         instance_id=spec.instance_id,
         log_tail=_tail(log_text),
+        evaluation_scope=evaluation_scope,
+        selected_f2p_ids=selected_f2p_ids,
     )
+
+
+class RepositoryTestCommandBuilder:
+    """Build the smallest practical command for selected SWE-bench test ids.
+
+    SWE-bench uses several test runners.  The high-volume Python repositories
+    are covered explicitly and all pytest-compatible repositories use exact
+    node ids.  Unsupported/empty selections fail loudly instead of silently
+    falling back to a full suite and pretending it was a subset run.
+    """
+
+    def build(self, instance: dict, selected_f2p_ids: List[str]) -> str:
+        tests = parse_test_ids(selected_f2p_ids)
+        if not tests:
+            raise ValueError("subset evaluation requires at least one F2P test id")
+        repo = str(instance.get("repo") or "").lower()
+        if repo == "django/django":
+            directives = [_django_test_directive(test_id) for test_id in tests]
+            args = " ".join(shlex.quote(item) for item in directives)
+            return f"./tests/runtests.py --verbosity 2 {args}"
+        args = " ".join(shlex.quote(test_id) for test_id in tests)
+        if repo == "sympy/sympy":
+            return f"bin/test {args}"
+        return f"python -m pytest -rA --tb=short -q {args}"
+
+    def eval_script(
+        self,
+        instance: dict,
+        selected_f2p_ids: List[str],
+        official_eval_script: str,
+    ) -> str:
+        """Replace only the official script's test command.
+
+        This preserves repository setup, environment activation and, crucially,
+        application of the instance test patch.  If marker boundaries cannot
+        be found we fail rather than running a full suite under a subset label.
+        """
+        command = self.build(instance, selected_f2p_ids)
+        lines = official_eval_script.splitlines()
+        starts = [i for i, line in enumerate(lines) if "Start Test Output" in line]
+        ends = [i for i, line in enumerate(lines) if "End Test Output" in line]
+        if not starts or not ends:
+            raise RuntimeError("official eval script has no test-output marker boundary")
+        start = starts[-1]
+        end = next((index for index in ends if index > start), -1)
+        if end < 0:
+            raise RuntimeError("official eval script has an incomplete test-output boundary")
+        return "\n".join([*lines[: start + 1], command, *lines[end:]]) + "\n"
+
+
+def _django_test_directive(test_id: str) -> str:
+    """Convert Django's unittest log id into its runnable dotted label."""
+    match = re.match(r"^(\S+)\s+\(([^)]+)\)$", test_id.strip())
+    if not match:
+        return test_id.strip()
+    test_name, dotted_scope = match.groups()
+    return f"{dotted_scope}.{test_name}"
 
 
 def make_entry_script() -> str:
@@ -312,22 +388,76 @@ class ContainerTestBackend:
         model_patch: str,
         timeout: Optional[int] = None,
     ) -> EvalOutcome:
+        """Backward-compatible alias for a full official evaluation."""
+        return self.run_full_eval(instance, model_patch, timeout=timeout)
+
+    def run_full_eval(
+        self,
+        instance: dict,
+        model_patch: str,
+        timeout: Optional[int] = None,
+    ) -> EvalOutcome:
         """
         Apply model_patch inside the instance's official container, run the
         official eval script, and grade the log. Timeouts and patch-apply
         failures grade as unresolved, exactly like the official harness.
         """
-        timeout = timeout or default_eval_timeout()
         spec = self.make_spec(instance)
+        return self._run_eval(
+            spec,
+            model_patch,
+            eval_script=spec.eval_script,
+            timeout=timeout,
+            evaluation_scope="full",
+            selected_f2p_ids=[],
+        )
+
+    def run_subset_eval(
+        self,
+        instance: dict,
+        model_patch: str,
+        selected_f2p_ids: List[str],
+        timeout: Optional[int] = None,
+    ) -> EvalOutcome:
+        """Actually execute only the selected F2P units in the official image."""
+        selected = parse_test_ids(selected_f2p_ids)
+        subset_instance = dict(instance)
+        subset_instance["FAIL_TO_PASS"] = selected
+        subset_instance["PASS_TO_PASS"] = []
+        spec = self.make_spec(subset_instance)
+        script = RepositoryTestCommandBuilder().eval_script(
+            instance,
+            selected,
+            official_eval_script=spec.eval_script,
+        )
+        return self._run_eval(
+            spec,
+            model_patch,
+            eval_script=script,
+            timeout=timeout,
+            evaluation_scope="subset",
+            selected_f2p_ids=selected,
+        )
+
+    def _run_eval(
+        self,
+        spec: TestSpec,
+        model_patch: str,
+        eval_script: str,
+        timeout: Optional[int],
+        evaluation_scope: str,
+        selected_f2p_ids: List[str],
+    ) -> EvalOutcome:
+        timeout = timeout or default_eval_timeout()
         with tempfile.TemporaryDirectory(prefix="sweval_") as td:
             workdir = Path(td)
             (workdir / "patch.diff").write_text(model_patch or "", encoding="utf-8")
-            (workdir / "eval.sh").write_text(spec.eval_script, encoding="utf-8")
+            (workdir / "eval.sh").write_text(eval_script, encoding="utf-8")
             (workdir / "entry.sh").write_text(make_entry_script(), encoding="utf-8")
             cmd = self._container_cmd(spec, workdir)
             logger.info(
-                f"Evaluating {spec.instance_id} via {self.engine} "
-                f"(timeout {timeout}s)"
+                f"Evaluating {spec.instance_id} scope={evaluation_scope} "
+                f"via {self.engine} (timeout {timeout}s)"
             )
             try:
                 result = subprocess.run(
@@ -344,7 +474,12 @@ class ContainerTestBackend:
                     partial = partial.decode("utf-8", errors="replace")
                 output = f"{partial}\n\n{TESTS_TIMEOUT}: {timeout} seconds exceeded."
                 logger.error(f"Eval timed out for {spec.instance_id} ({timeout}s)")
-        outcome = outcome_from_eval_log(spec, output)
+        outcome = outcome_from_eval_log(
+            spec,
+            output,
+            evaluation_scope=evaluation_scope,
+            selected_f2p_ids=selected_f2p_ids,
+        )
         logger.info(
             f"{spec.instance_id}: resolved={outcome.resolved} "
             f"F2P {outcome.f2p_passed}/{outcome.f2p_total} "
@@ -374,15 +509,62 @@ class HostTestBackend:
         model_patch: str,
         timeout: Optional[int] = None,
     ) -> EvalOutcome:
+        """Backward-compatible alias for full F2P + P2P evaluation."""
+        return self.run_full_eval(instance, model_patch, timeout=timeout)
+
+    def run_full_eval(
+        self,
+        instance: dict,
+        model_patch: str,
+        timeout: Optional[int] = None,
+    ) -> EvalOutcome:
         """
         Host approximation of the official eval: the repo must already be at
         issue state (base_commit checked out, test patch staged via
         setup_issue). Applies model_patch, runs the F2P+P2P test ids with
         pytest, grades per-test statuses, then reverts the patch.
         """
-        timeout = timeout or default_eval_timeout()
         f2p = _test_id_list(instance.get("FAIL_TO_PASS"))
         p2p = _test_id_list(instance.get("PASS_TO_PASS"))
+        return self._run_selected(
+            instance,
+            model_patch,
+            f2p=f2p,
+            p2p=p2p,
+            timeout=timeout,
+            evaluation_scope="full",
+            selected_f2p_ids=[],
+        )
+
+    def run_subset_eval(
+        self,
+        instance: dict,
+        model_patch: str,
+        selected_f2p_ids: List[str],
+        timeout: Optional[int] = None,
+    ) -> EvalOutcome:
+        selected = parse_test_ids(selected_f2p_ids)
+        return self._run_selected(
+            instance,
+            model_patch,
+            f2p=selected,
+            p2p=[],
+            timeout=timeout,
+            evaluation_scope="subset",
+            selected_f2p_ids=selected,
+        )
+
+    def _run_selected(
+        self,
+        instance: dict,
+        model_patch: str,
+        f2p: List[str],
+        p2p: List[str],
+        timeout: Optional[int],
+        evaluation_scope: str,
+        selected_f2p_ids: List[str],
+    ) -> EvalOutcome:
+        timeout = timeout or default_eval_timeout()
         repo = instance.get("repo", "")
         instance_id = instance.get("instance_id", "")
 
@@ -390,6 +572,8 @@ class HostTestBackend:
             return build_outcome(
                 {}, applied=False, f2p=f2p, p2p=p2p, repo=repo,
                 instance_id=instance_id, log_tail="Empty model patch",
+                evaluation_scope=evaluation_scope,
+                selected_f2p_ids=selected_f2p_ids,
             )
 
         apply_result = self.env.apply_patch_detailed(model_patch)
@@ -399,10 +583,20 @@ class HostTestBackend:
                 {}, applied=False, f2p=f2p, p2p=p2p, repo=repo,
                 instance_id=instance_id,
                 log_tail=_tail(f"{APPLY_PATCH_FAIL}\n{apply_result.diagnostic}"),
+                evaluation_scope=evaluation_scope,
+                selected_f2p_ids=selected_f2p_ids,
             )
         try:
-            ids = " ".join(shlex.quote(t) for t in [*f2p, *p2p])
-            cmd = f"{shlex.quote(sys.executable)} -m pytest -rA --tb=short -q {ids}"
+            selected = [*f2p, *p2p]
+            command = RepositoryTestCommandBuilder().build(instance, selected)
+            if command.startswith("python -m pytest"):
+                executable = (
+                    subprocess.list2cmdline([sys.executable])
+                    if os.name == "nt"
+                    else shlex.quote(sys.executable)
+                )
+                command = command.replace("python", executable, 1)
+            cmd = command
             test_result = self.env.run_tests(test_cmd=cmd, timeout=timeout)
         finally:
             # Restore issue state: staged test patch survives checkout -- .
@@ -418,6 +612,8 @@ class HostTestBackend:
             repo=repo,
             instance_id=instance_id,
             log_tail=_tail(test_result.output + test_result.error_logs),
+            evaluation_scope=evaluation_scope,
+            selected_f2p_ids=selected_f2p_ids,
         )
 
 

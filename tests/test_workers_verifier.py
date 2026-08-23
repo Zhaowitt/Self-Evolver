@@ -46,6 +46,21 @@ class FakeBackend:
         return self.outcome
 
 
+class TwoStageBackend:
+    def __init__(self, subset: EvalOutcome, full: EvalOutcome):
+        self.subset = subset
+        self.full = full
+        self.calls = []
+
+    def run_subset_eval(self, instance, model_patch, selected_f2p_ids, timeout=None):
+        self.calls.append(("subset", list(selected_f2p_ids)))
+        return self.subset
+
+    def run_full_eval(self, instance, model_patch, timeout=None):
+        self.calls.append(("full", None))
+        return self.full
+
+
 def _swebench_issue() -> Issue:
     return Issue(
         id="pkg__repo-1",
@@ -61,6 +76,70 @@ def _verify(tmp_path, outcome: EvalOutcome):
     context = ExecutionContext(issue=_swebench_issue(), repo_state=env.get_repo_state())
     result = Verifier(env, test_backend=backend).execute(context, PatchResult(patch_content=RAW_PATCH))
     return env, backend, result
+
+
+def _verify_two_stage(tmp_path, subset: EvalOutcome, *, iteration=0, stage="train"):
+    env = ProjectEnvironment(_init_repo(tmp_path))
+    full = EvalOutcome(
+        f2p_passed=1, f2p_total=1, p2p_passed=1, p2p_total=1,
+        resolved=True, per_test={"t::test_add": "PASSED", "t::test_keep": "PASSED"},
+        log_tail="full",
+    )
+    backend = TwoStageBackend(subset, full)
+    context = ExecutionContext(
+        issue=_swebench_issue(),
+        repo_state=env.get_repo_state(),
+        iteration=iteration,
+        max_iterations=3,
+        metadata={"stage": stage},
+    )
+    result = Verifier(env, test_backend=backend).execute(
+        context, PatchResult(patch_content=RAW_PATCH)
+    )
+    return backend, result
+
+
+def test_intermediate_subset_failure_skips_full_eval(tmp_path):
+    subset = EvalOutcome(
+        f2p_passed=0, f2p_total=1, p2p_passed=0, p2p_total=0,
+        resolved=False, evaluation_scope="subset", selected_f2p_ids=["t::test_add"],
+    )
+    backend, result = _verify_two_stage(tmp_path, subset)
+    assert backend.calls == [("subset", ["t::test_add"])]
+    assert result.data.evaluation_scope == "subset"
+    assert result.data.eval_outcome is None
+    assert result.data.official_eval_executed is False
+
+
+def test_subset_pass_runs_full_eval_for_same_patch(tmp_path):
+    subset = EvalOutcome(
+        f2p_passed=1, f2p_total=1, p2p_passed=0, p2p_total=0,
+        resolved=False, evaluation_scope="subset", selected_f2p_ids=["t::test_add"],
+    )
+    backend, result = _verify_two_stage(tmp_path, subset)
+    assert [name for name, _ in backend.calls] == ["subset", "full"]
+    assert result.data.evaluation_scope == "full"
+    assert result.data.official_eval_executed is True
+
+
+def test_final_iteration_runs_full_even_when_subset_fails(tmp_path):
+    subset = EvalOutcome(
+        f2p_passed=0, f2p_total=1, p2p_passed=0, p2p_total=0,
+        resolved=False, evaluation_scope="subset", selected_f2p_ids=["t::test_add"],
+    )
+    backend, result = _verify_two_stage(tmp_path, subset, iteration=2)
+    assert [name for name, _ in backend.calls] == ["subset", "full"]
+    assert result.data.evaluation_scope == "full"
+
+
+def test_eval_stage_bypasses_subset_and_runs_full(tmp_path):
+    subset = EvalOutcome(
+        f2p_passed=0, f2p_total=1, p2p_passed=0, p2p_total=0,
+        resolved=False, evaluation_scope="subset",
+    )
+    backend, result = _verify_two_stage(tmp_path, subset, stage="eval")
+    assert backend.calls == [("full", None)]
+    assert result.data.evaluation_scope == "full"
 
 
 def test_backend_resolved_maps_to_success(tmp_path):

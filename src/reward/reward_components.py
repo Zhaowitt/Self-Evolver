@@ -1,22 +1,8 @@
-"""Execution-utility components computed from real test-execution evidence.
+"""Reward components derived only from final full official evidence.
 
-Components (Proposal 2.6), each bounded to [0, 1]:
-
-- ``resolved``: all FAIL_TO_PASS tests pass AND no PASS_TO_PASS regression in
-  the evaluation outcome. This is the in-loop resolution predicate; for a
-  full-suite outcome it equals official SWE-bench resolution, for a targeted
-  subset (e.g. a focused task variant) it can be true without full resolve.
-- ``f2p_fraction``: fraction of FAIL_TO_PASS tests passing.
-- ``p2p_no_regression``: 1.0 when no observed PASS_TO_PASS test regressed
-  (vacuously true when the outcome ran no P2P tests).
-- ``cost_efficiency``: 1 - min(1, total_tokens / cost_token_budget).
-- ``process``: patch applied AND non-empty canonical diff AND within the
-  iteration budget.
-
-Test evidence comes from an ``EvalOutcome`` (``src.environment.test_backend``)
-carrying ``f2p_passed/f2p_total/p2p_passed/p2p_total/resolved``, or is derived
-from real per-test statuses in a ``TestResult`` plus the instance's
-FAIL_TO_PASS/PASS_TO_PASS name lists. No log-substring heuristics.
+Subset outcomes are retry-routing evidence and never become task reward.
+Token use is exposed as a positive *cost magnitude* which RewardModel
+subtracts; cheap failed trajectories therefore receive no positive bonus.
 """
 
 from __future__ import annotations
@@ -39,6 +25,7 @@ class EvalView:
     p2p_passed: int = 0
     p2p_total: int = 0
     resolved: bool = False
+    evaluation_scope: str = "full"
 
     @classmethod
     def from_any(cls, value: Any) -> Optional["EvalView"]:
@@ -56,6 +43,7 @@ class EvalView:
             p2p_passed=int(getter("p2p_passed") or 0),
             p2p_total=int(getter("p2p_total") or 0),
             resolved=bool(getter("resolved") or False),
+            evaluation_scope=str(getter("evaluation_scope", "full") or "full"),
         )
 
 
@@ -67,12 +55,13 @@ def compute_reward_components(
 ) -> Dict[str, float]:
     """Compute the execution-utility components for one rollout."""
     view = extract_eval_view(execution_result, eval_outcome=eval_outcome, issue=issue)
-    if view is not None:
+    # Explicit subset evidence must never be promoted to an official outcome.
+    if view is not None and view.evaluation_scope == "full":
         f2p_fraction = view.f2p_passed / view.f2p_total if view.f2p_total > 0 else 0.0
         p2p_no_regression = view.p2p_passed == view.p2p_total
-        resolved = bool(view.resolved) or (
-            view.f2p_total > 0 and view.f2p_passed == view.f2p_total and p2p_no_regression
-        )
+        # The official grader's resolution bit is authoritative.  Do not infer
+        # resolution from counts when the harness explicitly reports False.
+        resolved = bool(view.resolved)
     else:
         f2p_fraction, p2p_no_regression, resolved = 0.0, False, False
 
@@ -90,11 +79,21 @@ def compute_reward_components(
     total_tokens = int(getattr(execution_result, "total_tokens", 0) or 0)
     budget = max(1, int(cost_token_budget or DEFAULT_COST_TOKEN_BUDGET))
 
+    token_cost = max(0.0, min(1.0, total_tokens / budget))
+    official_resolved = 1.0 if resolved else 0.0
+    official_f2p_fraction = max(0.0, min(1.0, f2p_fraction))
     return {
-        "resolved": 1.0 if resolved else 0.0,
-        "f2p_fraction": max(0.0, min(1.0, f2p_fraction)),
-        "p2p_no_regression": 1.0 if (view is not None and p2p_no_regression) else 0.0,
-        "cost_efficiency": max(0.0, min(1.0, 1.0 - total_tokens / budget)),
+        "official_resolved": official_resolved,
+        "official_f2p_fraction": official_f2p_fraction,
+        "token_cost": token_cost,
+        # Diagnostic compatibility fields.  They remain unweighted and are
+        # useful in old reports, but no longer provide extra positive reward.
+        "resolved": official_resolved,
+        "f2p_fraction": official_f2p_fraction,
+        "p2p_no_regression": 1.0 if (
+            view is not None and view.evaluation_scope == "full" and p2p_no_regression
+        ) else 0.0,
+        "cost_efficiency": 1.0 - token_cost,
         "process": 1.0 if (patch_applied and non_empty and within_budget) else 0.0,
     }
 
@@ -107,9 +106,9 @@ def extract_eval_view(
     """Find the best available test-execution evidence for a rollout.
 
     Priority: explicit ``eval_outcome`` (container eval of the final patch) >
-    outcome attached to the execution result by the verifier > per-test
-    statuses of the last verification run classified via the issue's
-    FAIL_TO_PASS/PASS_TO_PASS lists.
+    outcome attached to the execution result by the verifier. Raw host test
+    statuses are deliberately ineligible: final reward requires a full
+    official evaluation outcome.
     """
     view = EvalView.from_any(eval_outcome)
     if view is not None:
@@ -123,15 +122,11 @@ def extract_eval_view(
         verification = getattr(record, "verification_result", None)
         if verification is None:
             continue
+        if getattr(verification, "evaluation_scope", "") == "subset":
+            continue
         view = EvalView.from_any(getattr(verification, "eval_outcome", None))
         if view is not None:
             return view
-        test_result = getattr(verification, "test_result", None)
-        if test_result is not None and issue is not None:
-            f2p_names, p2p_names = _test_name_lists(issue)
-            view = eval_view_from_test_result(test_result, f2p_names, p2p_names)
-            if view is not None:
-                return view
     return None
 
 

@@ -1,4 +1,4 @@
-"""SkillEvolver lifecycle: advantage credit, Ratchet retirement, cap, gating, dedup."""
+"""SkillEvolver lifecycle: credit, retirement, quality gating, and dedup."""
 
 from __future__ import annotations
 
@@ -19,10 +19,22 @@ SKILL = """# {title}
 ## Description
 {desc}
 
-## How to Apply
-{proc}
+## Purpose
+Prevent a repeated repair mistake with a concrete procedure.
 
-Target failure type: {ftype}
+## When to Use
+  * Use when the matching failure evidence is observed.
+
+## How to Apply
+  * {proc}
+  * Verify the resulting behavior with the relevant official tests.
+
+## Constraints
+  * Keep the patch scoped to the diagnosed cause.
+
+Action type: INSPECT|VERIFY.
+
+Applicable capability label: {ftype}
 """
 
 
@@ -156,6 +168,8 @@ def _create_proposal(skill_id="new_skill", ftype="test_failure"):
         content=_md("New Skill", ftype),
         rationale="cluster evidence",
         source="reflector",
+        cluster_id="cluster-1",
+        evidence_provenance=["issue-1", "issue-2"],
     )
 
 
@@ -221,6 +235,8 @@ def test_apply_proposal_rejects_create_matching_archived_revision(tmp_path):
         target_failure_type="test_failure",
         content=_md("Recycled v1", "test_failure"),  # identical to the archived revision
         source="reflector",
+        cluster_id="cluster-2",
+        evidence_provenance=["issue-1", "issue-2"],
     )
     result = evolver.apply_proposals([duplicate])
     event = result["events"][0]
@@ -233,13 +249,16 @@ def test_self_refinement_update_is_not_treated_as_duplicate(tmp_path):
     evolver = _evolver(tmp_path)
     evolver.store.write_skill("evolving", _md("Evolving", "test_failure", proc="Original steps."))
     update = SkillUpdateProposal(
-        operation="update",
+        operation="refine",
         skill_id="evolving",
         title="Evolving",
         summary="s",
         target_failure_type="test_failure",
         content=_md("Evolving", "test_failure", proc="Original steps plus one extra refinement line."),
         source="reflector",
+        cluster_id="cluster-3",
+        matched_skill_id="evolving",
+        evidence_provenance=["issue-1", "issue-2"],
     )
     result = evolver.apply_proposals([update])
     assert result["events"][0]["applied"] is True

@@ -58,6 +58,9 @@ class _InstanceStats:
     decay_multiplier: float = 1.0
     focus_emitted: int = 0
     is_variant: bool = False
+    last_resolved: Optional[bool] = None
+    observed_failure_label: str = ""
+    stable_cluster_id: str = ""
 
 
 class TaskPool:
@@ -119,6 +122,26 @@ class TaskPool:
 
     def family_of(self, instance_id: str) -> str:
         return self._stats[instance_id].family
+
+    def unseen_instance_ids(self) -> List[str]:
+        """U = tasks with no observed rollout attempts."""
+        return sorted(
+            instance_id for instance_id, stats in self._stats.items() if stats.attempts == 0
+        )
+
+    def observed_failure_groups(self) -> Dict[str, List[str]]:
+        """F = observed failures that have an actual post-execution label."""
+        groups: Dict[str, List[str]] = {}
+        for instance_id, stats in self._stats.items():
+            if stats.attempts <= 0 or stats.last_resolved is not False:
+                continue
+            if not stats.observed_failure_label:
+                continue
+            groups.setdefault(stats.observed_failure_label, []).append(instance_id)
+        return {label: sorted(ids) for label, ids in sorted(groups.items())}
+
+    def stable_cluster_id_of(self, instance_id: str) -> str:
+        return self._stats[instance_id].stable_cluster_id
 
     # --------------------------------------------------------------- weights
 
@@ -194,7 +217,14 @@ class TaskPool:
 
     # -------------------------------------------------------------- outcomes
 
-    def record_outcome(self, instance_id: str, resolved: bool, utility: float) -> Optional[str]:
+    def record_outcome(
+        self,
+        instance_id: str,
+        resolved: bool,
+        utility: float,
+        observed_failure_label: str = "",
+        stable_cluster_id: str = "",
+    ) -> Optional[str]:
         """
         Record one rollout outcome and update the sampling distribution.
 
@@ -213,6 +243,11 @@ class TaskPool:
         family.outcomes += 1
 
         stats.attempts += 1
+        stats.last_resolved = bool(resolved)
+        if not resolved and observed_failure_label:
+            stats.observed_failure_label = str(observed_failure_label)
+        if stable_cluster_id:
+            stats.stable_cluster_id = str(stable_cluster_id)
         utility = float(utility)
         if stats.utility_ema is None:
             stats.utility_ema = utility
@@ -300,6 +335,13 @@ class TaskPool:
                 logger.warning("Reflection boost for unknown family: %s", family)
                 continue
             self._families[family].boost = max(0.0, float(multiplier))
+
+        for instance_id, label in (signals.get("observed_failure_labels") or {}).items():
+            if instance_id in self._stats and str(label).strip():
+                self._stats[instance_id].observed_failure_label = str(label).strip()
+        for instance_id, cluster_id in (signals.get("stable_cluster_ids") or {}).items():
+            if instance_id in self._stats and str(cluster_id).strip():
+                self._stats[instance_id].stable_cluster_id = str(cluster_id).strip()
 
     # ----------------------------------------------------------- persistence
 

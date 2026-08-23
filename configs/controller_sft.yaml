@@ -1,0 +1,11 @@
+# Shallow Controller warm-up: learn legal skill selection, not repair generation.
+model_path: /root/self-evolver-lab/models/Qwen2.5-1.5B-Instruct
+max_sequence_length: 13312
+epochs: 1
+learning_rate: 0.000005
+lora_rank: 16
+lora_alpha: 32
+response_schema:
+  max_selected_skills: 2
+  allow_short_strategy: true
+  forbidden_fields: budget,target_failure_type,memory_query,task_wrapper

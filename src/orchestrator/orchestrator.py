@@ -6,6 +6,7 @@ with retry logic on failures.
 """
 
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -27,6 +28,8 @@ from src.workers.patch_generator import PatchGenerator, PatchResult
 from src.workers.verifier import Verifier, VerificationResult
 
 logger = logging.getLogger(__name__)
+
+SYSTEM_MAX_ITERATIONS = 3
 
 
 class ExecutionStatus(Enum):
@@ -97,6 +100,7 @@ class ExecutionOrchestrator:
         controller_signal: Optional[Any] = None,
         test_backend: Any = None,
         skill_bank: Any = None,
+        stage: Optional[str] = None,
     ):
         """
         Initialize the orchestrator.
@@ -105,7 +109,7 @@ class ExecutionOrchestrator:
             env: Project environment for code operations.
             llm_client: Shared LLM client for all workers.
             max_iterations: Maximum retry attempts. Uses config default if None.
-            controller_signal: Optional controller guidance (selection + budget).
+            controller_signal: Optional controller guidance (skill selection + strategy).
             test_backend: Optional test backend (``src.environment.test_backend``);
                 when given, the Verifier grades SWE-bench instances with official
                 per-test FAIL_TO_PASS / PASS_TO_PASS semantics in the loop.
@@ -116,9 +120,12 @@ class ExecutionOrchestrator:
         """
         self.env = env
         self.llm_client = llm_client or LLMClient()
-        self.max_iterations = max_iterations or get_config().agent.max_iterations
+        requested_iterations = max_iterations or get_config().agent.max_iterations
+        self.max_iterations = min(SYSTEM_MAX_ITERATIONS, max(1, int(requested_iterations)))
         self.controller_signal = controller_signal_from_any(controller_signal)
-        self.stage = self.controller_signal.mode if self.controller_signal else "train"
+        self.stage = stage or (
+            self.controller_signal.mode if self.controller_signal else "train"
+        )
 
         # Initialize workers with shared LLM client
         self.inspector = Inspector(env, self.llm_client, skill_bank=skill_bank)
@@ -129,12 +136,8 @@ class ExecutionOrchestrator:
         self.logger = logging.getLogger(f"{__name__}.Orchestrator")
 
     def _effective_max_iterations(self) -> int:
-        """Iteration budget: the controller may cap below the configured max."""
-        cap = max(1, self.max_iterations)
-        budget = self.controller_signal.budget if self.controller_signal else None
-        if budget:
-            return max(1, min(cap, int(budget)))
-        return cap
+        """Return the system-owned hard cap; Controller output cannot change it."""
+        return max(1, self.max_iterations)
     
     def run(self, issue: Issue) -> ExecutionResult:
         """
@@ -152,7 +155,7 @@ class ExecutionOrchestrator:
         # Reset token counter
         self.llm_client.reset_token_count()
 
-        # The controller budget may cap the loop below the configured maximum.
+        # The iteration cap is system-owned and identical across Controller actions.
         max_iterations = self._effective_max_iterations()
 
         # Initialize context
@@ -162,6 +165,7 @@ class ExecutionOrchestrator:
             repo_state=repo_state,
             max_iterations=max_iterations,
         )
+        context.metadata["stage"] = self.stage
         if self.controller_signal:
             context.metadata["controller_signal"] = self.controller_signal.to_dict()
 
@@ -377,6 +381,10 @@ class ExecutionOrchestrator:
 
     def _base_result_metadata(self) -> Dict[str, Any]:
         """Metadata shared by success, failure, hard-case, and rollout paths."""
-        if not self.controller_signal:
-            return {}
-        return {"controller_signal": self.controller_signal.to_dict()}
+        payload: Dict[str, Any] = {
+            "stage": self.stage,
+            "round_id": os.getenv("SELF_EVOLVER_ROUND_ID") or "",
+        }
+        if self.controller_signal:
+            payload["controller_signal"] = self.controller_signal.to_dict()
+        return payload

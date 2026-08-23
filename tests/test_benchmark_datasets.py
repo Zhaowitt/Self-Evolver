@@ -34,14 +34,23 @@ def test_validate_split_lists_available_and_hints_train():
         datasets.validate_split("swebench_pro", "dev")
 
 
-def test_load_split_cache_keyed_by_split():
+def test_load_split_cache_keyed_by_split(monkeypatch):
+    datasets._CACHE.clear()
+    rows = {
+        "test": [{"instance_id": f"test-{i}"} for i in range(300)],
+        "dev": [{"instance_id": "dev-0"}],
+    }
+    monkeypatch.setattr(datasets, "_load_local", lambda _spec, _split: None)
+    monkeypatch.setattr(datasets, "_load_hub", lambda _spec, split: rows[split])
     lite_test = datasets.load_split("lite", "test")
     assert lite_test is datasets.load_split("lite", "test")       # cached
     assert datasets.load_split("lite", "dev") is not lite_test    # keyed by split
     assert len(lite_test) == 300
 
 
-def test_iter_rows_limit_and_exclude():
+def test_iter_rows_limit_and_exclude(monkeypatch):
+    rows = [{"instance_id": f"issue-{i}"} for i in range(5)]
+    monkeypatch.setattr(datasets, "load_split", lambda _dataset, _split: rows)
     rows = list(datasets.iter_rows("lite", "test", limit=3))
     assert len(rows) == 3
     first_id = rows[0]["instance_id"]

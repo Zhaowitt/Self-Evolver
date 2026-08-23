@@ -49,7 +49,7 @@ def run_online_rollout(
     stage: Optional[str] = None,
     seed: Optional[int] = None,
     experiment: Optional[str] = None,
-    verify_in_loop: bool = False,
+    verify_in_loop: bool = True,
 ) -> OnlineRolloutResult:
     """Run the repair loop, grade the final patch, score it, and log the rollout.
 
@@ -58,11 +58,9 @@ def run_online_rollout(
     with official SWE-bench eval semantics and the resulting ``EvalOutcome``
     drives the test components of the utility.
 
-    With ``verify_in_loop`` the backend is handed to the Verifier so *every*
-    repair iteration is graded with official FAIL_TO_PASS / PASS_TO_PASS
-    semantics (accurate retry routing), and that in-loop outcome is reused for
-    the reward instead of grading a second time. This costs one backend grade
-    per iteration; the default (off) keeps a single grade of the final patch.
+    With ``verify_in_loop`` each train patch first runs its frozen F2P subset.
+    Only subset-passing patches (plus the final usable patch) run full official
+    F2P+P2P.  Final reward reads the full outcome only.
     """
     judge = judge or CriticJudge()
     reward_model = reward_model or RewardModel.from_config_file()
@@ -73,24 +71,30 @@ def run_online_rollout(
         max_iterations=max_iterations,
         controller_signal=controller_signal,
         test_backend=test_backend if verify_in_loop else None,
+        stage=stage,
     ).run(issue)
 
-    # Reuse the in-loop official grade when the Verifier produced one; otherwise
-    # grade the final patch once. This avoids a second backend run per rollout.
+    # Reuse only a final full in-loop outcome.  A subset-only final attempt is
+    # not silently promoted, nor is an earlier patch re-graded as the final one.
     eval_outcome = _final_eval_outcome(result) if verify_in_loop else None
-    if eval_outcome is None and test_backend is not None:
+    if eval_outcome is None and test_backend is not None and not verify_in_loop:
         patch = model_patch_from_execution(result)
         if patch.strip():
-            eval_outcome = test_backend.run_swebench_eval(
-                swebench_instance_from_issue(issue),
-                patch,
+            evaluator = getattr(test_backend, "run_full_eval", test_backend.run_swebench_eval)
+            eval_outcome = evaluator(
+                swebench_instance_from_issue(issue), patch,
                 timeout=eval_timeout or get_config().docker.timeout,
             )
         else:
             logger.info("Empty final patch for %s; skipping container eval", issue.id)
 
     evaluation = judge.evaluate(result)
-    reward = reward_model.score(result, eval_outcome=eval_outcome, issue=issue)
+    reward = reward_model.score(
+        result,
+        eval_outcome=eval_outcome,
+        issue=issue,
+        selected_skill_ids=(controller_signal.selected_skill_ids if controller_signal else []),
+    )
 
     skill_evolution = None
     if skill_evolver and controller_signal:
@@ -134,13 +138,14 @@ def run_online_rollout(
 
 
 def _final_eval_outcome(result: ExecutionResult) -> Any:
-    """The last in-loop official grade (EvalOutcome), or None if the loop ran none."""
-    for record in reversed(getattr(result, "iteration_records", []) or []):
-        verification = getattr(record, "verification_result", None)
-        outcome = getattr(verification, "eval_outcome", None) if verification else None
-        if outcome is not None:
-            return outcome
-    return None
+    """Full outcome of the final attempted candidate, never a subset/older patch."""
+    records = list(getattr(result, "iteration_records", []) or [])
+    if not records:
+        return None
+    verification = getattr(records[-1], "verification_result", None)
+    if not verification or getattr(verification, "evaluation_scope", "full") != "full":
+        return None
+    return getattr(verification, "eval_outcome", None)
 
 
 def model_patch_from_execution(result: ExecutionResult) -> str:

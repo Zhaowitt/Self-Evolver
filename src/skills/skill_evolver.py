@@ -14,6 +14,7 @@ from src.skills.embedding_client import EmbeddingClient
 from src.skills.proposals import SkillUpdateProposal
 from src.skills.skill_dedup import DedupDecision, is_duplicate_skill
 from src.skills.skill_store import SkillStore, normalize_skill_markdown
+from src.skills.skill_schema import lint_skill_markdown
 from src.skills.textnorm import slug
 
 logger = logging.getLogger(__name__)
@@ -94,7 +95,8 @@ class SkillEvolver:
     ) -> Dict[str, Any]:
         """Credit selected skills without changing the frozen round's active bank."""
         signal = controller_signal_from_any(controller_signal)
-        utility = _reward_total(reward)
+        utility = _reward_task(reward)
+        contribution = _reward_contribution(reward)
         before = self._stats_snapshot()
         events: List[SkillEvolutionEvent] = []
 
@@ -127,6 +129,8 @@ class SkillEvolver:
                 success=success,
                 ema_alpha=self.config.baseline_ema_alpha,
                 round_id=round_id,
+                contribution=contribution,
+                skill_set_key=credit_ids,
             )
             for skill_id in credit_ids:
                 events.append(
@@ -137,7 +141,8 @@ class SkillEvolver:
                         reward=utility,
                         metadata={
                             "advantage": credit["advantage"],
-                            "baseline_ema": credit["baseline_after"]["ema"],
+                            "joint_credit": True,
+                            "skill_set_key": sorted(credit_ids),
                         },
                     )
                 )
@@ -208,15 +213,66 @@ class SkillEvolver:
             )
         reward = utility if utility is not None else 0.0
 
-        if proposal.operation == "deprecate":
-            self.store.deprecate_skill(proposal.skill_id, reason=proposal.rationale)
+        if proposal.operation not in {"create", "refine", "no-op"}:
             return (
                 SkillEvolutionEvent(
-                    action="deprecate",
+                    action=f"proposal_{proposal.operation}",
                     skill_id=proposal.skill_id,
-                    applied=True,
+                    applied=False,
+                    reason="unsupported_cluster_decision",
                     reward=reward,
-                    metadata={"rationale": proposal.rationale},
+                ),
+                None,
+            )
+
+        if proposal.operation == "no-op":
+            return (
+                SkillEvolutionEvent(
+                    action="no-op",
+                    skill_id=proposal.skill_id,
+                    applied=False,
+                    reason="reflector_no_op",
+                    reward=reward,
+                    metadata={
+                        "rationale": proposal.rationale,
+                        "cluster_id": proposal.cluster_id,
+                    },
+                ),
+                None,
+            )
+
+        if not proposal.cluster_id:
+            return (
+                SkillEvolutionEvent(
+                    action=f"proposal_{proposal.operation}",
+                    skill_id=proposal.skill_id,
+                    applied=False,
+                    reason="missing_source_cluster",
+                    reward=reward,
+                ),
+                None,
+            )
+        if len(set(proposal.evidence_provenance)) < 2:
+            return (
+                SkillEvolutionEvent(
+                    action=f"proposal_{proposal.operation}",
+                    skill_id=proposal.skill_id,
+                    applied=False,
+                    reason="insufficient_representative_evidence",
+                    reward=reward,
+                ),
+                None,
+            )
+        if proposal.operation == "refine" and slug(proposal.matched_skill_id) != slug(
+            proposal.skill_id
+        ):
+            return (
+                SkillEvolutionEvent(
+                    action="proposal_refine",
+                    skill_id=proposal.skill_id,
+                    applied=False,
+                    reason="refine_target_mismatch",
+                    reward=reward,
                 ),
                 None,
             )
@@ -226,6 +282,19 @@ class SkillEvolver:
             slug(proposal.skill_id),
             proposal.target_failure_type,
         )
+        lint_errors = lint_skill_markdown(normalized_content)
+        if lint_errors:
+            return (
+                SkillEvolutionEvent(
+                    action=f"proposal_{proposal.operation}",
+                    skill_id=proposal.skill_id,
+                    applied=False,
+                    reason="skill_quality_lint_failed",
+                    reward=reward,
+                    metadata={"lint_errors": lint_errors},
+                ),
+                None,
+            )
         dedup = is_duplicate_skill(
             normalized_content,
             [*self.store.load_skills(), *self.store.load_archived_skills()],
@@ -252,8 +321,13 @@ class SkillEvolver:
             proposal.skill_id,
             proposal.content,
             source=proposal.source,
-            archive_existing=proposal.operation == "update",
+            archive_existing=proposal.operation == "refine",
             target_failure_type=proposal.target_failure_type,
+            provenance={
+                "source_cluster_id": proposal.cluster_id,
+                "matched_skill_id": proposal.matched_skill_id,
+                "evidence_provenance": proposal.evidence_provenance,
+            },
         )
         return (
             SkillEvolutionEvent(
@@ -261,7 +335,12 @@ class SkillEvolver:
                 skill_id=proposal.skill_id,
                 applied=True,
                 reward=reward,
-                metadata={"rationale": proposal.rationale},
+                metadata={
+                    "rationale": proposal.rationale,
+                    "cluster_id": proposal.cluster_id,
+                    "matched_skill_id": proposal.matched_skill_id,
+                    "evidence_provenance": proposal.evidence_provenance,
+                },
             ),
             asdict(dedup) if dedup.duplicate else None,
         )
@@ -353,7 +432,7 @@ class SkillEvolver:
 def _is_self_refinement(proposal: SkillUpdateProposal, dedup: DedupDecision) -> bool:
     """An update may be similar (not identical) to its own live revision."""
     return (
-        proposal.operation == "update"
+        proposal.operation == "refine"
         and dedup.reason == "similarity_threshold"
         and dedup.matched_status == "active"
         and dedup.matched_skill_id == slug(proposal.skill_id)
@@ -366,6 +445,27 @@ def _reward_total(reward: Any) -> float:
     if isinstance(reward, dict):
         return float(reward.get("total", 0.0) or 0.0)
     return float(getattr(reward, "total", 0.0) or 0.0)
+
+
+def _reward_task(reward: Any) -> float:
+    if reward is None:
+        return 0.0
+    if isinstance(reward, dict):
+        return float(reward.get("task_reward", reward.get("total", 0.0)) or 0.0)
+    return float(getattr(reward, "task_reward", getattr(reward, "total", 0.0)) or 0.0)
+
+
+def _reward_contribution(reward: Any) -> float:
+    if reward is None:
+        return 0.0
+    if isinstance(reward, dict):
+        return float(
+            reward.get("skill_contribution", reward.get("evolution_utility", 0.0)) or 0.0
+        )
+    return float(
+        getattr(reward, "skill_contribution", getattr(reward, "evolution_utility", 0.0))
+        or 0.0
+    )
 
 
 def _round_net_success(stats: Dict[str, Any]) -> float:

@@ -132,7 +132,7 @@ def _orchestrator(tmp_path, monkeypatch, *, verifier_statuses, judge_route, budg
     return orch
 
 
-def test_controller_budget_caps_iterations(tmp_path, monkeypatch):
+def test_controller_budget_is_ignored_by_fixed_cap(tmp_path, monkeypatch):
     orch = _orchestrator(
         tmp_path, monkeypatch,
         verifier_statuses=[VerificationStatus.TESTS_FAILED],
@@ -142,14 +142,13 @@ def test_controller_budget_caps_iterations(tmp_path, monkeypatch):
 
     result = orch.run(Issue(id="local-1", description="add() should add"))
 
-    assert orch._effective_max_iterations() == 2
-    assert len(result.iteration_records) == 2
-    assert result.iterations_used == 2
+    assert orch._effective_max_iterations() == 3
+    assert len(result.iteration_records) == 3
+    assert result.iterations_used == 3
     assert result.status == ExecutionStatus.MAX_ITERATIONS
 
 
-def test_budget_above_cap_is_clamped_to_config(tmp_path, monkeypatch):
-    # The signal clamps budget to [1, config max]; the loop then caps at that.
+def test_requested_iterations_are_capped_by_system_limit(tmp_path, monkeypatch):
     orch = _orchestrator(
         tmp_path, monkeypatch,
         verifier_statuses=[VerificationStatus.TESTS_FAILED],
@@ -159,7 +158,7 @@ def test_budget_above_cap_is_clamped_to_config(tmp_path, monkeypatch):
 
     result = orch.run(Issue(id="local-1", description="add"))
 
-    assert orch._effective_max_iterations() == min(3, get_config().agent.max_iterations)
+    assert orch._effective_max_iterations() == 3
     assert len(result.iteration_records) == orch._effective_max_iterations()
 
 
@@ -174,9 +173,10 @@ def test_reinspect_reruns_inspector_and_propagates_judge_feedback(tmp_path, monk
     orch.run(Issue(id="local-1", description="add"))
 
     # Inspector re-ran on the REINSPECT route and saw the judge's feedback.
-    assert orch.inspector.calls == 2
+    assert orch.inspector.calls == 3
     assert orch.inspector.feedback_seen[0] is None
     assert orch.inspector.feedback_seen[1] == "feedback-1"
+    assert orch.inspector.feedback_seen[2] == "feedback-2"
 
 
 def test_regenerate_reuses_cached_inspection(tmp_path, monkeypatch):
