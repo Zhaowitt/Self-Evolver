@@ -1,18 +1,7 @@
-"""
-Verifier Worker - applies a candidate patch and decides whether it fixes the issue.
-
-When a test backend is available and the issue is a SWE-bench instance, the
-canonical patch is graded with the OFFICIAL per-test FAIL_TO_PASS / PASS_TO_PASS
-semantics (an ``EvalOutcome`` from ``src.environment.test_backend``): a real
-PASS_TO_PASS regression maps to NEW_ISSUES and an incomplete FAIL_TO_PASS set
-maps to TESTS_FAILED. Without a backend (the local ``fix`` command, unit tests)
-the environment's test command runs on the host — a passing run is SUCCESS, a
-failing run is TESTS_FAILED. There is no host PASS_TO_PASS baseline, so the host
-path never fabricates a regression verdict.
-"""
+"""Verifier: applies a patch and grades it (official F2P/P2P backend, or host tests)."""
 
 import json
-import logging
+import dataclasses
 import os
 from dataclasses import dataclass
 from enum import Enum
@@ -32,9 +21,7 @@ from src.llm.client import LLMClient
 from src.workers.base import BaseWorker, WorkerResult
 from src.workers.patch_generator import PatchResult
 
-logger = logging.getLogger(__name__)
-
-# swebench grading status string -> host TestStatus (per-test reconstruction).
+# swebench grading status string -> host TestStatus.
 _SB_TO_TESTSTATUS = {
     "PASSED": TestStatus.PASSED,
     "FAILED": TestStatus.FAILED,
@@ -44,8 +31,6 @@ _SB_TO_TESTSTATUS = {
 
 
 class VerificationStatus(Enum):
-    """Status of patch verification."""
-
     SUCCESS = "success"
     EMPTY_PATCH = "empty_patch"
     PATCH_FAILED = "patch_failed"
@@ -57,8 +42,6 @@ class VerificationStatus(Enum):
 
 @dataclass
 class VerificationResult:
-    """Result of patch verification."""
-
     status: VerificationStatus = VerificationStatus.ERROR
     patch_applied: bool = False
     tests_passed: bool = False
@@ -83,8 +66,6 @@ class VerificationResult:
 
 
 class Verifier(BaseWorker):
-    """Verifier worker for testing patches."""
-
     def __init__(
         self,
         env: ProjectEnvironment,
@@ -97,7 +78,7 @@ class Verifier(BaseWorker):
 
     @property
     def system_prompt(self) -> str:
-        # Verifier is rule-based; it makes no LLM calls.
+        # Rule-based; makes no LLM calls.
         return "You are a test verification assistant."
 
     def execute(
@@ -105,7 +86,6 @@ class Verifier(BaseWorker):
         context: ExecutionContext,
         patch_result: Optional[PatchResult] = None,
     ) -> WorkerResult[VerificationResult]:
-        """Verify a patch by applying it and running tests."""
         self.logger.info(f"Verifying patch for issue: {context.issue.id}")
 
         if not patch_result or not patch_result.patch_content:
@@ -119,7 +99,7 @@ class Verifier(BaseWorker):
             )
 
         try:
-            # Step 1: Apply the patch to capture the canonical git diff.
+            # Apply on the host to capture the canonical git diff.
             self.logger.info("Applying patch...")
             apply_result = self.env.apply_patch_detailed(patch_result.patch_content)
 
@@ -161,11 +141,22 @@ class Verifier(BaseWorker):
                     ),
                 )
 
-            # Step 2: Grade the patch. The backend re-applies the canonical patch
-            # in isolation, so revert the host apply first.
+            # The backend re-applies the canonical patch in isolation, so revert the host apply.
             if self._use_backend(context.issue):
+                final_iteration = context.iteration + 1 >= context.max_iterations
+                # A patch that breaks Python syntax cannot pass: skip the container run
+                # on non-final attempts (the final candidate is always graded).
+                syntax_errors = [] if final_iteration else self._syntax_errors(canonical_diff)
                 self.env.revert_changes()
-                result = self._verify_with_backend(context, canonical_diff)
+                if syntax_errors:
+                    result = VerificationResult(
+                        status=VerificationStatus.TESTS_FAILED,
+                        evaluation_scope="precheck",
+                        error_message="\n".join(syntax_errors),
+                        summary="Patch introduces a syntax error: " + "; ".join(syntax_errors)[:500],
+                    )
+                else:
+                    result = self._verify_with_backend(context, canonical_diff)
             else:
                 self.logger.info("Running tests...")
                 result = self._verify_on_host(self.env.run_tests())
@@ -198,28 +189,161 @@ class Verifier(BaseWorker):
                 ),
             )
 
+    def _syntax_errors(self, diff: str) -> List[str]:
+        """Syntax errors introduced in touched .py files; pre-existing ones (version skew) are skipped."""
+        errors: List[str] = []
+        paths = sorted(
+            {
+                line[len("+++ b/"):].strip()
+                for line in diff.split("\n")
+                if line.startswith("+++ b/") and line.strip().endswith(".py")
+            }
+        )
+        for path in paths:
+            file_path = self.env.repo_path / path
+            try:
+                source = file_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            try:
+                compile(source, path, "exec", dont_inherit=True)
+                continue
+            except SyntaxError as exc:
+                error = f"{path}:{exc.lineno}: {exc.msg}"
+            except (ValueError, TypeError):
+                continue
+            try:
+                original = self.env.repo.git.show(f":{path}")
+            except Exception:
+                original = None
+            if original is not None:
+                try:
+                    compile(original, path, "exec", dont_inherit=True)
+                except (SyntaxError, ValueError, TypeError):
+                    continue  # host interpreter cannot judge this file
+            errors.append(error)
+        return errors
+
+    def _f2p_only_result(
+        self,
+        context: ExecutionContext,
+        model_patch: str,
+        subset_outcome: Any,
+    ) -> Optional[VerificationResult]:
+        """F2P-only grading after a failed subset; None means run the full evaluation."""
+        if os.getenv("SELF_EVOLVER_F2P_ONLY_ON_FAILED_SUBSET", "1").strip().lower() in {
+            "0", "false", "no", "off",
+        }:
+            return None
+        all_f2p = set(_fail_to_pass(context.issue))
+        if all_f2p and set(getattr(subset_outcome, "selected_f2p_ids", []) or []) == all_f2p:
+            # The subset already ran every F2P test, so its outcome is the F2P-only outcome.
+            outcome = dataclasses.replace(
+                subset_outcome,
+                evaluation_scope="f2p_only",
+                resolved=False,
+                # Reuse, not a run: keeps eval_cost from double counting.
+                cache_hit=True,
+                duration_seconds=0.0,
+            )
+            return self._f2p_only_verification(outcome, subset_outcome)
+        if not hasattr(self.test_backend, "run_f2p_eval"):
+            return None
+        try:
+            outcome = self.test_backend.run_f2p_eval(_swebench_instance(context.issue), model_patch)
+        except NotImplementedError as exc:
+            self.logger.info(f"F2P-only grading unavailable ({exc}); running full eval")
+            return None
+        except Exception:
+            self.logger.exception("F2P-only grading failed to execute; running full eval")
+            return None
+        if not getattr(outcome, "all_selected_executed", False):
+            self.logger.warning("F2P-only grading inconclusive; running full eval")
+            return None
+        return self._f2p_only_verification(outcome, subset_outcome)
+
+    @staticmethod
+    def _f2p_only_verification(outcome: Any, subset_outcome: Any) -> VerificationResult:
+        return VerificationResult(
+            status=VerificationStatus.TESTS_FAILED,
+            tests_passed=False,
+            original_issue_fixed=False,
+            test_result=_test_result_from_outcome(outcome),
+            subset_eval_outcome=subset_outcome,
+            full_eval_outcome=outcome,
+            eval_outcome=outcome,
+            evaluation_scope="f2p_only",
+            official_eval_executed=True,
+            summary=(
+                f"F2P {outcome.f2p_passed}/{outcome.f2p_total} (subset failed; "
+                "P2P skipped, resolved=False)"
+            ),
+        )
+
     def _use_backend(self, issue) -> bool:
         """Grade with the official backend only for SWE-bench instances."""
         return self.test_backend is not None and bool(_fail_to_pass(issue))
+
+    def finalize_full_eval(
+        self,
+        context: ExecutionContext,
+        verification: Optional[VerificationResult],
+    ) -> bool:
+        """Upgrade a subset-only final candidate in place; True when a full eval ran."""
+        if (
+            verification is None
+            or verification.evaluation_scope not in {"subset", "precheck"}
+            or not verification.canonical_patch_content.strip()
+            or not self._use_backend(context.issue)
+        ):
+            return False
+        subset_outcome = verification.subset_eval_outcome
+        full = None
+        if _subset_failed(subset_outcome):
+            full = self._f2p_only_result(
+                context, verification.canonical_patch_content, subset_outcome
+            )
+        if full is None:
+            full = self._verify_with_backend(
+                context, verification.canonical_patch_content, force_full=True
+            )
+        for name in (
+            "status",
+            "tests_passed",
+            "original_issue_fixed",
+            "new_issues_introduced",
+            "test_result",
+            "full_eval_outcome",
+            "eval_outcome",
+            "evaluation_scope",
+            "official_eval_executed",
+            "summary",
+        ):
+            setattr(verification, name, getattr(full, name))
+        verification.subset_eval_outcome = subset_outcome
+        return True
 
     def _verify_with_backend(
         self,
         context: ExecutionContext,
         model_patch: str,
+        force_full: bool = False,
     ) -> VerificationResult:
-        """Run the train-time subset gate, then full official verification.
-
-        A subset-only result is deliberately not stored in ``eval_outcome``;
-        that field is reserved for full outcomes consumed by final reward.
-        Validation/evaluation stages bypass the subset gate entirely.
-        """
+        """Subset gate (if enabled), then official grading; subset results never reach ``eval_outcome``."""
         issue = context.issue
         instance = _swebench_instance(issue)
         stage = str(context.metadata.get("stage") or "train").lower()
         final_iteration = context.iteration + 1 >= context.max_iterations
         subset_outcome = None
 
-        if stage == "train" and hasattr(self.test_backend, "run_subset_eval"):
+        # The gate is outcome-preserving (a failed F2P subset implies a failed full
+        # F2P set; the final candidate is always graded in full), so eval may enable it.
+        on = {"1", "true", "yes", "on"}
+        if stage == "train":
+            gate_enabled = os.getenv("SELF_EVOLVER_TRAIN_SUBSET_GATE", "1").strip().lower() in on
+        else:
+            gate_enabled = os.getenv("SELF_EVOLVER_EVAL_SUBSET_GATE", "0").strip().lower() in on
+        if not force_full and gate_enabled and hasattr(self.test_backend, "run_subset_eval"):
             selected = _training_subset(issue)
             if selected:
                 try:
@@ -228,18 +352,33 @@ class Verifier(BaseWorker):
                         model_patch,
                         selected,
                     )
-                except Exception:
-                    if not final_iteration:
-                        raise
-                    self.logger.exception(
-                        "Final-iteration subset failed to execute; continuing to full eval"
-                    )
+                except NotImplementedError as exc:
+                    self.logger.info(f"Subset gate unavailable ({exc}); running full eval")
                     subset_outcome = None
+                except Exception:
+                    # The gate only saves time; its failure must never fail the attempt.
+                    self.logger.exception("Subset gate failed to execute; running full eval")
+                    subset_outcome = None
+            if subset_outcome is not None and not getattr(
+                subset_outcome, "all_selected_executed", True
+            ):
+                self.logger.warning(
+                    "Subset gate inconclusive (selected tests missing from log); "
+                    "running full eval"
+                )
+                context.metadata.setdefault("subset_inconclusive", 0)
+                context.metadata["subset_inconclusive"] += 1
+                subset_outcome = None
             if subset_outcome is not None:
                 subset_passed = (
                     subset_outcome.f2p_total > 0
                     and subset_outcome.f2p_passed == subset_outcome.f2p_total
                 )
+                if not subset_passed and final_iteration:
+                    # A failed subset cannot resolve; the reward needs only the F2P fraction.
+                    cheap = self._f2p_only_result(context, model_patch, subset_outcome)
+                    if cheap is not None:
+                        return cheap
                 if not subset_passed and not final_iteration:
                     summary = (
                         "Subset gate failed: "
@@ -261,8 +400,6 @@ class Verifier(BaseWorker):
         if hasattr(self.test_backend, "run_full_eval"):
             outcome = self.test_backend.run_full_eval(instance, model_patch)
         else:
-            # Compatibility for external/legacy backends.  They perform the
-            # complete old evaluation, never masquerading as a subset run.
             outcome = self.test_backend.run_swebench_eval(instance, model_patch)
         if outcome.resolved:
             status = VerificationStatus.SUCCESS
@@ -327,6 +464,16 @@ def _test_result_from_outcome(outcome) -> TestResult:
 
 def _fail_to_pass(issue) -> List[str]:
     return _id_list((getattr(issue, "metadata", None) or {}).get("fail_to_pass"))
+
+
+def _subset_failed(outcome: Any) -> bool:
+    """A conclusive subset run in which some selected F2P test did not pass."""
+    return (
+        outcome is not None
+        and getattr(outcome, "all_selected_executed", False)
+        and getattr(outcome, "f2p_total", 0) > 0
+        and getattr(outcome, "f2p_passed", 0) < getattr(outcome, "f2p_total", 0)
+    )
 
 
 def _training_subset(issue) -> List[str]:

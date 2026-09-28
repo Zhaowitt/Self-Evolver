@@ -1,38 +1,9 @@
-"""JSONL rollout logging for controller-guided repair attempts.
-
-Record schema (``rollout_record_v2``) — one JSON object per line:
-
-- ``schema_version``: "rollout_record_v2".
-- ``rollout_id``: uuid4 string. ``created_at``: ISO timestamp.
-- ``instance_id`` / ``repo_name`` / ``base_commit``: task identity.
-- ``stage``: "train" | "eval" (falls back to the signal mode).
-- ``seed``: int | null — the run's RNG seed.
-- ``experiment``: str | null — experiment label (e.g. "full-method").
-- ``models``: {"worker": str, "controller": str} — model names in use.
-- ``mode``: controller signal mode (kept for v1 readers; equals ``stage``'s
-  source signal).
-- ``controller_signal``: full signal dict incl. raw_response/parse_error.
-- ``selected_skill_ids``: list[str].
-- ``skill_updates``: list of proposal dicts (empty now that skill-lifecycle
-  proposals are owned by the Reflector; kept for older readers).
-- ``execution``: success/status/iterations_used/total_tokens/
-  total_duration_ms/final_patch_non_empty/final_patch_files.
-- ``eval_outcome``: {f2p_passed, f2p_total, p2p_passed, p2p_total, resolved}
-  | null — official-semantics grading of the final patch when a test backend
-  ran.
-- ``evaluation``: critic summary (success/failure_type/failure_tags/summary).
-- ``reward``: RewardResult dict (total/components/weights/evolution_utility/
-  baseline). This is execution logging, not the reward source.
-- ``skill_evolution``: events/dedup decisions/stats snapshots.
-
-Backward compatibility: v1 records lack ``schema_version``, ``stage``,
-``seed``, ``experiment``, ``models``, and ``eval_outcome``; readers must treat those
-as absent/null. Writers must only add fields, never repurpose existing ones.
-"""
+"""JSONL rollout logging (``rollout_record_v2``): add fields, never repurpose existing ones."""
 
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
@@ -49,7 +20,7 @@ SCHEMA_VERSION = "rollout_record_v2"
 
 
 class RolloutWriter:
-    """Append rollout records to JSONL (flock-guarded for parallel workers)."""
+    """flock-guarded JSONL appender, safe for parallel workers."""
 
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -81,7 +52,6 @@ def build_rollout_record(
     final_patch = getattr(execution_result, "final_patch", None)
     reward_payload = reward.to_dict() if hasattr(reward, "to_dict") else reward
     evaluation_payload = _evaluation_payload(evaluation)
-    skill_updates = getattr(signal, "skill_updates", []) if signal else []
     records = list(getattr(execution_result, "iteration_records", []) or [])
     status_value = getattr(getattr(execution_result, "status", None), "value", "")
     failure_diagnosis = (
@@ -98,6 +68,10 @@ def build_rollout_record(
         "repo_name": issue.repo_name,
         "base_commit": issue.base_commit,
         "stage": stage or (signal.mode if signal else "train"),
+        # Lets post-round updates ingest only this round's rollouts.
+        "round_id": str(
+            issue.metadata.get("round_id") or os.getenv("SELF_EVOLVER_ROUND_ID") or ""
+        ),
         "seed": seed,
         "experiment": experiment,
         "models": models or _default_models(),
@@ -108,10 +82,6 @@ def build_rollout_record(
         "observed_failure_label": issue.metadata.get("observed_failure_label", ""),
         "stable_cluster_id": issue.metadata.get("stable_cluster_id", ""),
         "sampling_source": issue.metadata.get("sampling_source", ""),
-        "skill_updates": [
-            proposal.to_dict() if hasattr(proposal, "to_dict") else proposal
-            for proposal in skill_updates
-        ],
         "execution": {
             "success": bool(getattr(execution_result, "success", False)),
             "status": getattr(getattr(execution_result, "status", None), "value", ""),
@@ -123,6 +93,7 @@ def build_rollout_record(
         },
         "eval_outcome": _eval_outcome_payload(eval_outcome),
         "verification_evidence": _verification_evidence(records),
+        "eval_cost": _eval_cost(records),
         "failure_diagnosis": failure_diagnosis,
         "evaluation": evaluation_payload,
         "reward": reward_payload,
@@ -156,6 +127,9 @@ def _eval_outcome_payload(eval_outcome: Any) -> Optional[Dict[str, Any]]:
         "resolved": bool(getter("resolved") or False),
         "evaluation_scope": str(getter("evaluation_scope", "full") or "full"),
         "selected_f2p_ids": list(getter("selected_f2p_ids", []) or []),
+        "duration_seconds": float(getter("duration_seconds", 0.0) or 0.0),
+        "cache_hit": bool(getter("cache_hit", False) or False),
+        "timed_out": bool(getter("timed_out", False) or False),
     }
 
 
@@ -182,6 +156,39 @@ def _verification_evidence(records: list[Any]) -> list[Dict[str, Any]]:
             item["full"] = _eval_outcome_payload(full)
         evidence.append(item)
     return evidence
+
+
+def _eval_cost(records: list[Any]) -> Dict[str, Any]:
+    """Container evaluations this rollout triggered, by scope."""
+    cost: Dict[str, Any] = {
+        "precheck_rejections": 0,
+        "subset_runs": 0,
+        "f2p_only_runs": 0,
+        "full_runs": 0,
+        "cache_hits": 0,
+        "timeouts": 0,
+        "container_seconds": 0.0,
+    }
+    for record in records:
+        verification = getattr(record, "verification_result", None)
+        if not verification:
+            continue
+        if getattr(verification, "evaluation_scope", "") == "precheck":
+            cost["precheck_rejections"] += 1
+        for key, name in (("subset_runs", "subset_eval_outcome"), ("full_runs", "full_eval_outcome")):
+            outcome = getattr(verification, name, None)
+            if outcome is None:
+                continue
+            if getattr(outcome, "cache_hit", False):
+                cost["cache_hits"] += 1
+            else:
+                if key == "full_runs" and getattr(outcome, "evaluation_scope", "") == "f2p_only":
+                    key = "f2p_only_runs"
+                cost[key] += 1
+                cost["timeouts"] += int(bool(getattr(outcome, "timed_out", False)))
+                cost["container_seconds"] += float(getattr(outcome, "duration_seconds", 0.0) or 0.0)
+    cost["container_seconds"] = round(cost["container_seconds"], 3)
+    return cost
 
 
 def _evaluation_payload(evaluation: Any) -> Optional[Dict[str, Any]]:

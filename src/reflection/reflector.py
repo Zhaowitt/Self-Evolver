@@ -157,8 +157,7 @@ class Reflector:
             item.cluster_id: item for item in decisions if item.operation == "no-op"
         }
         accepted_by_cluster.update({item.cluster_id: item for item in accepted_writes})
-        # A validator rejection becomes an auditable no-op rather than silently
-        # removing the cluster's decision.
+        # A validator rejection becomes an auditable no-op, not a dropped decision.
         normalized: List[SkillUpdateProposal] = []
         for cluster in qualifying:
             decision = accepted_by_cluster.get(cluster.cluster_id)
@@ -207,10 +206,7 @@ class Reflector:
         except (ValueError, json.JSONDecodeError) as exc:
             logger.warning("Reflector response was not valid JSON: %s", exc)
             return [], [{"reason": f"invalid reflector json: {exc}", "proposal": ""}]
-        raw = data.get("cluster_decisions")
-        if raw is None:
-            raw = data.get("skill_updates")  # legacy key, new proposal validation still applies.
-        return parse_proposals(raw)
+        return parse_proposals(data.get("cluster_decisions"))
 
     def _build_user_prompt(
         self,
@@ -318,8 +314,7 @@ def _task_signals(clusters: List[FailureCluster]) -> Dict[str, Any]:
     return {
         "observed_failure_labels": labels,
         "stable_cluster_ids": stable_clusters,
-        # Kept empty for old TaskPool readers; new sampling does not use vague
-        # family/instance boosts as a substitute for observed labels.
+        # Always empty; kept for TaskPool readers that expect these keys.
         "instance_boosts": {},
         "family_boosts": {},
     }

@@ -20,19 +20,29 @@ FAILURE_MECHANISMS = {
     "unknown",
 }
 
-_ENVIRONMENT_TERMS = (
-    "modulenotfounderror",
-    "no module named",
-    "dependency",
-    "docker",
-    "apptainer",
-    "container",
-    "image pull",
-    "network",
-    "permission denied",
-    "tests_timeout",
-    "timed out",
+# Anchored phrases: bare words like "dependency" or "network" also occur in
+# ordinary code and judge prose and would misclassify real repair failures.
+_ENVIRONMENT_PATTERNS = tuple(
+    re.compile(pattern, re.I)
+    for pattern in (
+        r"\bModuleNotFoundError\b",
+        r"\bNo module named\b",
+        r"\bcannot connect to the docker daemon\b",
+        r"\bdocker: ",
+        r"\bapptainer: ",
+        r"\bFATAL: .*container",
+        r"\bfailed to pull\b|\bimage pull\b",
+        r"\bno space left on device\b",
+        r"\bTemporary failure in name resolution\b|\bConnection refused\b",
+        r"\bPermission denied\b",
+        r"\btests_timeout\b|\bTests Timed Out\b|seconds exceeded",
+    )
 )
+# "FAILED <test id>" lines are instance-specific; the exception/assertion line
+# is the reusable pattern.
+_LOG_ERROR_LINE = re.compile(r"(Error\b|Exception\b|\bassert\b|AssertionError)")
+_PYTEST_PREFIX = re.compile(r"^E\s+")
+_MAX_LOG_ERROR_LINES = 4
 
 
 @dataclass
@@ -59,7 +69,9 @@ def diagnose_failed_trajectory(
     patch_applied: List[bool] = []
     f2p_progress: List[Dict[str, Any]] = []
     p2p_regressions: List[Dict[str, Any]] = []
+    # Only concrete errors (not judge prose) may classify infrastructure failures.
     raw_errors: List[str] = []
+    feedback_texts: List[str] = []
 
     for index, record in enumerate(attempts, start=1):
         if getattr(record, "error", None):
@@ -71,7 +83,7 @@ def diagnose_failed_trajectory(
                 routes.append(route)
             feedback = getattr(decision, "feedback_for_next_attempt", "")
             if feedback:
-                raw_errors.append(str(feedback))
+                feedback_texts.append(str(feedback))
         verification = getattr(record, "verification_result", None)
         if not verification:
             continue
@@ -79,10 +91,14 @@ def diagnose_failed_trajectory(
         if status:
             statuses.append(status)
         patch_applied.append(bool(getattr(verification, "patch_applied", False)))
-        for name in ("summary", "error_message"):
-            value = getattr(verification, name, "")
-            if value:
-                raw_errors.append(str(value))
+        # ``summary`` is a shared template ("F2P 0/5, ..."), not an error signature.
+        value = getattr(verification, "error_message", "")
+        if value:
+            raw_errors.append(str(value))
+        apply_result = getattr(verification, "patch_apply_result", None)
+        diagnostic = getattr(apply_result, "diagnostic", "") if apply_result else ""
+        if diagnostic and not getattr(verification, "patch_applied", False):
+            raw_errors.append(str(diagnostic))
 
         outcomes = []
         subset = getattr(verification, "subset_eval_outcome", None)
@@ -92,8 +108,11 @@ def diagnose_failed_trajectory(
         if subset is not None:
             outcomes.append(("subset", subset))
         if full is not None:
-            outcomes.append(("full", full))
+            # "f2p_only" outcomes carry no P2P evidence; keep the scope so they
+            # are never read as "no regression".
+            outcomes.append((str(getattr(full, "evaluation_scope", "full") or "full"), full))
         for scope, outcome in outcomes:
+            raw_errors.extend(_log_error_lines(getattr(outcome, "log_tail", "") or ""))
             passed = int(getattr(outcome, "f2p_passed", 0) or 0)
             total = int(getattr(outcome, "f2p_total", 0) or 0)
             f2p_progress.append(
@@ -117,6 +136,10 @@ def diagnose_failed_trajectory(
                 )
 
     signatures = extract_error_signatures(raw_errors)
+    environment = _is_environment_failure(raw_errors)
+    if not signatures:
+        # Judge prose is a last-resort signature, never an infra signal.
+        signatures = extract_error_signatures(feedback_texts, limit=2)
     evidence = {
         "f2p_progress": f2p_progress,
         "p2p_regression": p2p_regressions,
@@ -131,6 +154,7 @@ def diagnose_failed_trajectory(
         f2p_progress=f2p_progress,
         p2p_regressions=p2p_regressions,
         signatures=signatures,
+        environment=environment,
     )
     return FailureDiagnosis(
         mechanism=mechanism,
@@ -203,6 +227,29 @@ def adjudicate_ambiguous_diagnoses(records: List[Any], llm_client: Any) -> List[
     return records
 
 
+def _is_environment_failure(texts: Iterable[str]) -> bool:
+    return any(
+        pattern.search(line)
+        for text in texts
+        for line in str(text or "").splitlines()
+        for pattern in _ENVIRONMENT_PATTERNS
+    )
+
+
+def _log_error_lines(log_text: str) -> List[str]:
+    lines = []
+    for raw in log_text.splitlines():
+        line = _PYTEST_PREFIX.sub("", raw.strip())
+        if (
+            line
+            and _LOG_ERROR_LINE.search(line)
+            and not line.startswith(("FAILED ", "ERROR ", "PASSED "))
+            and line not in lines
+        ):
+            lines.append(line)
+    return lines[-_MAX_LOG_ERROR_LINES:]
+
+
 def extract_error_signatures(values: Iterable[str], limit: int = 6) -> List[str]:
     """Normalize concrete error lines without retaining whole noisy logs."""
     signatures: List[str] = []
@@ -229,12 +276,12 @@ def _rule_mechanism(
     f2p_progress: List[Dict[str, Any]],
     p2p_regressions: List[Dict[str, Any]],
     signatures: List[str],
+    environment: bool = False,
 ) -> tuple[str, float]:
-    signature_text = " ".join(signatures).lower()
-    if any(term in signature_text for term in _ENVIRONMENT_TERMS):
-        return "environment_failure", 0.9
     if p2p_regressions or "new_issues" in statuses:
         return "regression_introduced", 0.95
+    if environment:
+        return "environment_failure", 0.9
     if statuses and all(status in {"patch_failed", "no_changes"} for status in statuses):
         return "patch_application_failure", 0.95
     if statuses and all(status == "empty_patch" for status in statuses):
@@ -245,7 +292,15 @@ def _rule_mechanism(
     fractions = [float(item.get("fraction", 0.0)) for item in f2p_progress]
     if any(0.0 < fraction < 1.0 for fraction in fractions):
         return "incomplete_fix", 0.9
-    if any(item.get("scope") == "subset" for item in f2p_progress) and any(
+    # The patch satisfied the tests it was steered by (subset fully passed)
+    # yet failed the full F2P set: it fit the visible tests, not the issue.
+    subset_passed = any(
+        item.get("scope") == "subset"
+        and item.get("total", 0) > 0
+        and item.get("fraction", 0.0) >= 1.0
+        for item in f2p_progress
+    )
+    if subset_passed and any(
         item.get("scope") == "full" and item.get("fraction", 0.0) < 1.0
         for item in f2p_progress
     ):
@@ -253,7 +308,7 @@ def _rule_mechanism(
     if patch_applied and any(patch_applied) and fractions and max(fractions) == 0.0:
         if routes.count("reinspect") >= 1:
             return "wrong_root_cause", 0.8
-        return "incomplete_fix", 0.7
+        return "wrong_root_cause", 0.6
     if routes.count("reinspect") >= 2 or (not patch_applied and routes):
         return "localization_failure", 0.7
     if "patch_failed" in statuses or "no_changes" in statuses:

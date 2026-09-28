@@ -15,13 +15,8 @@ except ImportError:  # Windows development/test hosts
 
 @contextmanager
 def file_lock(path: Path) -> Iterator[None]:
-    """Hold an exclusive advisory lock guarding read-modify-write cycles on `path`.
-
-    A sidecar `<name>.lock` file is used so the guarded file can be atomically
-    replaced (tmp + os.replace) without invalidating the locked descriptor.
-    Do not nest acquisitions of the same lock: flock blocks between file
-    descriptors even within one process.
-    """
+    """Exclusive advisory lock on `path`; never nest it (flock blocks across fds in one process)."""
+    # A sidecar lock file lets `path` be atomically replaced while locked.
     lock_path = Path(str(path) + ".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("w") as handle:

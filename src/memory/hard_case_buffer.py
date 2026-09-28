@@ -18,9 +18,6 @@ from src.reflection.failure_diagnosis import diagnose_failed_trajectory
 
 HARD_CASE_SCHEMA_VERSION = "hard_case_v2"
 
-# Admission policy (Proposal 2.5.1): a failed run is worth keeping when it is a
-# repeated failure, shows many interactions with little progress, or exhausted
-# the fixed repair budget.
 LOW_PROGRESS_MIN_ITERATIONS = 2
 
 
@@ -140,12 +137,7 @@ class HardCaseBuffer:
         stage: str = "train",
         budget: Optional[int] = None,
     ) -> bool:
-        """Build a hard-case record and admit it only if it meets the policy.
-
-        Returns True when the record was written, False when the admission
-        policy rejected it (novel one-shot failure that is neither repeated nor
-        low-progress nor budget-exhausting).
-        """
+        """Build a hard-case record; return True if the admission policy wrote it."""
         record_list = list(records)
         payload = HardCaseRecord(
             issue_id=issue.id,
@@ -179,7 +171,7 @@ class HardCaseBuffer:
             ).to_dict(),
         )
         mechanism = str(payload.failure_diagnosis.get("mechanism") or "unknown")
-        # Keep the old field readable, while v2 consumers use mechanism.
+        # failure_type mirrors the mechanism for readers of the v1 field.
         payload.failure_type = mechanism
         if payload.failure_type == FailureType.UNKNOWN.value:
             payload.failure_type = failure_type_from_statuses(payload.verification_statuses)
@@ -197,7 +189,7 @@ def should_admit(
     history: List[HardCaseRecord],
     budget: Optional[int] = None,
 ) -> tuple[bool, str]:
-    """Decide whether a failed run belongs in the hard-case buffer (Proposal 2.5.1)."""
+    """Admit repeated failures, low-progress runs, or runs that exhausted the budget."""
     for prior in history:
         if prior.repo_name == record.repo_name and prior.failure_type == record.failure_type:
             return True, "repeated_similar_failure"

@@ -1,113 +1,60 @@
 # Self-Evolver
 
-A self-evolving multi-agent coding agent for repository-level issue resolving.
-The Controller drives an outer loop of **task evolution** and **skill evolution**
-over an Inspector → PatchGenerator → Verifier repair loop, graded with official
-SWE-bench-family semantics.
+## 安装
 
 ```bash
 pip install -e .
-cp .env.example .env      # then fill in OPENAI_API_KEY
+cp .env.example .env
 ```
 
-Container grading uses `apptainer` (or `docker` if present); no other setup.
-
-## Benchmark configuration
-
-Set the data root and container-image cache (both have portable defaults):
+## 分阶段运行
 
 ```bash
-export SWEBENCH_DATA_DIR="$(pwd)/benchmarks"     # default: <repo>/benchmarks
-export SIF_CACHE_DIR="$HOME/.cache/self_evolver/sif"
+export EASYR1_DIR=/path/to/EasyR1 EXPERIMENT=full_method SEED=0
+bash scripts/0_check.sh
+bash scripts/1_download.sh
+bash scripts/2_splits.sh
+bash scripts/3_flaky.sh
+ANNOTATOR_MODELS=gpt-4o,gpt-4.1 bash scripts/4_sft.sh
+ROUNDS=3 STEPS_PER_ROUND=64 bash scripts/5_grpo.sh
+bash scripts/6_eval.sh
+bash scripts/7_metrics.sh
 ```
 
-Download every dataset (idempotent; `DATASETS=` selects a subset):
+## 一键运行
 
 ```bash
-bash scripts/download_benchmarks.sh
+ANNOTATOR_MODELS=gpt-4o,gpt-4.1 bash scripts/pipeline.sh
+STAGES="grpo eval metrics" bash scripts/pipeline.sh
 ```
 
-| `--benchmark`    | `--dataset`          | Role                         | Grading |
-| ---------------- | -------------------- | ---------------------------- | ------- |
-| `swebench`       | `full` (`--split test`) | labeled RL pool; exclude final-eval IDs | apptainer/docker |
-| `swebench`       | `verified`           | primary eval (Python)        | apptainer/docker |
-| `swebench`       | `lite`               | fast dev (`dev`/`test`)      | apptainer/docker |
-| `swebench_live`  | `lite`\|`full`\|`test` | contamination-free held-out | apptainer/docker |
-| `multi_swe_bench`| `full` (1632, 7 langs)\|`flash` (300) | cross-language transfer | official Docker harness |
-| `swebench_pro`   | `test`               | harder OOD                   | official Docker harness |
-
-## Training commands
-
-Each experiment is one script (`SEED=`, `TEST_BACKEND=`, `NUM_*=` override defaults).
-Baselines to full method:
+## 消融
 
 ```bash
-bash scripts/run_zero_shot.sh        # base model, single agent, no evolution
-bash scripts/run_mas_static.sh       # fixed multi-agent workflow, no evolution
-bash scripts/run_task_evolution.sh   # task evolution only
-bash scripts/run_skill_evolution.sh  # skill evolution only
-bash scripts/run_full_method.sh      # task + skill evolution (main method)
-bash scripts/run_rl_controller.sh    # build EasyR1 GRPO data + train the Controller
-bash scripts/run_all_experiments.sh  # every experiment x seeds -> metrics tables
+EXPERIMENT=no_subset_gate  TRAIN_SUBSET_GATE=0 bash scripts/pipeline.sh
+EXPERIMENT=old_reward      REWARD_CONFIG=configs/reward_config_legacy.yaml bash scripts/pipeline.sh
+EXPERIMENT=no_sft          SKIP_SFT=1 bash scripts/pipeline.sh
+EXPERIMENT=one_level       CLUSTER_LEVELS=1 bash scripts/pipeline.sh
+EXPERIMENT=no_contribution REWARD_CONFIG=configs/reward_config_no_contribution.yaml bash scripts/pipeline.sh
+EXPERIMENT=old_sampling    SAMPLING_MODE=legacy bash scripts/pipeline.sh
 ```
 
-Equivalent direct CLI (a train run evolves the skill bank, then freezes it):
+## 基线
 
 ```bash
-python -m src.main benchmark \
-  --benchmark swebench --dataset full --split train --stage train --phase generate \
-  --agent-mode mas --skills evolve --memory on --task-evolution on \
-  --num-instances 100 --seed 0 --run-id full_method-train
+bash scripts/baselines/run_zero_shot.sh
+bash scripts/baselines/run_mas_static.sh
+bash scripts/baselines/run_task_evolution.sh
+bash scripts/baselines/run_skill_evolution.sh
+bash scripts/baselines/run_full_method.sh
+bash scripts/baselines/run_all_experiments.sh
+DATASETS="swebench_live multi_swe_bench" bash scripts/1_download.sh
+bash scripts/baselines/run_transfer_eval.sh
+PREDICTIONS=runs/<run>/predictions.json bash scripts/tools/evaluate.sh
 ```
 
-Flags: `--agent-mode single|mas`, `--skills off|static|evolve`, `--memory on|off`,
-`--task-evolution on|off`, `--controller-mode off|llm`, `--stage train|eval`,
-`--test-backend auto|apptainer|docker|host`, `--train-ids FILE` (contamination guard).
-
-## Evaluation commands
-
-Frozen held-out eval (skills snapshotted read-only) generates predictions:
+## NeSI
 
 ```bash
-python -m src.main benchmark \
-  --benchmark swebench --dataset verified --stage eval --phase generate \
-  --skills static --seed 0 --run-id full_method-eval
-
-bash scripts/run_transfer_eval.sh    # frozen eval on SWE-bench-Live + Multi-SWE-bench
+ANNOTATOR_MODELS=gpt-4o,gpt-4.1 sbatch --account=<project> scripts/slurm_nesi.sl
 ```
-
-Grade a predictions file (official Docker harness when docker is present, else the
-same swebench grading via apptainer):
-
-```bash
-PREDICTIONS=runs/full_method-eval/predictions.json bash scripts/evaluate.sh
-```
-
-Aggregate metrics (resolved rate, pass@k, cost-to-success, per-iteration evolution
-curve) as JSON + Markdown:
-
-```bash
-python -m src.benchmark.metrics --rollouts runs/*/rollouts.jsonl --report
-```
-
-Multi-SWE-bench and SWE-bench Pro grade with their own Docker harnesses: the runner
-generates predictions and writes a harness-ready patch file, then prints the exact
-official command.
-
-For Controller GRPO, `scripts/run_rl_controller.sh` records the hard-case boundary
-before EasyR1 starts and runs one train-only Reflector pass after a successful
-training exit. The resulting skill changes are stored in `skills/`, with an audit
-report under `runs/skill_reflections/`. A later invocation rebuilds its prompt
-JSONL from that updated skill bank; validation and final evaluation remain frozen.
-Online rewards run different instance checkouts concurrently while keeping all
-rollouts for one instance serial. `REWARD_WORKERS` controls the launcher setting
-(default `4`; for `rollout_batch_size: 4` and `rollout.n: 3`, this gives four
-parallel queues of three rollouts).
-
-### NeSI + Qwen3.5
-
-The portable Controller default is `Qwen/Qwen3.5-4B`.  On NeSI, first run the
-Qwen3.5 compatibility check and a one-step GPU smoke test, then submit the
-64-step A100 job with `scripts/run_nesi_qwen35_4b.sl`.  See
-[`docs/NESI_QWEN35_RUNBOOK.md`](docs/NESI_QWEN35_RUNBOOK.md) for storage paths,
-environment prerequisites, fresh-run versus checkpoint rules, and commands.

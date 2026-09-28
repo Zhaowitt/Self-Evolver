@@ -39,7 +39,7 @@ class ClusterBaselineStore:
         return dict(clusters) if isinstance(clusters, dict) else {}
 
     def frozen_snapshot(self) -> Dict[str, Dict[str, Any]]:
-        """Return a detached snapshot safe to reuse throughout one round."""
+        """Detached copy, safe to reuse throughout one round."""
         return json.loads(json.dumps(self.load()))
 
     def update_round(
@@ -66,6 +66,8 @@ class ClusterBaselineStore:
             for cluster_id, values in sorted(grouped.items()):
                 mean = sum(values) / len(values)
                 old = dict(clusters.get(cluster_id) or {})
+                if round_id and old.get("last_round_id") == round_id:
+                    continue  # this round was already folded in (rerun)
                 old_count = int(old.get("count", 0) or 0)
                 old_ema = float(old.get("ema", 0.0) or 0.0)
                 ema = mean if old_count <= 0 else (1.0 - alpha) * old_ema + alpha * mean

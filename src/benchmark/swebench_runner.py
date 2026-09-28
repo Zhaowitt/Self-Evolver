@@ -1,22 +1,10 @@
-"""SWE-bench runner: generate predictions and grade them with official semantics.
-
-Generation routes every instance through the shared repair rollout. In-loop
-verification uses a real per-instance container image (``ContainerTestBackend``,
-apptainer or docker) so the reward sees the official FAIL_TO_PASS / PASS_TO_PASS
-per-test outcomes rather than an unreliable host run.
-
-Train stage (``--stage train``) draws instances from an evolving ``TaskPool``
-and, when skill evolution is on, runs the ``Reflector`` every N rollouts to
-turn recurring failures into skill and task-distribution updates. Eval stage
-(``--stage eval``) is frozen: the skill bank is snapshotted into the run
-directory and read-only, and no skill / task / memory evolution runs.
-
-Each configuration of the flags below is one *experiment* (see ``ExperimentConfig``).
-"""
+"""SWE-bench runner: generate predictions and grade them with official semantics; eval stage is frozen."""
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import logging
 import random
 import shutil
@@ -29,6 +17,7 @@ from typing import Any, Dict, List, Optional
 
 from src.benchmark import datasets
 from src.benchmark.base import BenchmarkRunner
+from src.benchmark.datasets import read_id_file
 from src.config import get_config
 from src.controller.controller_client import ControllerClient
 from src.controller.schema import ControllerSignal, SkillSignal
@@ -90,12 +79,7 @@ class EpisodeResult:
 
 
 class _ImageBaseAdapter:
-    """Grade an instance in its base image.
-
-    Focused task variants (``<id>::focus-<n>``) run in their parent's official
-    image; this adapter rewrites the grading instance id to the base id so the
-    right image is used while the subset FAIL_TO_PASS is still evaluated.
-    """
+    """Grade focused variants (``<id>::focus-<n>``) in their parent's image by rewriting the instance id."""
 
     def __init__(self, backend: Any):
         self.backend = backend
@@ -153,8 +137,7 @@ class SWEBenchRunner(BenchmarkRunner):
         self.reward_model = RewardModel.from_config_file(reward_config)
         self.judge = CriticJudge()
 
-        # Isolate this run: hard cases and workspace-relative state live under the
-        # run directory instead of the shared repo workspace.
+        # Keep hard cases and workspace-relative state under this run's directory.
         get_config().environment.workspace_dir = self.run_dir
         self._hard_cases_path = self.run_dir / "hard_cases.jsonl"
 
@@ -162,7 +145,13 @@ class SWEBenchRunner(BenchmarkRunner):
         self._skill_evolve = (
             self.experiment.stage == "train" and self.experiment.skills == "evolve"
         )
-        self._skills_dir = self._frozen_skills_dir() if self._is_eval else self._repo_skills_dir()
+        if self._is_eval:
+            self._skills_dir = self._frozen_skills_dir()
+        elif self._skill_evolve and not os.getenv("SELF_EVOLVER_SKILLS_DIR", "").strip():
+            # Never evolve the tracked seed bank: evolve a per-run copy.
+            self._skills_dir = self._run_local_skills_dir()
+        else:
+            self._skills_dir = self._repo_skills_dir()
         self._bank = SkillBank(self._skills_dir)
         self._selector = (
             SkillSelector(self._bank) if self.experiment.skills != "off" else None
@@ -185,26 +174,38 @@ class SWEBenchRunner(BenchmarkRunner):
 
         self._write_manifest()
 
-    # ------------------------------------------------------------ skill bank
-
     @staticmethod
     def _repo_skills_dir() -> Path:
-        return Path(__file__).resolve().parents[2] / "skills"
+        from src.skills.skill_bank import default_skills_dir
+
+        return default_skills_dir()
+
+    def _run_local_skills_dir(self) -> Path:
+        bank = self.run_dir / "skills"
+        if not (bank / ".initialized").exists():
+            if bank.exists():
+                shutil.rmtree(bank)
+            shutil.copytree(self._repo_skills_dir(), bank)
+            (bank / ".initialized").touch()
+            logger.info("Train stage: evolving a per-run skill bank at %s", bank)
+        return bank
 
     def _frozen_skills_dir(self) -> Path:
-        """Snapshot the live skill bank into the run directory for read-only eval."""
+        """Snapshot the skill bank for read-only eval; an existing snapshot is reused so resumes stay consistent."""
         source = self._repo_skills_dir()
         snapshot = self.run_dir / "skills_snapshot"
+        if (snapshot / ".complete").exists():
+            logger.info("Eval stage: reusing frozen skill bank snapshot at %s", snapshot)
+            return snapshot
         if snapshot.exists():
             shutil.rmtree(snapshot)
         if source.exists():
             shutil.copytree(source, snapshot)
         else:
             snapshot.mkdir(parents=True, exist_ok=True)
+        (snapshot / ".complete").touch()
         logger.info("Eval stage: froze skill bank snapshot at %s", snapshot)
         return snapshot
-
-    # ------------------------------------------------------------- datasets
 
     def _dataset_split(self, split: str) -> tuple[str, str]:
         """Map the CLI (dataset, split) to a (registry key, registry split)."""
@@ -218,9 +219,6 @@ class SWEBenchRunner(BenchmarkRunner):
     ) -> List[dict]:
         key, registry_split = self._dataset_split(split)
         return list(datasets.iter_rows(key, registry_split, limit=limit, exclude_ids=exclude_ids))
-
-    def load_instances(self, split: str = "test") -> List[Issue]:
-        return [datasets.row_to_issue(row, use_hints=self.experiment.hints) for row in self.load_rows(split)]
 
     def setup_instance_environment(self, issue: Issue) -> ProjectEnvironment:
         """Clone (or reset) the repo and check out the base commit."""
@@ -238,8 +236,6 @@ class SWEBenchRunner(BenchmarkRunner):
         if issue.base_commit and not env.checkout_commit(issue.base_commit):
             raise RuntimeError(f"Failed to checkout commit: {issue.base_commit}")
         return env
-
-    # ------------------------------------------------------------- backends
 
     def _container_backend(self) -> Any:
         """Resolve the container test backend once (None for the host backend)."""
@@ -273,8 +269,6 @@ class SWEBenchRunner(BenchmarkRunner):
         backend = self._container_backend()
         return _ImageBaseAdapter(backend) if backend else None
 
-    # ---------------------------------------------------------- controller
-
     def _build_controller_signal(
         self,
         issue: Issue,
@@ -299,8 +293,15 @@ class SWEBenchRunner(BenchmarkRunner):
 
         if self._controller_client is not None:
             hard_cases = self._retrieve_hard_cases(issue)
+            # Same candidates as the GRPO/SFT prompt builder, so the Controller
+            # sees its training input distribution.
+            candidates = []
+            if self._selector is not None:
+                from src.rl.easyr1_dataset import controller_candidate_skills
+
+                candidates = controller_candidate_skills(issue, self._selector)
             return self._controller_client.generate(
-                issue, stage=self.experiment.stage, skills=selected, hard_cases=hard_cases
+                issue, stage=self.experiment.stage, skills=candidates, hard_cases=hard_cases
             )
         if selected:
             return ControllerSignal(
@@ -315,26 +316,37 @@ class SWEBenchRunner(BenchmarkRunner):
         if self.experiment.memory == "off" or not self._hard_cases_path.exists():
             return []
         retriever = MemoryRetriever(self._hard_cases_path)
-        return [record.to_dict() for record in retriever.retrieve(repo_name=issue.repo_name, limit=3)]
+        return [
+            record.to_dict()
+            for record in retriever.retrieve(repo_name=issue.repo_name, stage="train", limit=3)
+        ]
 
-    @staticmethod
-    def _max_iterations(signal: Optional[ControllerSignal]) -> int:
-        # Kept as a helper for call-site compatibility.  The Controller no
-        # longer owns resource allocation.
-        return min(3, max(1, get_config().agent.max_iterations))
-
-    # -------------------------------------------------------------- episode
+    # False: generate one patch and leave grading to the official harness.
+    in_loop_verification = True
 
     def _run_episode(
         self,
         issue: Issue,
         forced_skills: Optional[List[SkillSignal]] = None,
+        record: bool = True,
     ) -> EpisodeResult:
+        """``record=False`` (skill-validation replays) writes no rollout, eval-cache entry or skill credit."""
         env = self.setup_instance_environment(issue)
         test_cmd = build_targeted_test_cmd(issue)
         if test_cmd:
             env.test_cmd = test_cmd
         backend = self._grading_backend(env)
+        max_iterations = get_config().agent.max_iterations
+        verify_in_loop = True
+        if not self.in_loop_verification:
+            env.test_cmd = "false"
+            backend, max_iterations = None, 1
+        elif self._is_eval and os.getenv(
+            "SELF_EVOLVER_EVAL_ORACLE_VERIFIER", "0"
+        ).strip().lower() in {"0", "false", "no", "off"}:
+            # pass@1: hidden F2P/P2P tests must not steer eval retries.
+            env.test_cmd = "false"
+            max_iterations, verify_in_loop = 1, False
         signal = self._build_controller_signal(issue, forced_skills=forced_skills)
 
         if self.experiment.agent_mode == "single":
@@ -344,23 +356,27 @@ class SWEBenchRunner(BenchmarkRunner):
             issue,
             env=env,
             controller_signal=signal,
-            max_iterations=self._max_iterations(signal),
+            # The orchestrator clamps this to the system cap of 3.
+            max_iterations=max_iterations,
             reward_model=self.reward_model,
-            rollout_writer=self.rollout_writer,
-            skill_evolver=self._evolver if self._skill_evolve else None,
+            rollout_writer=self.rollout_writer if record else None,
+            skill_evolver=self._evolver if (self._skill_evolve and record) else None,
             judge=self.judge,
             test_backend=backend,
             eval_timeout=default_eval_timeout(),
+            verify_in_loop=verify_in_loop,
             stage=self.experiment.stage,
             seed=self.experiment.seed,
             experiment=self.experiment.label or None,
         )
         eval_outcome = rollout.eval_outcome
         resolved = eval_outcome.resolved if eval_outcome else rollout.execution_result.success
-        self._cache_eval(issue.id, eval_outcome)
+        patch = model_patch_from_execution(rollout.execution_result)
+        if record:
+            self._cache_eval(issue.id, eval_outcome, patch)
         return EpisodeResult(
             instance_id=issue.id,
-            patch=model_patch_from_execution(rollout.execution_result),
+            patch=patch,
             resolved=resolved,
             utility=rollout.reward.total,
             execution_result=rollout.execution_result,
@@ -402,7 +418,7 @@ class SWEBenchRunner(BenchmarkRunner):
             seed=self.experiment.seed,
         )
         self.rollout_writer.append(record)
-        self._cache_eval(issue.id, eval_outcome)
+        self._cache_eval(issue.id, eval_outcome, patch)
         resolved = eval_outcome.resolved if eval_outcome else exec_result.success
         return EpisodeResult(
             instance_id=issue.id,
@@ -412,8 +428,6 @@ class SWEBenchRunner(BenchmarkRunner):
             execution_result=exec_result,
             eval_outcome=eval_outcome,
         )
-
-    # ------------------------------------------------------------ reflection
 
     def _run_reflection(self, pool: Optional[TaskPool]) -> None:
         if self._skill_evolve:
@@ -430,7 +444,7 @@ class SWEBenchRunner(BenchmarkRunner):
             pool.apply_reflection(signals)
 
     def _task_signals_from_memory(self) -> Dict[str, Any]:
-        """Observed labels from v2 diagnoses (task evolution without skill writes)."""
+        """Observed failure labels for task evolution without skill writes."""
         from src.reflection.clustering import cluster_records, qualifying_clusters
 
         records = MemoryRetriever(self._hard_cases_path).retrieve(stage="train", limit=200)
@@ -485,11 +499,11 @@ class SWEBenchRunner(BenchmarkRunner):
             if row is None:
                 continue
             issue = datasets.row_to_issue(row, use_hints=self.experiment.hints)
-            utilities.append(self._run_episode(issue, forced_skills=forced).utility)
+            utilities.append(
+                self._run_episode(issue, forced_skills=forced, record=False).utility
+            )
         mean_utility = sum(utilities) / len(utilities) if utilities else None
         return proposals, mean_utility
-
-    # ------------------------------------------------------------- generate
 
     def generate_predictions(
         self,
@@ -524,7 +538,7 @@ class SWEBenchRunner(BenchmarkRunner):
         predictions = self._load_predictions(predictions_path)
 
         self.logger.info("Train stage: %d rollouts over a pool of %d instances", budget, len(pool))
-        for step in range(budget):
+        for _ in range(budget):
             sampled = pool.sample(1, rng)
             if not sampled:
                 break
@@ -532,7 +546,7 @@ class SWEBenchRunner(BenchmarkRunner):
             issue = datasets.row_to_issue(instance, use_hints=self.experiment.hints)
             try:
                 episode = self._run_episode(issue)
-            except Exception as exc:  # keep the loop alive; log and continue
+            except Exception as exc:
                 self.logger.error("Rollout failed for %s: %s", issue.id, exc)
                 continue
             pool.record_outcome(instance["instance_id"], episode.resolved, episode.utility)
@@ -540,8 +554,7 @@ class SWEBenchRunner(BenchmarkRunner):
             self._save_predictions(predictions_path, predictions)
             pool.save()
 
-        # SkillBank and cluster decisions stay frozen during the round.  One
-        # batch reflection is applied only after every rollout has completed.
+        # SkillBank stays frozen during the round; reflect once at the end.
         self._run_reflection(pool)
         pool.save()
 
@@ -555,6 +568,8 @@ class SWEBenchRunner(BenchmarkRunner):
         exclude = self._eval_contamination_guard()
         rows = self.load_rows(split, limit=num_instances, exclude_ids=exclude)
         predictions = self._load_predictions(predictions_path) if resume else {}
+        if exclude:
+            predictions = {k: v for k, v in predictions.items() if k not in exclude}
         for row in rows:
             issue = datasets.row_to_issue(row, use_hints=self.experiment.hints)
             if resume and predictions.get(issue.id, {}).get("model_patch", "").strip():
@@ -567,6 +582,9 @@ class SWEBenchRunner(BenchmarkRunner):
                 patch = ""
             predictions[issue.id] = self._prediction_dict(issue.id, patch)
             self._save_predictions(predictions_path, predictions)
+        if self._skill_evolve:
+            # Skill-only evolution must still reflect, or it never writes a skill.
+            self._run_reflection(None)
 
     def _eval_contamination_guard(self) -> set:
         """Refuse eval on ids listed in the training-id file (contamination control)."""
@@ -575,8 +593,6 @@ class SWEBenchRunner(BenchmarkRunner):
         train_ids = read_id_file(self._train_ids_path)
         self.logger.info("Excluding %d training ids from the eval set", len(train_ids))
         return train_ids
-
-    # ------------------------------------------------------------- evaluate
 
     def evaluate_predictions(
         self,
@@ -587,22 +603,24 @@ class SWEBenchRunner(BenchmarkRunner):
         cleanup_images: bool = True,
         official_harness: Optional[bool] = None,
     ) -> dict:
-        """Grade a predictions file and summarize resolved / unresolved instances.
-
-        The official swebench Docker harness is used when a docker engine is
-        available (canonical leaderboard numbers); otherwise each prediction is
-        graded per-instance with the same swebench grading code via apptainer or
-        the host backend.
-        """
+        """Grade predictions with the official Docker harness if available, else per-instance via the backend."""
         predictions = self._load_predictions(predictions_path)
+        # A predictions file resumed from an unguarded run may hold training ids.
+        excluded = self._eval_contamination_guard()
+        if excluded:
+            predictions = {k: v for k, v in predictions.items() if k not in excluded}
         if official_harness is None:
             official_harness = (
                 self.experiment.test_backend in ("auto", "docker")
                 and shutil.which("docker") is not None
             )
         if official_harness:
+            # The harness skips instances already reported under (run_id, model),
+            # so namespace run_id by predictions content.
+            content_sha = hashlib.sha256(Path(predictions_path).read_bytes()).hexdigest()[:10]
             summary = self._evaluate_official_docker(
-                predictions, predictions_path, split, run_id or self.run_id,
+                predictions, predictions_path, split,
+                f"{run_id or self.run_id}-{content_sha}",
                 max_workers, cleanup_images,
             )
         else:
@@ -624,7 +642,7 @@ class SWEBenchRunner(BenchmarkRunner):
             if not patch or row is None:
                 unresolved.append(instance_id)
                 continue
-            outcome = cache.get(instance_id)
+            outcome = self._cached_outcome(instance_id, patch)
             if outcome is None:
                 issue = datasets.row_to_issue(row, use_hints=self.experiment.hints)
                 backend = self._eval_backend_for(issue)
@@ -636,7 +654,7 @@ class SWEBenchRunner(BenchmarkRunner):
                         swebench_instance_from_issue(issue), patch, timeout=default_eval_timeout()
                     )
                 )
-                cache[instance_id] = outcome
+                cache[instance_id] = {**outcome, "patch_sha": _patch_sha(patch)}
             (resolved if outcome["resolved"] else unresolved).append(instance_id)
             for field_name in totals:
                 totals[field_name] += outcome[field_name]
@@ -700,16 +718,22 @@ class SWEBenchRunner(BenchmarkRunner):
             finally:
                 if cleanup_images:
                     self.cleanup_docker_images(except_base=True)
-        return self.summarize_official_results(run_id=run_id)
+        return self.summarize_official_results(run_id=run_id, expected_ids=set(predictions))
 
-    def summarize_official_results(self, run_id: Optional[str] = None) -> dict:
+    def summarize_official_results(
+        self,
+        run_id: Optional[str] = None,
+        expected_ids: Optional[set] = None,
+    ) -> dict:
         """Read the official harness report tree and separate infra from patch errors."""
         run_id = run_id or self.run_id
-        candidates = [Path("logs/run_evaluation") / run_id / self.model_name]
+        # The harness writes model directories with "/" replaced by "__".
+        model_dir = self.model_name.replace("/", "__")
+        candidates = [Path("logs/run_evaluation") / run_id / model_dir]
         try:
             from swebench.harness.constants import RUN_EVALUATION_LOG_DIR
 
-            candidates.insert(0, RUN_EVALUATION_LOG_DIR / run_id / self.model_name)
+            candidates.insert(0, RUN_EVALUATION_LOG_DIR / run_id / model_dir)
         except Exception:
             pass
         eval_dir = next((path for path in candidates if path.exists()), candidates[-1])
@@ -723,10 +747,16 @@ class SWEBenchRunner(BenchmarkRunner):
             for instance_dir in sorted(eval_dir.iterdir()):
                 if not instance_dir.is_dir():
                     continue
+                if expected_ids is not None and instance_dir.name not in expected_ids:
+                    continue  # stale report from an earlier run with this run_id
                 self._classify_official_instance(
                     instance_dir, resolved, unresolved, infra_errors, patch_errors, other_errors
                 )
 
+        graded = set(resolved) | set(unresolved) | set(infra_errors) | set(patch_errors) | set(other_errors)
+        # Unsubmitted predictions are unresolved, same denominator as the backend path.
+        not_submitted = sorted(set(expected_ids or ()) - graded)
+        unresolved.extend(not_submitted)
         total = len(resolved) + len(unresolved) + len(infra_errors) + len(patch_errors) + len(other_errors)
         return {
             "backend": "official-docker-harness",
@@ -741,6 +771,7 @@ class SWEBenchRunner(BenchmarkRunner):
             "infra_error_count": len(infra_errors),
             "patch_error_count": len(patch_errors),
             "other_error_count": len(other_errors),
+            "not_submitted_count": len(not_submitted),
             "resolve_rate": len(resolved) / max(1, total),
             "resolve_rate_excluding_infra": len(resolved) / max(1, total - len(infra_errors)),
         }
@@ -767,8 +798,6 @@ class SWEBenchRunner(BenchmarkRunner):
             other.append(instance_id)
         else:
             unresolved.append(instance_id)
-
-    # -------------------------------------------------------------- phased
 
     def run_phased_benchmark(
         self,
@@ -810,14 +839,21 @@ class SWEBenchRunner(BenchmarkRunner):
         empty = sum(1 for p in predictions.values() if not p.get("model_patch", "").strip())
         return {"total": total, "non_empty": total - empty, "empty": empty}
 
-    # ------------------------------------------------------------- eval cache
-
-    def _cache_eval(self, instance_id: str, eval_outcome: Any) -> None:
-        if eval_outcome is None:
-            return
+    def _cache_eval(self, instance_id: str, eval_outcome: Any, patch: str = "") -> None:
+        """Cache this patch's outcome; no outcome drops any stale entry."""
         cache = self._load_eval_cache()
-        cache[instance_id] = _eval_outcome_dict(eval_outcome)
+        if eval_outcome is None or not (patch or "").strip():
+            if cache.pop(instance_id, None) is not None:
+                self._save_eval_cache(cache)
+            return
+        cache[instance_id] = {**_eval_outcome_dict(eval_outcome), "patch_sha": _patch_sha(patch)}
         self._save_eval_cache(cache)
+
+    def _cached_outcome(self, instance_id: str, patch: str) -> Optional[dict]:
+        entry = self._load_eval_cache().get(instance_id)
+        if not entry or not (patch or "").strip() or entry.get("patch_sha") != _patch_sha(patch):
+            return None
+        return entry
 
     def _load_eval_cache(self) -> Dict[str, dict]:
         if self._eval_cache is None:
@@ -835,8 +871,12 @@ class SWEBenchRunner(BenchmarkRunner):
         if not cache:
             return
         predictions = self._load_predictions(predictions_path)
-        resolved = [iid for iid in predictions if cache.get(iid, {}).get("resolved")]
-        graded = [iid for iid in predictions if iid in cache]
+        outcomes = {
+            iid: self._cached_outcome(iid, prediction.get("model_patch", ""))
+            for iid, prediction in predictions.items()
+        }
+        resolved = [iid for iid, outcome in outcomes.items() if outcome and outcome.get("resolved")]
+        graded = [iid for iid, outcome in outcomes.items() if outcome]
         summary = {
             "backend": self.experiment.test_backend,
             "source": "in-loop",
@@ -844,11 +884,11 @@ class SWEBenchRunner(BenchmarkRunner):
             "resolved_count": len(resolved),
             "graded_count": len(graded),
             "prediction_count": len(predictions),
-            "resolve_rate": len(resolved) / max(1, len(graded)),
+            # Ungraded/empty predictions count as unresolved, as in the evaluate phase.
+            "resolve_rate": len(resolved) / max(1, len(predictions)),
+            "resolve_rate_graded_only": len(resolved) / max(1, len(graded)),
         }
         (self.run_dir / "final_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-
-    # ------------------------------------------------------------- helpers
 
     def _prediction_dict(self, instance_id: str, patch: str) -> dict:
         return {
@@ -899,6 +939,10 @@ class SWEBenchRunner(BenchmarkRunner):
             logger.warning("Docker cleanup error: %s", exc)
 
 
+def _patch_sha(patch: str) -> str:
+    return hashlib.sha256((patch or "").strip().encode("utf-8")).hexdigest()[:16]
+
+
 def _eval_outcome_dict(eval_outcome: Any) -> dict:
     getter = (
         eval_outcome.get if isinstance(eval_outcome, dict)
@@ -910,18 +954,6 @@ def _eval_outcome_dict(eval_outcome: Any) -> dict:
         "p2p_passed": int(getter("p2p_passed") or 0),
         "p2p_total": int(getter("p2p_total") or 0),
         "resolved": bool(getter("resolved") or False),
-    }
-
-
-def read_id_file(path: Path) -> set:
-    """Read instance ids from a file: one id per line (# comments) or a JSON list."""
-    text = Path(path).read_text(encoding="utf-8").strip()
-    if text.startswith("["):
-        return {str(item) for item in json.loads(text)}
-    return {
-        line.strip()
-        for line in text.splitlines()
-        if line.strip() and not line.strip().startswith("#")
     }
 
 

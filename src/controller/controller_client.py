@@ -10,7 +10,7 @@ from src.controller.parser import parse_controller_response
 from src.controller.prompt_builder import ControllerPromptBuilder
 from src.controller.schema import ControllerSignal, SkillSignal
 from src.environment.models import Issue
-from src.llm.client import LLMClient
+from src.llm.client import LLMClient, Message
 from src.skills.skill_bank import SkillMetadata
 
 
@@ -71,29 +71,28 @@ class ControllerClient:
             )
             self.llm_client = LLMClient(llm_config)
 
-        skill_payloads = [
-            skill_signal.to_dict()
-            for skill_signal in _skill_list(skill=skill, skills=skills)
-        ]
+        skill_payloads = _skill_payloads(skill=skill, skills=skills)
 
-        user_prompt = self.prompt_builder.build_user_prompt(
-            issue,
-            mode=stage,
-            skills=skill_payloads,
-            hard_cases=hard_cases,
-        )
+        # The trained policy only ever saw the single-turn prompt EasyR1 builds.
+        messages = [
+            Message(role=item["role"], content=item["content"])
+            for item in self.prompt_builder.build_messages(
+                issue,
+                mode=stage,
+                skills=skill_payloads,
+                hard_cases=hard_cases,
+            )
+        ]
         try:
-            response = self.llm_client.chat_with_system(
-                self.prompt_builder.system_prompt,
-                user_prompt,
+            response = self.llm_client.chat(
+                messages,
                 temperature=self.config.temperature,
                 max_tokens=self.config.max_tokens,
                 response_format={"type": "json_object"},
             )
         except Exception:
-            response = self.llm_client.chat_with_system(
-                self.prompt_builder.system_prompt,
-                user_prompt,
+            response = self.llm_client.chat(
+                messages,
                 temperature=self.config.temperature,
                 max_tokens=self.config.max_tokens,
             )
@@ -114,23 +113,26 @@ def _skill_to_signal(value: Optional[SkillMetadata | SkillSignal]) -> Optional[S
     return None
 
 
-def _skill_list(
+def _skill_payloads(
     skill: Optional[SkillMetadata | SkillSignal] = None,
     skills: Optional[Sequence[SkillMetadata | SkillSignal]] = None,
-) -> list[SkillSignal]:
-    selected: list[SkillSignal] = []
+) -> list[dict]:
+    """SkillMetadata keeps its usage/reward/status fields so the served prompt matches training."""
+    payloads: list[dict] = []
     seen: set[str] = set()
     for value in [*(skills or []), *([skill] if skill else [])]:
-        signal = _skill_to_signal(value)
-        if not signal:
-            continue
-        key = signal.id or signal.title
-        if key in seen:
+        if isinstance(value, SkillMetadata):
+            payload = value.to_dict()
+        else:
+            signal = _skill_to_signal(value)
+            if not signal:
+                continue
+            payload = signal.to_dict()
+        key = str(payload.get("id") or payload.get("title") or "")
+        if not key or key in seen:
             continue
         seen.add(key)
-        selected.append(signal)
-        # Give the Controller a real matching problem (relevant candidates plus
-        # distractors); grounding still caps the chosen action at two skills.
-        if len(selected) >= 6:
+        payloads.append(payload)
+        if len(payloads) >= 6:
             break
-    return selected
+    return payloads

@@ -1,9 +1,4 @@
-"""
-Task evolution configuration (Proposal 2.3).
-
-Tunables live in ``configs/task_evolution.yaml``; the in-code defaults below
-are identical to that file so behavior is unchanged when it is absent.
-"""
+"""Task evolution tunables; in-code defaults mirror configs/task_evolution.yaml."""
 
 from __future__ import annotations
 
@@ -19,8 +14,6 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class TaskEvolutionConfig:
-    """Tunables for TaskPool sampling and focused-variant generation."""
-
     ema_alpha: float = 0.3            # EMA step for per-family success rate
     boundary_sigma: float = 0.2       # sigma of exp(-(s-0.5)^2 / (2*sigma^2))
     boost_factor: float = 2.0         # instance boost = 1 + boost_factor * cluster_hits
@@ -57,18 +50,11 @@ class TaskEvolutionConfig:
 
 
 def default_config_path() -> Path:
-    """Repo-relative path of configs/task_evolution.yaml (no absolute paths)."""
     return Path(__file__).resolve().parents[2] / "configs" / "task_evolution.yaml"
 
 
 def load_task_evolution_config(path: Optional[Path] = None) -> TaskEvolutionConfig:
-    """
-    Load tunables from a YAML file.
-
-    With ``path=None`` the repo default is used and, when that file is absent,
-    the in-code defaults (identical values) apply. An explicitly given path
-    must exist.
-    """
+    """``path=None`` uses the repo default (code defaults if absent); an explicit path must exist."""
     config_path = Path(path) if path is not None else default_config_path()
     if not config_path.exists():
         if path is not None:

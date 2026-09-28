@@ -1,18 +1,5 @@
-"""
-Single-agent zero-shot baseline.
+"""Single-agent zero-shot baseline: one LLM call producing one diff."""
 
-One LLM call sees the issue, the repository file tree, and the full text of the
-few files with the highest lexical overlap with the issue, and returns a unified
-diff. The diff is canonicalized through the ProjectEnvironment (apply -> git diff
--> revert). There are no worker roles, retries, judge, or controller guidance —
-this is the reference point the multi-agent loop is compared against.
-
-``run_single_agent`` returns the same ``ExecutionResult`` the orchestrator
-produces, so the benchmark runner can dispatch to it for ``--agent-mode single``
-and reuse the downstream grading, reward, and rollout-logging path unchanged.
-"""
-
-import logging
 import re
 import time
 from typing import List, Optional
@@ -23,8 +10,6 @@ from src.llm.client import LLMClient
 from src.orchestrator.orchestrator import ExecutionResult, ExecutionStatus, IterationRecord
 from src.workers.base import BaseWorker, WorkerResult
 from src.workers.patch_generator import PatchResult, parse_patch_response
-
-logger = logging.getLogger(__name__)
 
 MAX_TREE_FILES = 100
 TOP_FILES = 3
@@ -86,7 +71,6 @@ class SingleAgent(BaseWorker):
         return SINGLE_AGENT_SYSTEM_PROMPT
 
     def execute(self, context: ExecutionContext) -> WorkerResult[PatchResult]:
-        """Generate a patch from a single LLM call."""
         self.logger.info(f"Single-agent patch for issue: {context.issue.id}")
         try:
             prompt = self._build_prompt(context)
@@ -164,18 +148,14 @@ def run_single_agent(
     env: ProjectEnvironment,
     llm_client: Optional[LLMClient] = None,
 ) -> ExecutionResult:
-    """Run the single-agent baseline and return an ExecutionResult.
-
-    The baseline does not run tests; ``success`` means a non-empty canonical
-    patch (a prediction) was produced. Official resolution is graded downstream
-    by the test backend / SWE-bench harness.
-    """
+    """``success`` means a non-empty canonical patch; tests are graded downstream."""
     start_time = time.time()
     agent = SingleAgent(env, llm_client)
     repo_state = env.get_repo_state()
     context = ExecutionContext(issue=issue, repo_state=repo_state, max_iterations=1)
 
-    if not env.setup_issue(issue):
+    # The agent must not see the hidden test patch.
+    if not env.setup_issue(issue, apply_test_patch=False):
         return ExecutionResult(
             status=ExecutionStatus.ERROR,
             issue_id=issue.id,

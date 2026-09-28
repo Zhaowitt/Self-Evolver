@@ -1,10 +1,4 @@
-"""
-Focused task variants (Proposal 2.3 failure-driven task generation).
-
-A focused variant keeps the error type but reduces context complexity:
-FAIL_TO_PASS is subset to a single test and the problem statement is
-augmented with that failing test path.
-"""
+"""Focused task variants: FAIL_TO_PASS subset to one test, named in the problem statement."""
 
 from __future__ import annotations
 
@@ -15,7 +9,7 @@ FOCUS_MARKER = "::focus-"
 
 
 def fail_to_pass(instance: dict) -> List[str]:
-    """FAIL_TO_PASS as a list of test paths (handles JSON-string encoding)."""
+    """FAIL_TO_PASS as a list (handles JSON-string encoding)."""
     raw = instance.get("FAIL_TO_PASS")
     if raw is None:
         return []
@@ -45,15 +39,7 @@ def base_instance_id(instance: dict) -> str:
 
 
 def make_focused_variant(instance: dict, n: int = 1) -> Optional[dict]:
-    """
-    Build the n-th focused variant of a base instance, or None when
-    impossible (already a variant, missing id, or fewer than n F2P tests).
-
-    The variant copies every field, keeps the parent's image via
-    ``base_instance_id``, subsets FAIL_TO_PASS to the n-th test (preserving
-    the parent's list/JSON-string encoding), suffixes the instance id with
-    ``::focus-<n>``, and augments the problem statement with the test path.
-    """
+    """n-th focused variant (runs in the parent's image), or None when impossible."""
     instance_id = str(instance.get("instance_id") or "")
     if not instance_id or is_focused_variant(instance):
         return None

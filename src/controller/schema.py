@@ -1,11 +1,4 @@
-"""Schema objects for the deliberately small Controller action.
-
-Schema ``controller_signal_v2`` lets the policy choose at most two canonical
-skills and optionally emit one short strategy.  Historical v1 fields are
-tolerated by :meth:`ControllerSignal.from_dict` but are intentionally ignored:
-execution budget is fixed by the system and failure diagnosis belongs to the
-post-execution reflection path.
-"""
+"""Controller action schema (v2): at most two skills plus a strategy; legacy v1 fields are parsed but ignored."""
 
 from __future__ import annotations
 
@@ -31,7 +24,6 @@ class SkillSignal:
 
     @classmethod
     def from_any(cls, value: Any) -> Optional["SkillSignal"]:
-        """Build a skill signal from a dict, string, object, or None."""
         if value is None:
             return None
         if isinstance(value, SkillSignal):
@@ -80,7 +72,7 @@ class ControllerSignal:
         parse_error: str = "",
     ) -> "ControllerSignal":
         signal = cls(
-            mode=mode if mode in ALLOWED_MODES else "train",
+            mode=mode,
             source=source,
             raw_response=raw_response,
             parse_error=parse_error,
@@ -102,14 +94,9 @@ class ControllerSignal:
         parsed_skills = _parse_skills(data)
         selected_skill_ids = _parse_selected_skill_ids(data, parsed_skills)
         primary_skill = SkillSignal.from_any(data.get("skill"))
-        if primary_skill and not parsed_skills:
-            parsed_skills = [primary_skill]
-        if not primary_skill and parsed_skills:
-            primary_skill = parsed_skills[0]
 
         signal = cls(
-            # Normalize legacy responses onto the active v2 schema.  The raw
-            # response remains available for audit/debugging.
+            # Legacy responses are normalized onto v2; raw_response keeps the original.
             schema_version=CONTROLLER_SCHEMA_VERSION,
             mode=selected_mode,
             skill=primary_skill,

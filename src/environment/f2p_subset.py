@@ -1,9 +1,4 @@
-"""Deterministic, task-specific FAIL_TO_PASS subset selection.
-
-The selector is deliberately independent from patches and test outcomes.  A
-given ``instance_id`` and round therefore produces the same subset for every
-GRPO sample, while a later round can rotate coverage deterministically.
-"""
+"""Deterministic FAIL_TO_PASS subset selection, independent of patches and outcomes."""
 
 from __future__ import annotations
 
@@ -12,11 +7,13 @@ import json
 import re
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Iterable, List, Sequence
+from typing import List, Sequence
 
 
 F2P_SUBSET_POLICY = "stable_hash_v1"
 DEFAULT_F2P_SUBSET_SIZE = 2
+# sympy's ``bin/test -k`` takes a single keyword, so only one test per run.
+REPO_MAX_SUBSET_SIZE = {"sympy__sympy": 1}
 
 
 def parse_test_ids(value: object) -> List[str]:
@@ -50,15 +47,12 @@ def test_scope(test_id: str) -> str:
     if ".py:" in value:
         return value.split(":", 1)[0]
     dotted = value.split(".")
-    # Django/unittest identifiers usually end in Class.method.  Keeping the
-    # module + class spreads a two-test subset across meaningful scopes.
+    # Django/unittest ids end in Class.method; keep module + class as the scope.
     return ".".join(dotted[:-1]) if len(dotted) > 2 else value
 
 
 @dataclass(frozen=True)
 class F2PSubsetSelector:
-    """Select at most ``subset_size`` F2P ids with deterministic diversity."""
-
     subset_size: int = DEFAULT_F2P_SUBSET_SIZE
     policy: str = F2P_SUBSET_POLICY
 
@@ -70,6 +64,8 @@ class F2PSubsetSelector:
     ) -> List[str]:
         tests = parse_test_ids(fail_to_pass)
         size = max(1, int(self.subset_size))
+        repo_key = str(instance_id).rsplit("-", 1)[0]
+        size = min(size, REPO_MAX_SUBSET_SIZE.get(repo_key, size))
         if len(tests) <= size:
             return tests
 
@@ -88,19 +84,6 @@ class F2PSubsetSelector:
         if len(selected) < size:
             selected.extend(item for item in ranked if item not in selected)
         return selected[:size]
-
-
-def select_f2p_subset(
-    fail_to_pass: Iterable[str] | str | object,
-    instance_id: str,
-    round_id: str | int | None = None,
-    subset_size: int = DEFAULT_F2P_SUBSET_SIZE,
-) -> List[str]:
-    return F2PSubsetSelector(subset_size=subset_size).select(
-        fail_to_pass,
-        instance_id=instance_id,
-        round_id=round_id,
-    )
 
 
 def _hash(seed: str, value: str) -> str:

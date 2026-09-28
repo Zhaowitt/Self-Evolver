@@ -1,10 +1,4 @@
-"""
-Task family classification (Proposal 2.3).
-
-Instances are grouped into four families from gold patch statistics
-(#files changed, paths touching setup/config/dependency files) plus issue
-keywords, so the TaskPool can steer sampling per family.
-"""
+"""Task family classification from gold-patch statistics plus issue keywords."""
 
 from __future__ import annotations
 
@@ -117,17 +111,7 @@ def _keyword_hits(text: str, keywords: Iterable[str]) -> int:
 
 
 def classify_family(instance: dict) -> str:
-    """
-    Classify a SWE-bench-style instance dict into one of TASK_FAMILIES.
-
-    Decision cascade (gold patch stats take priority over issue keywords):
-    1. all non-test changed paths are config/dependency files -> config family;
-    2. some config path touched and issue mentions config keywords -> config;
-    3. more than one non-test file changed -> multi-file consistency fix;
-    4. no patch available but issue is strongly config-flavored -> config;
-    5. single-file: behavior-expectation wording outweighing error/traceback
-       wording -> test-aligned behavior fix, otherwise single-file bug fix.
-    """
+    """Gold-patch statistics take priority over issue keywords."""
     text = str(instance.get("problem_statement") or "").lower()
     paths = [path for path in changed_paths(instance.get("patch") or "") if not _is_test_path(path)]
     config_paths = [path for path in paths if _is_config_path(path)]

@@ -1,32 +1,15 @@
-"""Benchmark metrics (Proposal 3.3) from predictions, official reports, and rollouts.
-
-Computes resolved rate, unbiased pass@k across repeated runs, success under a
-fixed iteration budget, cost-to-success (tokens and dollars), hard-case success
-rate, average tokens, and a per-rollout evolution curve. Emits JSON and a
-Markdown table.
-
-CLI::
-
-    python -m src.benchmark.metrics --rollouts run1/rollouts.jsonl run2/rollouts.jsonl \
-        --hard-ids hard_ids.txt --budget 3 --price-per-token 0.0 --output metrics.json
-
-Each ``--rollouts`` file is one run (one sample for pass@k). A ``--report`` file
-(a ``final_summary.json`` or swebench run report) overrides the resolved set for
-the run at the same position. Without ``--rollouts`` a single run is built from
-``--predictions`` + ``--report``.
-"""
+"""Benchmark metrics (resolved rate, pass@k, budget/cost, hard cases, evolution curve) from runs."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import logging
 from dataclasses import dataclass, field
 from math import comb
 from pathlib import Path
 from typing import Dict, List, Optional
 
-logger = logging.getLogger(__name__)
+from src.benchmark.datasets import read_id_file
 
 DEFAULT_WINDOW = 20
 MAX_CURVE_POINTS = 60
@@ -54,17 +37,6 @@ def pass_at_k(n: int, c: int, k: int) -> float:
     if n - c < k:
         return 1.0
     return 1.0 - comb(n - c, k) / comb(n, k)
-
-
-def read_id_file(path: Path) -> set:
-    text = Path(path).read_text(encoding="utf-8").strip()
-    if text.startswith("["):
-        return {str(item) for item in json.loads(text)}
-    return {
-        line.strip()
-        for line in text.splitlines()
-        if line.strip() and not line.strip().startswith("#")
-    }
 
 
 def load_report_resolved(path: Path) -> set:
@@ -109,7 +81,26 @@ def load_rollouts_run(path: Path, report_ids: Optional[set] = None, label: str =
         )
         if record.get("stage") == "train":
             run.train_resolved.append(resolved)
+    _add_missing_predictions(run, Path(path).with_name("predictions.json"), report_ids)
     return run
+
+
+def _add_missing_predictions(run: Run, predictions_path: Path, report_ids: Optional[set]) -> None:
+    """Count predictions without a rollout (setup crashed) as unresolved, like final_summary.json."""
+    if not predictions_path.exists():
+        return
+    try:
+        predictions = json.loads(predictions_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return
+    items = predictions.values() if isinstance(predictions, dict) else predictions
+    for prediction in items:
+        instance_id = prediction.get("instance_id") if isinstance(prediction, dict) else None
+        if instance_id and instance_id not in run.outcomes:
+            run.outcomes[instance_id] = InstanceOutcome(
+                resolved=bool(report_ids and instance_id in report_ids),
+                non_empty=bool(str(prediction.get("model_patch", "")).strip()),
+            )
 
 
 def load_predictions_run(path: Path, report_ids: set, label: str = "") -> Run:
@@ -184,7 +175,10 @@ def _evolution_curve(runs: List[Run], window: int = DEFAULT_WINDOW) -> List[dict
         return []
     stride = max(1, len(events) // MAX_CURVE_POINTS)
     curve: List[dict] = []
-    for index in range(0, len(events), stride):
+    indices = list(range(0, len(events), stride))
+    if indices[-1] != len(events) - 1:
+        indices.append(len(events) - 1)  # the curve must end at the final value
+    for index in indices:
         upto = events[: index + 1]
         window_slice = events[max(0, index - window + 1): index + 1]
         curve.append({

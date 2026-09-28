@@ -1,11 +1,13 @@
-# Execution utility (Proposal 2.6) — single source of truth for reward weights.
-# Loaded by RewardModel.from_config_file (src/reward/reward_model.py); the code
-# defaults are identical for installs without this file.
+# Reward weights loaded by RewardModel.from_config_file; matches the code defaults.
 weights:
   official_resolved: 0.3
   official_f2p_fraction: 0.7
 cost_token_budget: 60000
 token_cost_weight: 0.05
+# Token use below this budget fraction is not penalized.
+token_cost_deadband: 0.5
 contribution_weight: 0.1
 cluster_baseline_min_count: 3
 skill_write_gate: 0.55
+# Invalid Controller JSON; must stay below -(token_cost_weight + contribution_weight).
+format_failure_reward: -0.5

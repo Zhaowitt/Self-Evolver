@@ -1,30 +1,13 @@
-"""Multi-SWE-bench runner.
-
-Multi-SWE-bench (ByteDance-Seed/Multi-SWE-bench) is 1632 issue-resolving tasks
-across 7 non-Python languages (C, C++, Go, Java, JavaScript, Rust, TypeScript).
-Patch generation is benchmark-agnostic — the same Inspector/PatchGenerator loop
-runs, with the Inspector listing source files by the instance's language — so it
-produces a predictions file like any other benchmark. Grading, however, needs
-Multi-SWE-bench's own Docker harness (``multi_swe_bench.harness.run_evaluation``)
-with per-language test runners; this framework does not reimplement that grader,
-so eval writes the harness-ready patch file and then fails loudly with the exact
-command to run rather than emit unverified numbers.
-
-``--dataset full`` selects all 1632 instances; ``--dataset flash`` selects the
-balanced 300-instance subset.
-"""
+"""Multi-SWE-bench runner: generation only; grading is delegated to the official harness."""
 
 from __future__ import annotations
 
 import json
-import logging
 from pathlib import Path
 from typing import Any, Dict
 
 from src.benchmark import datasets
 from src.benchmark.swebench_runner import SWEBenchRunner
-
-logger = logging.getLogger(__name__)
 
 MULTI_OFFICIAL_REPO = "https://github.com/multi-swe-bench/multi-swe-bench"
 
@@ -39,14 +22,14 @@ class MultiSWEBenchRunner(SWEBenchRunner):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.name = "multi_swe_bench"
+        # Host pytest cannot check Go/Rust/Java/... patches.
+        self.in_loop_verification = False
 
     def _dataset_split(self, split: str) -> tuple[str, str]:
         key = "multi_swe_bench_flash" if self.dataset == "flash" else "multi_swe_bench"
         return key, "test"
 
     def _container_backend(self) -> Any:
-        # Multi-language tests run in Multi-SWE-bench's own per-language images;
-        # there is no in-loop container grading here. Generation still runs.
         return None
 
     def _write_harness_patch_file(self, predictions: Dict[str, dict]) -> Path:

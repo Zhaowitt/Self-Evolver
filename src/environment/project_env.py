@@ -1,9 +1,4 @@
-"""
-Project Environment for code repository interaction.
-
-Provides an interface for interacting with code repositories,
-running tests, and applying patches.
-"""
+"""Git repository environment: file access, patch application, and test runs."""
 
 import logging
 import os
@@ -22,30 +17,12 @@ logger = logging.getLogger(__name__)
 
 
 class ProjectEnvironment:
-    """
-    Manages interaction with a code project environment.
-    
-    Provides methods for:
-    - Reading repository state and file contents
-    - Applying and reverting patches
-    - Running tests
-    - Managing git operations
-    """
-    
     def __init__(
         self,
         repo_path: str | Path,
         test_cmd: Optional[str] = None,
         timeout: int = 300,
     ):
-        """
-        Initialize the project environment.
-        
-        Args:
-            repo_path: Path to the repository root.
-            test_cmd: Command to run tests (e.g., "pytest", "python -m pytest").
-            timeout: Timeout in seconds for test execution.
-        """
         self.repo_path = Path(repo_path).resolve()
         self.test_cmd = test_cmd or self._detect_test_cmd()
         self.timeout = timeout
@@ -57,13 +34,11 @@ class ProjectEnvironment:
     
     @property
     def repo(self) -> Repo:
-        """Get the git repository object."""
         if self._repo is None:
             self._repo = Repo(self.repo_path)
         return self._repo
     
     def _detect_test_cmd(self) -> str:
-        """Auto-detect the test command based on project files."""
         if (self.repo_path / "pytest.ini").exists():
             return "pytest"
         if (self.repo_path / "setup.py").exists():
@@ -72,20 +47,18 @@ class ProjectEnvironment:
             return "pytest"
         if (self.repo_path / "tox.ini").exists():
             return "tox"
-        return "pytest"  # Default fallback
+        return "pytest"
     
     def get_repo_state(self) -> RepoState:
-        """Get the current state of the repository."""
         try:
             current_branch = self.repo.active_branch.name
         except TypeError:
-            # Detached HEAD state
+            # Detached HEAD.
             current_branch = "HEAD"
         
         current_commit = self.repo.head.commit.hexsha
         is_dirty = self.repo.is_dirty()
         
-        # Get list of modified files
         modified_files = []
         if is_dirty:
             modified_files = [item.a_path for item in self.repo.index.diff(None)]
@@ -100,18 +73,6 @@ class ProjectEnvironment:
         )
     
     def get_file_content(self, file_path: str) -> str:
-        """
-        Read the content of a file in the repository.
-        
-        Args:
-            file_path: Relative path to the file from repo root.
-            
-        Returns:
-            File content as string.
-            
-        Raises:
-            FileNotFoundError: If file doesn't exist.
-        """
         full_path = self.repo_path / file_path
         if not full_path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
@@ -123,17 +84,7 @@ class ProjectEnvironment:
         start_line: int = 1,
         end_line: Optional[int] = None,
     ) -> str:
-        """
-        Read specific lines from a file.
-        
-        Args:
-            file_path: Relative path to the file.
-            start_line: Starting line number (1-indexed).
-            end_line: Ending line number (inclusive). None means end of file.
-            
-        Returns:
-            Selected lines as string.
-        """
+        """Return lines ``start_line..end_line`` (1-indexed, inclusive)."""
         content = self.get_file_content(file_path)
         lines = content.split("\n")
         
@@ -143,15 +94,6 @@ class ProjectEnvironment:
         return "\n".join(lines[start_idx:end_idx])
     
     def list_files(self, pattern: str = "**/*.py") -> List[str]:
-        """
-        List files matching a pattern.
-        
-        Args:
-            pattern: Glob pattern for matching files.
-            
-        Returns:
-            List of relative file paths.
-        """
         files = []
         for path in self.repo_path.glob(pattern):
             if path.is_file() and ".git" not in str(path):
@@ -160,16 +102,8 @@ class ProjectEnvironment:
     
     @staticmethod
     def _fix_hunk_counts(patch_content: str) -> str:
-        """
-        Recompute and fix the line counts in unified diff hunk headers.
-
-        LLMs frequently generate wrong @@ -X,Y +A,B @@ counts.
-        This function parses each hunk, counts the actual old/new lines,
-        and rewrites the headers so that tools like git-apply accept them.
-        """
+        """Recompute hunk-header line counts, which LLMs frequently get wrong."""
         import re
-        # Capture: old_start, new_start, and optional trailing function hint
-        # e.g.  "@@ -78,6 +78,15 @@ def foo" -> groups: "78", "78", " @@ def foo"
         hunk_header = re.compile(
             r'^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)'
         )
@@ -182,8 +116,7 @@ class ProjectEnvironment:
             if m:
                 old_start = m.group(1)
                 new_start = m.group(2)
-                hint = m.group(3)  # e.g. "" or " def foo"
-                # Collect all lines belonging to this hunk
+                hint = m.group(3)
                 hunk_lines: list[str] = []
                 i += 1
                 while i < len(lines) and not hunk_header.match(lines[i]) \
@@ -206,20 +139,7 @@ class ProjectEnvironment:
         return "".join(output_lines)
 
     def apply_patch_detailed(self, patch_content: str) -> PatchApplyResult:
-        """
-        Apply a unified diff patch to the repository and return diagnostics.
-
-        Attempts multiple strategies in order:
-        1. git apply --ignore-whitespace (standard)
-        2. git apply with fixed hunk counts + --ignore-whitespace
-        3. patch -p1 --fuzz=5 --ignore-whitespace (most lenient)
-
-        Args:
-            patch_content: The patch in unified diff format.
-
-        Returns:
-            PatchApplyResult with success state, strategy, and command diagnostics.
-        """
+        """Apply a diff via git apply, then git apply with fixed hunk counts, then patch --fuzz=5."""
         if not patch_content.strip():
             logger.warning("Empty patch content, nothing to apply")
             return PatchApplyResult(
@@ -228,7 +148,6 @@ class ProjectEnvironment:
                 error_message="Empty patch content",
             )
 
-        # Save original commit for potential rollback
         if self._original_commit is None:
             self._original_commit = self.repo.head.commit.hexsha
 
@@ -242,7 +161,6 @@ class ProjectEnvironment:
                 f.write(patch_content)
                 patch_file = f.name
 
-            # Strategy 1: git apply --ignore-whitespace
             try:
                 stdout = self.repo.git.apply(patch_file, "--ignore-whitespace", "--verbose")
                 logger.info("Patch applied successfully (git apply)")
@@ -262,7 +180,6 @@ class ProjectEnvironment:
                     f"git apply failed, trying fixed hunk counts: {(e.stderr or str(e))[:120]}"
                 )
 
-            # Strategy 2: fix hunk counts then git apply
             fixed_content = self._fix_hunk_counts(patch_content)
             with tempfile.NamedTemporaryFile(
                 mode="w", suffix=".patch", delete=False, encoding="utf-8"
@@ -293,7 +210,6 @@ class ProjectEnvironment:
                     f"{(e.stderr or str(e))[:120]}"
                 )
 
-            # Strategy 3: patch --fuzz=5 --ignore-whitespace (most lenient)
             try:
                 result = subprocess.run(
                     [
@@ -363,22 +279,7 @@ class ProjectEnvironment:
                     except OSError:
                         pass
 
-    def apply_patch(self, patch_content: str) -> bool:
-        """
-        Apply a unified diff patch to the repository.
-
-        Kept as a bool-returning compatibility wrapper around
-        apply_patch_detailed().
-        """
-        return self.apply_patch_detailed(patch_content).success
-    
     def revert_changes(self) -> bool:
-        """
-        Revert all changes in the repository.
-        
-        Returns:
-            True if revert was successful.
-        """
         try:
             self.repo.git.checkout("--", ".")
             self.repo.git.clean("-fd")
@@ -389,15 +290,7 @@ class ProjectEnvironment:
             return False
     
     def reset_to_commit(self, commit: Optional[str] = None) -> bool:
-        """
-        Reset repository to a specific commit.
-        
-        Args:
-            commit: Commit hash to reset to. Uses original commit if None.
-            
-        Returns:
-            True if reset was successful.
-        """
+        """Hard-reset to ``commit`` (default: the original commit)."""
         target = commit or self._original_commit
         if not target:
             logger.warning("No commit specified and no original commit recorded")
@@ -417,16 +310,6 @@ class ProjectEnvironment:
         test_cmd: Optional[str] = None,
         timeout: Optional[int] = None,
     ) -> TestResult:
-        """
-        Run tests in the repository.
-        
-        Args:
-            test_cmd: Test command to run. Uses default if None.
-            timeout: Timeout in seconds. Uses default if None.
-            
-        Returns:
-            TestResult with pass/fail status and output.
-        """
         cmd = test_cmd or self.test_cmd
         timeout = timeout or self.timeout
 
@@ -471,27 +354,32 @@ class ProjectEnvironment:
             )
     
     def get_diff(self) -> str:
-        """
-        Get the current diff of uncommitted changes.
-        
-        Returns:
-            Unified diff string.
-        """
+        """Unstaged diff plus untracked files (the staged test patch is excluded)."""
         try:
-            return self.repo.git.diff()
+            tracked = self.repo.git.diff()
         except GitCommandError:
             return ""
+        # Append untracked files without touching the index, which holds the
+        # staged SWE-bench test patch.
+        parts = [tracked] if tracked.strip() else []
+        try:
+            untracked = self.repo.git.ls_files("--others", "--exclude-standard").splitlines()
+        except GitCommandError:
+            untracked = []
+        for path in sorted(item for item in untracked if item.strip()):
+            # ``--no-index`` exits 1 whenever the files differ (always, here).
+            result = subprocess.run(
+                ["git", "diff", "--no-index", "--", "/dev/null", path],
+                cwd=self.repo_path,
+                capture_output=True,
+                text=True,
+            )
+            text = result.stdout.strip()
+            if result.returncode in (0, 1) and text and "Binary files" not in text:
+                parts.append(text)
+        return "\n".join(parts) + ("\n" if parts else "")
     
     def checkout_commit(self, commit: str) -> bool:
-        """
-        Checkout a specific commit.
-        
-        Args:
-            commit: Commit hash to checkout.
-            
-        Returns:
-            True if checkout was successful.
-        """
         try:
             self.repo.git.checkout(commit)
             self._original_commit = commit
@@ -502,16 +390,6 @@ class ProjectEnvironment:
             return False
     
     def clone_repo(self, url: str, branch: Optional[str] = None) -> bool:
-        """
-        Clone a repository to the repo_path.
-        
-        Args:
-            url: Git URL to clone from.
-            branch: Branch to checkout after clone.
-            
-        Returns:
-            True if clone was successful.
-        """
         try:
             if self.repo_path.exists():
                 import shutil
@@ -530,35 +408,31 @@ class ProjectEnvironment:
             logger.error(f"Failed to clone repository: {e}")
             return False
     
-    def setup_issue(self, issue: Issue) -> bool:
-        """
-        Set up the environment for working on an issue.
-        
-        Args:
-            issue: The issue to work on.
-            
-        Returns:
-            True if setup was successful.
-        """
-        # If base_commit is specified, checkout that commit
+    def setup_issue(self, issue: Issue, apply_test_patch: bool = True) -> bool:
+        """Check out the issue's base commit; ``apply_test_patch`` is for host-side tests only (it exposes hidden F2P tests)."""
+        # Benchmark episodes start clean: a previous staged test patch survives
+        # ``checkout -- .``. A plain `fix` run on a user repo must keep local work.
+        if issue.base_commit or issue.test_patch:
+            try:
+                self.repo.git.reset("--hard")
+                self.repo.git.clean("-fd")
+            except GitCommandError as e:
+                logger.error(f"Failed to clean repository before setup: {e}")
+                return False
+
         if issue.base_commit:
             if not self.checkout_commit(issue.base_commit):
                 return False
         
-        # Apply test patch if provided (for SWE-bench)
-        if issue.test_patch:
+        if issue.test_patch and apply_test_patch:
             test_patch_result = self.apply_patch_detailed(issue.test_patch)
             if not test_patch_result.success:
-                # Without the hidden tests, local verification for this issue
-                # would be meaningless — fail loudly instead of degrading.
                 logger.error(
                     f"Failed to apply test patch: {test_patch_result.diagnostic[:500]}"
                 )
                 self.revert_changes()
                 return False
-            # SWE-bench test patches are needed for local validation but must
-            # not appear in final predictions. Staging them keeps default
-            # `git diff` focused on the agent's later code changes.
+            # Stage the test patch so `git diff` (the prediction) excludes it.
             try:
                 self.repo.git.add("-A")
             except GitCommandError as e:

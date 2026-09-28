@@ -1,22 +1,4 @@
-"""
-Weighted task pool for train-stage task evolution (Proposal 2.3).
-
-The pool holds SWE-bench-style instance dicts and maintains a sampling
-distribution over them:
-
-  weight(i) = exp(-(s_f - 0.5)^2 / (2 * sigma^2))   # family capability boundary
-            * family_boost(f)                        # reflection signal
-            * min(1 + boost_factor * cluster_hits_i, max_instance_boost)
-            * decay_multiplier_i                     # too-hard decay
-
-where s_f is the EMA of resolved outcomes for instance i's family. After
-``too_hard_attempts`` consecutive failures an instance's weight decays by
-``decay_factor`` and a verified focused variant is emitted into the pool.
-
-State is persisted to ``<run_dir>/task_pool.json`` deterministically (no
-timestamps, sorted keys), and all sampling randomness comes from the caller's
-``random.Random`` — so runs are seed-reproducible.
-"""
+"""Weighted task pool for train-stage task evolution; sampling is seed-reproducible."""
 
 from __future__ import annotations
 
@@ -63,6 +45,9 @@ class _InstanceStats:
     stable_cluster_id: str = ""
 
 
+SAMPLING_INELIGIBLE_LABELS = {"environment_failure"}
+
+
 class TaskPool:
     """Evolving sampling distribution over verified benchmark instances."""
 
@@ -106,10 +91,8 @@ class TaskPool:
         config: Optional[TaskEvolutionConfig] = None,
         verifier: Optional[Verifier] = None,
     ) -> "TaskPool":
-        """Build a pool, resuming evolution state from state_path if present."""
+        """Resumes evolution state from state_path if present."""
         return cls(instances, state_path, config=config, verifier=verifier)
-
-    # ------------------------------------------------------------------ pool
 
     def __len__(self) -> int:
         return len(self._instances)
@@ -120,9 +103,6 @@ class TaskPool:
     def get(self, instance_id: str) -> dict:
         return self._instances[instance_id]
 
-    def family_of(self, instance_id: str) -> str:
-        return self._stats[instance_id].family
-
     def unseen_instance_ids(self) -> List[str]:
         """U = tasks with no observed rollout attempts."""
         return sorted(
@@ -130,30 +110,39 @@ class TaskPool:
         )
 
     def observed_failure_groups(self) -> Dict[str, List[str]]:
-        """F = observed failures that have an actual post-execution label."""
+        """F = labeled observed failures; infra-only labels are excluded (replaying them trains no repair)."""
         groups: Dict[str, List[str]] = {}
         for instance_id, stats in self._stats.items():
             if stats.attempts <= 0 or stats.last_resolved is not False:
                 continue
             if not stats.observed_failure_label:
                 continue
+            if stats.observed_failure_label in SAMPLING_INELIGIBLE_LABELS:
+                continue
             groups.setdefault(stats.observed_failure_label, []).append(instance_id)
         return {label: sorted(ids) for label, ids in sorted(groups.items())}
 
+    def failure_gap_counts(self) -> Dict[str, int]:
+        """Recent failed-rollout mass per eligible label (the quota "gap")."""
+        return {
+            label: sum(max(1, self._stats[instance_id].consecutive_failures) for instance_id in ids)
+            for label, ids in self.observed_failure_groups().items()
+        }
+
+    def attempts_of(self, instance_id: str) -> int:
+        return self._stats[instance_id].attempts
+
+    def last_resolved_of(self, instance_id: str) -> Optional[bool]:
+        return self._stats[instance_id].last_resolved
+
     def stable_cluster_id_of(self, instance_id: str) -> str:
         return self._stats[instance_id].stable_cluster_id
-
-    # --------------------------------------------------------------- weights
 
     def family_weight(self, family: str) -> float:
         """Capability-boundary weight: peaks at success EMA 0.5."""
         stats = self._families[family]
         sigma = self.config.boundary_sigma
         return math.exp(-((stats.success_ema - 0.5) ** 2) / (2.0 * sigma * sigma))
-
-    def weights(self) -> Dict[str, float]:
-        """Current unnormalized sampling weight per instance id."""
-        return {instance_id: self._weight(instance_id) for instance_id in self._instances}
 
     def _weight(self, instance_id: str) -> float:
         stats = self._stats[instance_id]
@@ -168,15 +157,8 @@ class TaskPool:
             * stats.decay_multiplier
         )
 
-    # -------------------------------------------------------------- sampling
-
     def sample(self, n: int, rng: random.Random) -> List[dict]:
-        """
-        Draw up to n distinct instances, weighted, without replacement.
-
-        All randomness comes from ``rng``: identical pool state + seed yields
-        identical samples.
-        """
+        """Draw up to n distinct instances, weighted, without replacement."""
         if n <= 0:
             return []
         candidates = list(self._instances)
@@ -199,24 +181,6 @@ class TaskPool:
             weights.pop(index)
         return [self._instances[instance_id] for instance_id in chosen]
 
-    def sample_with_replacement(self, n: int, rng: random.Random) -> List[dict]:
-        """Draw ``n`` weighted instances, allowing repeats.
-
-        GRPO consumes a frozen JSONL rather than this live pool. Sampling with
-        replacement materializes the pool's distribution into a fixed-size,
-        reproducible next-round dataset without modifying EasyR1's sampler.
-        """
-        if n <= 0 or not self._instances:
-            return []
-        candidates = list(self._instances)
-        weights = [self._weight(instance_id) for instance_id in candidates]
-        if sum(weights) <= 0.0:
-            return [self._instances[rng.choice(candidates)] for _ in range(n)]
-        chosen = rng.choices(candidates, weights=weights, k=n)
-        return [self._instances[instance_id] for instance_id in chosen]
-
-    # -------------------------------------------------------------- outcomes
-
     def record_outcome(
         self,
         instance_id: str,
@@ -225,14 +189,7 @@ class TaskPool:
         observed_failure_label: str = "",
         stable_cluster_id: str = "",
     ) -> Optional[str]:
-        """
-        Record one rollout outcome and update the sampling distribution.
-
-        Updates the family success EMA and per-instance stats; after
-        ``too_hard_attempts`` consecutive failures the instance decays by
-        ``decay_factor`` and a verified focused variant is emitted into the
-        pool. Returns the emitted variant's instance_id, if any.
-        """
+        """Returns the id of a focused variant emitted after too many consecutive failures, if any."""
         if instance_id not in self._stats:
             raise KeyError(f"record_outcome for unknown instance: {instance_id}")
         alpha = self.config.ema_alpha
@@ -285,9 +242,7 @@ class TaskPool:
             return None
         if self.verifier is None:
             logger.warning(
-                "No task verifier configured; focused variant %s not admitted "
-                "(Proposal 2.7.1: only verified tasks enter the pool)",
-                variant_id,
+                "No task verifier configured; focused variant %s not admitted", variant_id
             )
             return None
         ok, reason = self.verifier(variant)
@@ -300,26 +255,10 @@ class TaskPool:
         logger.info("Focused variant %s admitted to pool (%s)", variant_id, reason)
         return variant_id
 
-    # ------------------------------------------------------------ reflection
-
     def apply_reflection(self, signals: dict) -> None:
-        """
-        Apply Reflector task-level signals.
-
-        Schema::
-
-            {
-              "instance_boosts": {instance_id: cluster_hits_int, ...},
-              "family_boosts": {family: multiplier_float, ...},
-            }
-
-        cluster_hits and family multipliers are SET (idempotent per
-        reflection cycle), not accumulated. Unknown ids/families are logged
-        and skipped.
-        """
-        # Each reflection report describes the complete signal for the next
-        # cycle. Clear stale boosts before applying it so old clusters do not
-        # remain overweight forever when a state file is reused.
+        """Boosts are SET, not accumulated, so each reflection cycle is idempotent."""
+        # Each report is the complete signal: clear stale boosts so old clusters
+        # do not stay overweight when a state file is reused.
         for stats in self._stats.values():
             stats.cluster_hits = 0
         for family in self._families.values():
@@ -343,15 +282,12 @@ class TaskPool:
             if instance_id in self._stats and str(cluster_id).strip():
                 self._stats[instance_id].stable_cluster_id = str(cluster_id).strip()
 
-    # ----------------------------------------------------------- persistence
-
     def save(self) -> Path:
-        """Atomically persist evolution state as deterministic JSON."""
+        """Atomic, deterministic JSON."""
         state = {
             "schema_version": _STATE_SCHEMA_VERSION,
-            # Persist the source pool so post-GRPO outcome ingestion can resume
-            # state even though the frozen weighted JSONL may contain repeats
-            # and omit some base instances.
+            # Post-GRPO ingestion resumes from this: the frozen JSONL may repeat
+            # or omit base instances.
             "base_instances": {
                 instance_id: instance
                 for instance_id, instance in self._instances.items()

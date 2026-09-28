@@ -23,7 +23,7 @@ def read_round_hard_cases(path: Path, start_offset: int) -> list[HardCaseRecord]
     with path.open("r", encoding="utf-8") as stream:
         stream.seek(offset)
         # A caller-provided offset may point into a line; discard that fragment.
-        if offset and stream.tell() != 0:
+        if offset:
             stream.seek(offset - 1)
             if stream.read(1) != "\n":
                 stream.readline()
@@ -46,7 +46,6 @@ def reflect_after_grpo(
     min_cluster_size: int = 3,
     reflector: Optional[Reflector] = None,
 ) -> dict[str, Any]:
-    """Reflect once over this GRPO round and persist an auditable report."""
     records = read_round_hard_cases(hard_cases_path, start_offset)
     active_reflector = reflector or Reflector(
         buffer_path=hard_cases_path,

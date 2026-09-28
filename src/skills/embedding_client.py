@@ -7,28 +7,15 @@ import math
 import os
 import re
 from collections import Counter
-from typing import Callable, Iterable, List, Optional
+from typing import Iterable, List, Optional
 
 logger = logging.getLogger(__name__)
 
 
 class EmbeddingClient:
-    """Embeddings from an injected function or an OpenAI-compatible /embeddings endpoint.
+    """Embeddings from an OpenAI-compatible endpoint; None when unavailable."""
 
-    Configure the endpoint via env: EMBEDDING_MODEL (required), EMBEDDING_BASE_URL
-    (falls back to OPENAI_BASE_URL), EMBEDDING_API_KEY (falls back to OPENAI_API_KEY).
-    When embeddings are unavailable, methods return None so callers can fall back to
-    `local_text_similarity`.
-    """
-
-    def __init__(
-        self,
-        embed_fn: Optional[Callable[[str], List[float]]] = None,
-        model: str = "",
-        base_url: Optional[str] = None,
-        api_key: str = "",
-    ):
-        self.embed_fn = embed_fn
+    def __init__(self, model: str = "", base_url: Optional[str] = None, api_key: str = ""):
         self.model = model
         self.base_url = base_url
         self.api_key = api_key
@@ -51,8 +38,6 @@ class EmbeddingClient:
         text_list = list(texts)
         if not text_list:
             return []
-        if self.embed_fn:
-            return [list(self.embed_fn(text)) for text in text_list]
         if not self.model:
             return None
         try:
@@ -66,10 +51,6 @@ class EmbeddingClient:
         except Exception as exc:
             logger.warning(f"Embedding request failed ({exc}); falling back to lexical similarity")
             return None
-
-    def embed(self, text: str) -> Optional[List[float]]:
-        vectors = self.embed_many([text])
-        return vectors[0] if vectors else None
 
     def similarity(self, left: str, right: str) -> Optional[float]:
         vectors = self.embed_many([left, right])

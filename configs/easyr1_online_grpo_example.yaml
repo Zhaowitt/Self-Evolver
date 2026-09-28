@@ -1,5 +1,4 @@
-# One-A100 EasyR1 GRPO configuration for the Self-Evolver Controller.
-# scripts/run_rl_controller.sh supplies absolute train/validation/reward paths.
+# One-A100 EasyR1 GRPO config for the Controller; scripts/tools/grpo_round.sh supplies absolute paths.
 data:
   train_files: data/controller_train.jsonl
   val_files: data/controller_val.jsonl
@@ -7,7 +6,9 @@ data:
   answer_key: ground_truth
   max_prompt_length: 12288
   max_response_length: 1024
-  rollout_batch_size: 4
+  # 2 prompts x 6 samples = 12 rollouts/step: at ~10% resolve, 6 samples give
+  # far more groups with outcome variance than 3.
+  rollout_batch_size: 2
   mini_rollout_batch_size: null
   val_batch_size: 2
   format_prompt: null
@@ -17,7 +18,8 @@ data:
   filter_overlong_prompts_workers: 8
 
 algorithm:
-  adv_estimator: grpo
+  # RLOO: GRPO's std normalization inflates token-cost noise in all-failed groups.
+  adv_estimator: rloo
   disable_kl: false
   use_kl_loss: true
   kl_penalty: low_var_kl
@@ -26,7 +28,7 @@ algorithm:
 
 worker:
   actor:
-    global_batch_size: 4
+    global_batch_size: 2
     micro_batch_size_per_device_for_update: 1
     micro_batch_size_per_device_for_experience: 1
     max_grad_norm: 1.0
@@ -34,8 +36,7 @@ worker:
     dynamic_batching: true
     ulysses_size: 1
     model:
-      # Portable default. CONTROLLER_MODEL_PATH can override this with either
-      # another Hugging Face ID or a cluster-local snapshot path.
+      # Overridden by CONTROLLER_MODEL_PATH (HF id or local snapshot).
       model_path: Qwen/Qwen3.5-4B
       enable_gradient_checkpointing: true
       trust_remote_code: false
@@ -44,7 +45,8 @@ worker:
         alpha: 32
         target_modules: all-linear
     optim:
-      lr: 1.0e-6
+      # LoRA needs a larger step than full fine-tuning; 1e-6 barely moves in 64 steps.
+      lr: 1.0e-5
       weight_decay: 1.0e-2
       strategy: adamw_bf16
       lr_warmup_ratio: 0.03
@@ -58,12 +60,11 @@ worker:
       offload_optimizer: false
 
   rollout:
-    n: 3
+    n: 6
     temperature: 1.0
     top_p: 1.0
     limit_images: 0
-    # Reserve a bounded fraction of an 80 GiB A100 for the colocated vLLM
-    # rollout engine while the FSDP actor remains resident on the same GPU.
+    # Colocated vLLM shares the 80 GiB A100 with the resident FSDP actor.
     gpu_memory_utilization: 0.2
     enforce_eager: true
     enable_chunked_prefill: true
@@ -74,7 +75,8 @@ worker:
     val_override_config:
       temperature: 0.6
       top_p: 0.95
-      n: 1
+      # Two samples per task halve validation variance.
+      n: 2
 
   ref:
     fsdp:
@@ -83,8 +85,7 @@ worker:
       enable_rank0_init: true
       torch_dtype: bf16
     offload:
-      # LoRA reuses the actor module as the reference model in EasyR1.
-      # Keep the shared module on GPU when using the unmodified EasyR1 worker.
+      # EasyR1 LoRA reuses the actor as reference: keep it on GPU.
       offload_params: false
 
   reward:
@@ -100,9 +101,10 @@ trainer:
   nnodes: 1
   n_gpus_per_node: 1
   max_try_make_batch: 20
-  # Full official validation once at the 64-step round boundary.
+  # Validate once per 64-step round.
   val_freq: 64
-  val_before_train: false
+  # scripts/5_grpo.sh keeps this only for round 1.
+  val_before_train: true
   val_generations_to_log: 2
   save_freq: 4
   save_limit: 3

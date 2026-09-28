@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import re
 import shutil
 from datetime import datetime
@@ -21,17 +22,12 @@ _ARCHIVE_REV_RE = re.compile(r"_rev\d+_\d{8,14}$")
 
 
 class SkillStore:
-    """Load, update, archive, and persist skills in the skills directory.
-
-    Public mutators (`credit_skills`, `write_skill`, `deprecate_skill`,
-    `retire_skills`) serialize concurrent read-modify-write cycles through an
-    fcntl lock on `metadata.json`; read helpers and `save_metadata` are
-    lock-free and must only be combined by those mutators.
-    """
+    """Skill files plus metadata.json; mutators hold the metadata lock, read helpers and save_metadata do not."""
 
     def __init__(self, skills_dir: Optional[Path] = None, metadata_path: Optional[Path] = None):
-        repo_root = Path(__file__).resolve().parents[2]
-        self.skills_dir = Path(skills_dir or repo_root / "skills")
+        from src.skills.skill_bank import default_skills_dir
+
+        self.skills_dir = Path(skills_dir or default_skills_dir())
         self.metadata_path = Path(metadata_path or self.skills_dir / "metadata.json")
         self.archive_dir = self.skills_dir / "_archive"
 
@@ -40,8 +36,12 @@ class SkillStore:
             return {}
         try:
             data = json.loads(self.metadata_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            return {}
+        except json.JSONDecodeError as exc:
+            # Returning {} would let the next write silently erase all other stats.
+            raise RuntimeError(
+                f"corrupt skill metadata {self.metadata_path}: {exc}; restore it from "
+                "the round snapshot before continuing"
+            ) from exc
         if isinstance(data, list):
             return {"skills": {str(item.get("id", "")): item for item in data if item.get("id")}}
         if isinstance(data, dict):
@@ -132,12 +132,7 @@ class SkillStore:
         contribution: Optional[float] = None,
         skill_set_key: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        """Record joint skill-set contribution.
-
-        ``contribution`` is the cluster-relative signal computed by RewardModel.
-        The legacy global EMA path remains readable for old callers, but the
-        training path always supplies the explicit frozen-baseline value.
-        """
+        """Record joint skill-set credit; without ``contribution``, fall back to the global EMA baseline."""
         normalized_ids = [slug(skill_id) for skill_id in skill_ids if slug(skill_id)]
         with file_lock(self.metadata_path):
             stats = self.load_metadata()
@@ -216,9 +211,6 @@ class SkillStore:
             self.save_metadata(stats)
         return existing
 
-    def deprecate_skill(self, skill_id: str, reason: str = "") -> SkillStats:
-        return self._set_status(skill_id, status="deprecated", event="deprecated", reason=reason)
-
     def retire_skills(self, skill_ids: Iterable[str], reason: str = "") -> List[SkillStats]:
         """Mark skills as retired (net-success retirement / active-cap eviction)."""
         normalized_ids = [slug(skill_id) for skill_id in skill_ids if slug(skill_id)]
@@ -236,22 +228,22 @@ class SkillStore:
             self.save_metadata(stats)
         return retired
 
-    def _set_status(self, skill_id: str, status: str, event: str, reason: str = "") -> SkillStats:
-        normalized_id = slug(skill_id)
-        with file_lock(self.metadata_path):
-            stats = self.load_metadata()
-            item = stats.get(normalized_id) or SkillStats(id=normalized_id)
-            item.status = status
-            item.record_event(event, reason=reason)
-            stats[normalized_id] = item
-            self.save_metadata(stats)
-        return item
-
     @staticmethod
     def _atomic_write(path: Path, content: str) -> None:
-        tmp_path = path.with_suffix(path.suffix + ".tmp")
-        tmp_path.write_text(content, encoding="utf-8")
-        os.replace(tmp_path, path)
+        # Unique temp per writer, fsync before rename: a crash never leaves a truncated file.
+        fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_name, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
 
 
 def normalize_skill_markdown(

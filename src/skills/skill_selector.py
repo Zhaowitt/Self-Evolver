@@ -49,6 +49,24 @@ class SkillSelector:
         fallback = self.skill_bank.get("inspect_before_editing") or skills[0]
         return [fallback]
 
+    def select_candidates(
+        self,
+        memory_query: str = "",
+        limit: int = 6,
+        target_failure_type: str = "",
+    ) -> List[SkillMetadata]:
+        """Ranked skills padded with distractors to ``min(limit, active)`` so the Controller has a choice."""
+        skills = self.skill_bank.active()
+        if not skills or limit <= 0:
+            return []
+        target = normalize_failure_type(target_failure_type, default="")
+        query_terms = _query_terms(memory_query)
+        ranked = sorted(
+            skills,
+            key=lambda skill: (-_score(skill, target, query_terms), skill.id),
+        )
+        return ranked[:limit]
+
 
 def _score(skill: SkillMetadata, target: str, query_terms: set[str]) -> float:
     score = 0.0

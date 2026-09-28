@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
-from typing import Iterable, Mapping, Optional
+from typing import Dict, Iterable, List, Mapping, Optional
 
 from src.environment.models import Issue
+
+# EasyR1 sends the dataset prompt as one user turn; SFT and served eval must
+# render the same single turn or train and eval inputs diverge.
+CONTROLLER_PROMPT_FORMAT = "single_user_turn_v1"
+MAX_CANDIDATE_SKILLS = 6
 
 
 CONTROLLER_SYSTEM_PROMPT = """You are a Controller for a repository-level code repair worker.
@@ -30,7 +36,7 @@ RULES:
 
 EXAMPLE:
 {
-  "selected_skill_ids": ["inspect_before_editing", "failure_localization"],
+  "selected_skill_ids": ["<candidate_id_1>", "<candidate_id_2>"],
   "strategy": "Trace the focused failure to the smallest causal region before generating a minimal patch."
 }
 """
@@ -42,6 +48,36 @@ class ControllerPromptBuilder:
     @property
     def system_prompt(self) -> str:
         return CONTROLLER_SYSTEM_PROMPT
+
+    def build_prompt_text(
+        self,
+        issue: Issue,
+        mode: str = "train",
+        skills: Optional[Iterable[Mapping[str, object]]] = None,
+        hard_cases: Optional[Iterable[Mapping[str, object]]] = None,
+    ) -> str:
+        """Render the canonical single-turn Controller prompt (GRPO/SFT/eval)."""
+        user_prompt = self.build_user_prompt(
+            issue, mode=mode, skills=skills, hard_cases=hard_cases
+        )
+        return f"{CONTROLLER_SYSTEM_PROMPT.strip()}\n\n{user_prompt}"
+
+    def build_messages(
+        self,
+        issue: Issue,
+        mode: str = "train",
+        skills: Optional[Iterable[Mapping[str, object]]] = None,
+        hard_cases: Optional[Iterable[Mapping[str, object]]] = None,
+    ) -> List[Dict[str, str]]:
+        """Chat messages equal to what EasyR1 builds from ``build_prompt_text``."""
+        return [
+            {
+                "role": "user",
+                "content": self.build_prompt_text(
+                    issue, mode=mode, skills=skills, hard_cases=hard_cases
+                ),
+            }
+        ]
 
     def build_user_prompt(
         self,
@@ -61,8 +97,9 @@ class ControllerPromptBuilder:
                     "repo_name": issue.repo_name,
                     "base_commit": issue.base_commit,
                     "hints_present": bool(issue.hints),
-                    "fail_to_pass": issue.metadata.get("fail_to_pass"),
-                    "pass_to_pass": issue.metadata.get("pass_to_pass"),
+                    # Test names are grading labels: exposing them leaks eval
+                    # tests and can exceed the prompt length limit.
+                    "fail_to_pass_count": len(_test_ids(issue.metadata.get("fail_to_pass"))),
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -72,10 +109,10 @@ class ControllerPromptBuilder:
         if issue.hints:
             parts.extend(["## Hints", issue.hints[:1500]])
 
-        skill_items = list(skills or [])
+        skill_items = order_candidate_skills(issue.id, list(skills or [])[:MAX_CANDIDATE_SKILLS])
         if skill_items:
             parts.append("## Candidate Skills")
-            for skill in skill_items[:6]:
+            for skill in skill_items:
                 parts.append(
                     json.dumps(
                         {
@@ -114,3 +151,26 @@ class ControllerPromptBuilder:
         parts.append("## Output")
         parts.append("Return the ControllerSignal JSON only.")
         return "\n\n".join(parts)
+
+
+def order_candidate_skills(
+    instance_id: str,
+    skills: List[Mapping[str, object]],
+) -> List[Mapping[str, object]]:
+    """Stable per-instance order, so the policy cannot learn "pick the top-ranked two"."""
+    def key(skill: Mapping[str, object]) -> str:
+        seed = f"{instance_id}\0{skill.get('id', '')}".encode("utf-8")
+        return hashlib.sha256(seed).hexdigest()
+
+    return sorted(skills, key=key)
+
+
+def _test_ids(raw: object) -> List[str]:
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            return [line for line in raw.splitlines() if line.strip()]
+    if isinstance(raw, (list, tuple)):
+        return [str(item) for item in raw if str(item).strip()]
+    return []

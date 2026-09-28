@@ -8,12 +8,15 @@ import os
 import random
 from collections import Counter, defaultdict
 from dataclasses import replace
-from math import ceil
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional
 
-from src.config import get_config
-from src.controller.prompt_builder import ControllerPromptBuilder
+from src.benchmark.datasets import load_split, read_id_file, validate_split
+from src.controller.prompt_builder import (
+    CONTROLLER_PROMPT_FORMAT,
+    MAX_CANDIDATE_SKILLS,
+    ControllerPromptBuilder,
+)
 from src.environment.models import Issue
 from src.environment.f2p_subset import F2P_SUBSET_POLICY, F2PSubsetSelector
 from src.memory.hard_case_buffer import resolve_hard_cases_path
@@ -21,28 +24,6 @@ from src.memory.memory_retriever import MemoryRetriever
 from src.rl.online_rollout_runner import build_targeted_test_cmd
 from src.skills.skill_selector import SkillSelector
 from src.tasks.task_pool import TaskPool
-
-
-DATASET_MAP = {
-    "lite": "princeton-nlp/SWE-bench_Lite",
-    "verified": "princeton-nlp/SWE-bench_Verified",
-    "full": "SWE-bench/SWE-bench",
-}
-
-# HF splits actually shipped per dataset; only `full` has a train split.
-DATASET_SPLITS = {
-    "lite": ("dev", "test"),
-    "verified": ("test",),
-    "full": ("train", "dev", "test"),
-}
-
-# save_to_disk layouts under $SWEBENCH_DATA_DIR (default <repo>/benchmarks).
-# swe_bench_full_train holds only the train split of the full dataset.
-LOCAL_DATASET_DIRS = {
-    "lite": "swe_bench_lite",
-    "verified": "swe_bench_verified",
-    "full": "swe_bench_full_train",
-}
 
 
 def build_easyr1_prompt_record(
@@ -57,24 +38,15 @@ def build_easyr1_prompt_record(
 ) -> Dict[str, Any]:
     """Build one EasyR1 JSONL record with the real Controller prompt."""
     prompt_builder = prompt_builder or ControllerPromptBuilder()
-    candidate_skills = (skill_selector or SkillSelector()).select_many(
-        memory_query=issue.description,
-        limit=6,
-    )
-    hard_case_items = list(hard_cases or retrieve_hard_cases(issue))
+    candidate_skills = controller_candidate_skills(issue, skill_selector or SkillSelector())
+    hard_case_items = list(hard_cases if hard_cases is not None else retrieve_hard_cases(issue))
     skill_payloads = [skill.to_dict() for skill in candidate_skills]
-    messages = [
-        {"role": "system", "content": prompt_builder.system_prompt},
-        {
-            "role": "user",
-            "content": prompt_builder.build_user_prompt(
-                issue,
-                mode=stage,
-                skills=skill_payloads,
-                hard_cases=hard_case_items,
-            ),
-        },
-    ]
+    prompt_text = prompt_builder.build_prompt_text(
+        issue,
+        mode=stage,
+        skills=skill_payloads,
+        hard_cases=hard_case_items,
+    )
     ground_truth = issue_to_ground_truth(issue)
     round_id = str(issue.metadata.get("round_id") or os.getenv("SELF_EVOLVER_ROUND_ID") or "0")
     train_subset = F2PSubsetSelector().select(
@@ -83,9 +55,7 @@ def build_easyr1_prompt_record(
     ground_truth["TRAIN_FAIL_TO_PASS_SUBSET"] = train_subset
     ground_truth["F2P_SUBSET_POLICY"] = F2P_SUBSET_POLICY
     ground_truth["round_id"] = round_id
-    # EasyR1's batch reward input does not reliably preserve arbitrary
-    # ``extra_info`` fields. Keep the lifecycle boundary in ground_truth too so
-    # validation can never be mistaken for train-time skill evolution.
+    # Also top-level in ground_truth: validation must never be taken for training.
     ground_truth["stage"] = stage
     ground_truth["split"] = split
     ground_truth["allowed_skill_ids"] = [skill.id for skill in candidate_skills]
@@ -101,16 +71,30 @@ def build_easyr1_prompt_record(
         "TRAIN_FAIL_TO_PASS_SUBSET": train_subset,
         "F2P_SUBSET_POLICY": F2P_SUBSET_POLICY,
         "round_id": round_id,
+        "prompt_format": CONTROLLER_PROMPT_FORMAT,
     }
+    # EasyR1 passes only response / response_length / ground_truth to the
+    # reward function; extra_info must travel inside ground_truth to arrive.
+    ground_truth["extra_info"] = dict(extra_info)
     return {
-        "prompt": json.dumps(messages, ensure_ascii=False),
+        # Plain text: EasyR1 wraps it as the single user message itself.
+        "prompt": prompt_text,
         "ground_truth": json.dumps(ground_truth, ensure_ascii=False),
         "extra_info": extra_info,
     }
 
 
+def controller_candidate_skills(issue: Issue, skill_selector: SkillSelector) -> list:
+    """Single candidate-set rule shared by GRPO/SFT prompts and served eval."""
+    # Failure-replay tasks rank skills targeting their observed failure first.
+    return skill_selector.select_candidates(
+        memory_query=issue.description,
+        limit=MAX_CANDIDATE_SKILLS,
+        target_failure_type=str(issue.metadata.get("observed_failure_label") or ""),
+    )
+
+
 def issue_to_ground_truth(issue: Issue) -> Dict[str, Any]:
-    """Serialize the SWE-bench fields required by the online reward function."""
     return {
         "instance_id": issue.id,
         "repo_name": issue.repo_name,
@@ -146,10 +130,8 @@ def write_swebench_prompt_dataset(
 ) -> int:
     """Write a JSONL dataset of Controller prompts for EasyR1; returns row count."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    # TaskPool must see the complete eligible source split.  Applying
-    # ``num_instances`` here used to truncate full/test before sampling; because
-    # SWE-bench rows are repository-grouped, NUM_TRAIN=320 silently restricted
-    # the pool to Astropy and Django.
+    # TaskPool must see the full eligible split: rows are repository-grouped, so
+    # truncating before sampling would restrict the pool to the first repos.
     pool_sampling = stage == "train" and bool(task_pool_state_path)
     issues = list(
         iter_swebench_issues(
@@ -160,19 +142,16 @@ def write_swebench_prompt_dataset(
             include_ids=include_ids,
         )
     )
-    if stage == "train" and task_pool_state_path:
-        pool = _task_pool_for_issues(issues, task_pool_state_path)
-        if task_signals:
-            pool.apply_reflection(task_signals)
-        issues = _issues_from_pool_sample(
+    if pool_sampling:
+        issues = sample_issues_with_task_pool(
             issues,
-            pool,
+            task_signals or {},
+            task_pool_state_path,
             sampling_seed,
             num_samples=num_instances,
             uniform_fraction=task_pool_uniform_fraction,
             max_instance_repeats=max_instance_repeats,
         )
-        pool.save()
     count = 0
     with output_path.open("w", encoding="utf-8") as out:
         for issue in issues:
@@ -201,7 +180,8 @@ def sample_issues_with_task_pool(
     if not issues:
         return []
     pool = _task_pool_for_issues(issues, state_path)
-    pool.apply_reflection(task_signals)
+    if task_signals:
+        pool.apply_reflection(task_signals)
     result = _issues_from_pool_sample(
         issues,
         pool,
@@ -248,6 +228,8 @@ def _issues_from_pool_sample(
         return []
 
     rng = random.Random(seed)
+    if os.getenv("SELF_EVOLVER_SAMPLING_MODE", "u_f").strip() == "legacy":
+        return _legacy_pool_sample(issues, pool, rng, target, uniform_fraction, max_instance_repeats)
     unseen_ids = [instance_id for instance_id in pool.unseen_instance_ids() if instance_id in by_id]
     failure_groups = {
         label: [instance_id for instance_id in ids if instance_id in by_id]
@@ -271,33 +253,45 @@ def _issues_from_pool_sample(
         by_id,
         max_instance_repeats,
         rng,
+        gap_counts=pool.failure_gap_counts(),
     )
     for instance_id, label in replay_ids:
         chosen.append((instance_id, "observed_failure_replay", label))
         counts[instance_id] += 1
 
-    # Explicit fallback when U or F cannot fill its half. Prefer the other
-    # valid pool, then the complete eligible set, always respecting repeat cap.
+    # Backfill order: unseen, lowest-attempt unresolved, then anything eligible;
+    # resolved tasks are a last resort.
     label_by_id = {
         instance_id: label for label, ids in failure_groups.items() for instance_id in ids
     }
-    while len(chosen) < target:
-        candidates = [
+    unresolved = sorted(
+        (
             instance_id
-            for instance_id in [*unseen_ids, *label_by_id, *sorted(by_id)]
-            if counts[instance_id] < max_instance_repeats
-        ]
-        candidates = list(dict.fromkeys(candidates))
-        if not candidates:
-            raise RuntimeError("TaskPool repeat cap exhausted before sample was full")
-        selected = rng.choice(candidates)
-        if selected in unseen_ids:
-            source, label = "unseen_random_fallback", ""
-        elif selected in label_by_id:
-            source, label = "observed_failure_replay_fallback", label_by_id[selected]
+            for instance_id in by_id
+            if pool.attempts_of(instance_id) > 0 and pool.last_resolved_of(instance_id) is False
+        ),
+        key=lambda instance_id: (pool.attempts_of(instance_id), instance_id),
+    )
+    tiers = [
+        ("unseen_random_fallback", unseen_ids),
+        ("observed_failure_replay_fallback", unresolved),
+        ("eligible_pool_fallback", sorted(by_id)),
+    ]
+    while len(chosen) < target:
+        for source, pool_ids in tiers:
+            candidates = [
+                instance_id for instance_id in pool_ids if counts[instance_id] < max_instance_repeats
+            ]
+            if candidates:
+                break
         else:
-            source, label = "eligible_pool_fallback", ""
-        chosen.append((selected, source, label))
+            raise RuntimeError("TaskPool repeat cap exhausted before sample was full")
+        if source == "observed_failure_replay_fallback":
+            # Keep the lowest-attempt preference but randomize among ties.
+            lowest = pool.attempts_of(candidates[0])
+            candidates = [c for c in candidates if pool.attempts_of(c) == lowest]
+        selected = rng.choice(candidates)
+        chosen.append((selected, source, label_by_id.get(selected, "")))
         counts[selected] += 1
 
     rng.shuffle(chosen)
@@ -314,6 +308,48 @@ def _issues_from_pool_sample(
     return result
 
 
+def _legacy_pool_sample(
+    issues: List[Issue],
+    pool: TaskPool,
+    rng: random.Random,
+    target: int,
+    uniform_fraction: float,
+    max_instance_repeats: int,
+) -> List[Issue]:
+    """Ablation arm: repo-balanced uniform half plus a half weighted by TaskPool family/boost weights."""
+    by_id = {issue.id: issue for issue in issues}
+    counts: Counter = Counter()
+    chosen: List[tuple[str, str]] = []
+    uniform_target = round(target * uniform_fraction)
+    for instance_id in _repo_balanced_ids(issues, min(uniform_target, len(by_id)), rng):
+        chosen.append((instance_id, "legacy_uniform"))
+        counts[instance_id] += 1
+    while len(chosen) < target:
+        draw = [
+            item["instance_id"]
+            for item in pool.sample(target - len(chosen), rng)
+            if item["instance_id"] in by_id and counts[item["instance_id"]] < max_instance_repeats
+        ]
+        if not draw:
+            raise RuntimeError("TaskPool repeat cap exhausted before sample was full")
+        for instance_id in draw[: target - len(chosen)]:
+            chosen.append((instance_id, "legacy_weighted"))
+            counts[instance_id] += 1
+    rng.shuffle(chosen)
+    return [
+        replace(
+            by_id[instance_id],
+            metadata={
+                **by_id[instance_id].metadata,
+                "sampling_source": source,
+                "observed_failure_label": "",
+                "stable_cluster_id": pool.stable_cluster_id_of(instance_id),
+            },
+        )
+        for instance_id, source in chosen
+    ]
+
+
 def _failure_balanced_ids(
     groups: Dict[str, List[str]],
     target: int,
@@ -321,48 +357,95 @@ def _failure_balanced_ids(
     by_id: Dict[str, Issue],
     repeat_cap: int,
     rng: random.Random,
-    label_fraction_cap: float = 0.5,
+    label_fraction_cap: float = 0.4,
+    gap_counts: Optional[Dict[str, int]] = None,
 ) -> List[tuple[str, str]]:
-    """Allocate label quotas first, then draw repo-balanced within each label."""
+    """Gap-proportional capped label quotas, drawn repo-balanced; any shortfall is left to the caller."""
     if target <= 0 or not groups:
         return []
     labels = sorted(groups)
-    rng.shuffle(labels)
-    label_cap = max(1, ceil(target * label_fraction_cap))
+    gaps = {label: max(1, int((gap_counts or {}).get(label, len(groups[label])))) for label in labels}
+    cap = max(1, int(target * label_fraction_cap))
+    quotas = _proportional_quotas(gaps, target, cap)
+
+    local_counts: Counter = Counter()
     label_counts: Counter = Counter()
     repo_counts: Dict[str, Counter] = {label: Counter() for label in labels}
     chosen: List[tuple[str, str]] = []
-    cursor = 0
-    stalled = 0
-    while len(chosen) < target and stalled < len(labels):
-        label = labels[cursor % len(labels)]
-        cursor += 1
-        if label_counts[label] >= label_cap:
-            stalled += 1
-            continue
-        candidates = [
+
+    def candidates_for(label: str) -> List[str]:
+        return [
             instance_id
             for instance_id in groups[label]
-            if counts[instance_id] + sum(1 for item, _ in chosen if item == instance_id) < repeat_cap
+            if counts[instance_id] + local_counts[instance_id] < repeat_cap
         ]
+
+    def draw(label: str) -> bool:
+        candidates = candidates_for(label)
         if not candidates:
-            stalled += 1
-            continue
-        min_repo_count = min(
+            return False
+        min_repo = min(
             repo_counts[label][by_id[instance_id].repo_name or "unknown"]
             for instance_id in candidates
         )
         candidates = [
             instance_id
             for instance_id in candidates
-            if repo_counts[label][by_id[instance_id].repo_name or "unknown"] == min_repo_count
+            if repo_counts[label][by_id[instance_id].repo_name or "unknown"] == min_repo
         ]
         selected = rng.choice(candidates)
         chosen.append((selected, label))
+        local_counts[selected] += 1
         label_counts[label] += 1
         repo_counts[label][by_id[selected].repo_name or "unknown"] += 1
-        stalled = 0
+        return True
+
+    # 1) each label fills its own quota
+    for label in labels:
+        while len(chosen) < target and label_counts[label] < quotas[label] and draw(label):
+            pass
+    # 2) redistribute unused quota, largest gap first; lift the cap only as a last resort
+    order = sorted(labels, key=lambda label: (-gaps[label], label))
+    for respect_cap in (True, False):
+        progressed = True
+        while len(chosen) < target and progressed:
+            progressed = False
+            for label in order:
+                if len(chosen) >= target:
+                    break
+                if respect_cap and label_counts[label] >= cap:
+                    continue
+                progressed = draw(label) or progressed
     return chosen
+
+
+def _proportional_quotas(gaps: Dict[str, int], target: int, cap: int) -> Dict[str, int]:
+    """Largest-remainder apportionment with a per-label cap and a floor of one."""
+    labels = sorted(gaps)
+    total = sum(gaps.values())
+    floor_one = target >= len(labels)
+    raw = {label: target * gaps[label] / total for label in labels}
+    quotas = {label: min(cap, int(raw[label])) for label in labels}
+    if floor_one:
+        quotas = {label: max(1, quota) for label, quota in quotas.items()}
+    # The floor of one can overshoot the target: trim the largest quotas.
+    while sum(quotas.values()) > target:
+        largest = max(labels, key=lambda label: (quotas[label], label))
+        if quotas[largest] <= 1:
+            break
+        quotas[largest] -= 1
+    remainder = sorted(labels, key=lambda label: (-(raw[label] - int(raw[label])), label))
+    while sum(quotas.values()) < target:
+        grew = False
+        for label in remainder:
+            if sum(quotas.values()) >= target:
+                break
+            if quotas[label] < cap:
+                quotas[label] += 1
+                grew = True
+        if not grew:
+            break
+    return quotas
 
 
 def _repo_balanced_ids(issues: List[Issue], n: int, rng: random.Random) -> List[str]:
@@ -416,23 +499,6 @@ def _issue_to_pool_item(issue: Issue) -> Dict[str, Any]:
     }
 
 
-def validate_split(dataset: str, split: str) -> None:
-    """Reject unavailable dataset/split combinations with an actionable error."""
-    splits = DATASET_SPLITS.get(dataset)
-    if splits is None:
-        return  # raw HF dataset name; let the hub resolve its splits
-    if split not in splits:
-        hint = (
-            " For RL training data use --dataset full --split train."
-            if split == "train"
-            else ""
-        )
-        raise ValueError(
-            f"dataset '{dataset}' ({DATASET_MAP[dataset]}) has no '{split}' split; "
-            f"available splits: {', '.join(splits)}.{hint}"
-        )
-
-
 def iter_swebench_issues(
     dataset: str = "full",
     split: str = "train",
@@ -440,10 +506,9 @@ def iter_swebench_issues(
     exclude_ids: Optional[Iterable[str]] = None,
     include_ids: Optional[Iterable[str]] = None,
 ) -> Iterator[Issue]:
-    """Yield SWE-bench instances as Issue objects (validates eagerly)."""
-    validate_split(dataset, split)
+    """Validates eagerly, then yields Issues lazily."""
     return issues_from_rows(
-        _load_split(dataset, split),
+        load_split(dataset, split),
         limit=limit,
         exclude_ids=exclude_ids,
         include_ids=include_ids,
@@ -456,7 +521,7 @@ def issues_from_rows(
     exclude_ids: Optional[Iterable[str]] = None,
     include_ids: Optional[Iterable[str]] = None,
 ) -> Iterator[Issue]:
-    """Convert raw rows to Issues, dropping contaminated ids before the limit."""
+    """Excluded ids are dropped before the limit applies."""
     exclude = set(exclude_ids or [])
     include = set(include_ids) if include_ids is not None else None
     count = 0
@@ -471,55 +536,7 @@ def issues_from_rows(
             break
 
 
-def _load_split(dataset: str, split: str):
-    """Load a dataset split, preferring local save_to_disk copies."""
-    local = _local_split(dataset, split)
-    if local is not None:
-        return local
-    try:
-        from datasets import load_dataset
-    except ImportError as exc:
-        raise ImportError("datasets package required. Install with: pip install datasets") from exc
-    return load_dataset(DATASET_MAP.get(dataset, dataset), split=split)
-
-
-def _local_split(dataset: str, split: str):
-    dir_name = LOCAL_DATASET_DIRS.get(dataset)
-    if not dir_name:
-        return None
-    path = swebench_data_dir() / dir_name
-    if not path.exists():
-        return None
-    from datasets import load_from_disk
-
-    loaded = load_from_disk(str(path))
-    if hasattr(loaded, "keys"):  # DatasetDict keyed by split
-        return loaded[split] if split in loaded else None
-    return loaded if split == "train" else None  # single saved split (full train)
-
-
-def swebench_data_dir() -> Path:
-    """Local benchmark data root: $SWEBENCH_DATA_DIR or <repo>/benchmarks."""
-    env_dir = os.getenv("SWEBENCH_DATA_DIR")
-    if env_dir:
-        return Path(env_dir)
-    return Path(__file__).resolve().parents[2] / "benchmarks"
-
-
-def read_id_file(path: Path) -> set[str]:
-    """Read instance ids from a file: one id per line (# comments) or a JSON list."""
-    text = Path(path).read_text(encoding="utf-8").strip()
-    if text.startswith("["):
-        return {str(item) for item in json.loads(text)}
-    return {
-        line.strip()
-        for line in text.splitlines()
-        if line.strip() and not line.strip().startswith("#")
-    }
-
-
 def issue_from_swebench_item(item: Dict[str, Any]) -> Issue:
-    """Convert a raw SWE-bench dataset row to an Issue."""
     return Issue(
         id=item["instance_id"],
         description=item["problem_statement"],
@@ -540,14 +557,14 @@ def issue_from_swebench_item(item: Dict[str, Any]) -> Issue:
 
 
 def retrieve_hard_cases(issue: Issue, limit: int = 3) -> List[Dict[str, Any]]:
-    """Retrieve similar hard cases for Controller prompt context."""
     path = resolve_hard_cases_path()
     if not path.exists():
         return []
     retriever = MemoryRetriever(path)
     return [
         record.to_dict()
-        for record in retriever.retrieve(repo_name=issue.repo_name, limit=limit)
+        # Only train-stage memory may inform prompts: no eval leakage.
+        for record in retriever.retrieve(repo_name=issue.repo_name, stage="train", limit=limit)
     ]
 
 
@@ -559,7 +576,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser.add_argument(
         "--dataset",
         default="full",
-        help="lite, verified, full, or HF dataset name (only 'full' has a train split)",
+        help="registered dataset: lite, verified or full",
     )
     parser.add_argument(
         "--task-signals-report",
@@ -590,9 +607,10 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser.add_argument(
         "--exclude-ids",
         type=Path,
-        default=None,
+        action="append",
+        default=[],
         help="File of instance ids (one per line or JSON list) to exclude, "
-        "e.g. eval ids for contamination control",
+        "e.g. eval or Controller-SFT ids for contamination control; repeatable",
     )
     parser.add_argument(
         "--include-ids",
@@ -607,7 +625,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     except ValueError as exc:
         parser.error(str(exc))
 
-    exclude_ids = read_id_file(args.exclude_ids) if args.exclude_ids else None
+    exclude_ids = set().union(*(read_id_file(path) for path in args.exclude_ids)) or None
     include_ids = read_id_file(args.include_ids) if args.include_ids else None
     task_signals = load_task_signals(args.task_signals_report) if args.task_signals_report else None
     count = write_swebench_prompt_dataset(

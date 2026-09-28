@@ -1,0 +1,15 @@
+# Ablation arm: pre-redesign reward (no token penalty, no contribution); REWARD_CONFIG=configs/reward_config_legacy.yaml.
+weights:
+  official_resolved: 0.0
+  official_f2p_fraction: 0.0
+  resolved: 0.5
+  f2p_fraction: 0.2
+  p2p_no_regression: 0.1
+  cost_efficiency: 0.1
+  process: 0.1
+cost_token_budget: 60000
+token_cost_weight: 0.0
+contribution_weight: 0.0
+cluster_baseline_min_count: 3
+skill_write_gate: 0.55
+format_failure_reward: -0.5

@@ -1,15 +1,8 @@
-"""Local-first loading of the SWE-bench dataset family.
-
-Datasets are downloaded once with ``datasets.save_to_disk`` under
-``$SWEBENCH_DATA_DIR`` (default ``<repo_root>/benchmarks``) and loaded from
-there with ``load_from_disk``; when a split is absent locally we fall back to
-the HuggingFace hub. Splits are validated up front with an actionable error
-that lists what is actually available, and loaded splits are cached by
-``(dataset, split)`` so a runner can hold several splits at once.
-"""
+"""Local-first loading of the SWE-bench dataset family, with HuggingFace hub fallback."""
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -31,14 +24,9 @@ class DatasetSpec:
     splits: Tuple[str, ...]          # every split that can be loaded (local or hub)
     local_splits: Tuple[str, ...]    # splits present in the local save_to_disk copy
     single_split: Optional[str] = None  # local dir is a bare Dataset for this split
-    jsonl_glob: Optional[str] = None    # local dir holds raw JSONL files (glob) instead
-                                        # of a save_to_disk copy; used by Multi-SWE-bench
+    jsonl_glob: Optional[str] = None    # local dir holds raw JSONL files, not save_to_disk
 
 
-# Local layout (see $SWEBENCH_DATA_DIR): swe_bench_full_train holds only the
-# full dataset's train split as a bare save_to_disk Dataset; the others are
-# DatasetDicts. Live/Pro repos are not in swebench's registry, so their eval
-# lives in dedicated runners.
 DATASETS: Dict[str, DatasetSpec] = {
     "lite": DatasetSpec(
         "lite", "swe_bench_lite", "princeton-nlp/SWE-bench_Lite",
@@ -49,8 +37,8 @@ DATASETS: Dict[str, DatasetSpec] = {
         splits=("test",), local_splits=("test",),
     ),
     "full": DatasetSpec(
-        "full", "swe_bench_full_train", "princeton-nlp/SWE-bench",
-        splits=("train", "dev", "test"), local_splits=("train",), single_split="train",
+        "full", "swe_bench_full", "princeton-nlp/SWE-bench",
+        splits=("train", "dev", "test"), local_splits=("train", "dev", "test"),
     ),
     "swebench_live": DatasetSpec(
         "swebench_live", "swe_bench_live", "SWE-bench-Live/SWE-bench-Live",
@@ -61,10 +49,7 @@ DATASETS: Dict[str, DatasetSpec] = {
         "swebench_pro", "swe_bench_pro", "ScaleAI/SWE-bench_Pro",
         splits=("test",), local_splits=("test",),
     ),
-    # Multi-SWE-bench ships as per-repo JSONL files (one dir per language), which
-    # datasets.load_dataset cannot unify into one Arrow table, so we read the raw
-    # JSONL. ``full`` is all 1632 non-Python instances across 7 languages;
-    # ``flash`` is the balanced 300-instance subset.
+    # Per-language JSONL files that load_dataset cannot unify into one table.
     "multi_swe_bench": DatasetSpec(
         "multi_swe_bench", "multi_swe_bench_full", "ByteDance-Seed/Multi-SWE-bench",
         splits=("test",), local_splits=("test",), jsonl_glob="*/*.jsonl",
@@ -115,6 +100,14 @@ def validate_split(dataset: str, split: str) -> None:
         )
 
 
+def read_id_file(path: Path) -> set:
+    """One id per line (# comments) or a JSON list."""
+    text = Path(path).read_text(encoding="utf-8").strip()
+    if text.startswith("["):
+        return {str(item) for item in json.loads(text)}
+    return {line.strip() for line in text.splitlines() if line.strip() and not line.strip().startswith("#")}
+
+
 def load_split(dataset: str, split: str):
     """Load one split, preferring the local copy and caching by (dataset, split)."""
     validate_split(dataset, split)
@@ -147,11 +140,7 @@ def _load_local(spec: DatasetSpec, split: str):
 
 
 def _load_jsonl_dir(path: Path, glob: str) -> list:
-    """Read every row from the JSONL files under ``path`` matching ``glob``.
-
-    Multi-SWE-bench encodes each instance's language in the directory name
-    (``<lang>/<repo>_dataset.jsonl``) rather than a row field, so we inject it.
-    """
+    """Read JSONL rows, injecting ``language`` from the ``<lang>/`` directory name."""
     import json
 
     rows: list = []
@@ -175,7 +164,7 @@ def _load_hub(spec: DatasetSpec, split: str):
             f"dataset {spec.name!r} is missing locally under "
             f"{swebench_data_dir() / spec.local_dir}. Its raw JSONL files must be "
             f"fetched with snapshot_download (datasets.load_dataset cannot unify "
-            f"its per-language schema); run scripts/download_benchmarks.sh."
+            f"its per-language schema); run scripts/1_download.sh."
         )
     if not spec.hf_name:
         raise RuntimeError(
@@ -209,8 +198,7 @@ def iter_rows(
             break
 
 
-# SWE-bench-Live/Pro carry these extra fields; keep them so downstream runners
-# can build the right eval (test command, per-instance image tag, ...).
+# SWE-bench-Live/Pro fields that downstream runners need to build their eval.
 _EXTRA_METADATA_FIELDS = (
     "test_cmds",
     "log_parser",
@@ -221,8 +209,6 @@ _EXTRA_METADATA_FIELDS = (
 )
 
 
-# Source-file globs per language, used by the Inspector to list candidate files
-# in a repo. SWE-bench is Python-only; Multi-SWE-bench spans 7 more languages.
 LANGUAGE_GLOBS: Dict[str, Tuple[str, ...]] = {
     "python": ("**/*.py",),
     "c": ("**/*.c", "**/*.h"),
@@ -272,13 +258,7 @@ def _msb_row_to_issue(row: Dict[str, Any]) -> Issue:
 
 
 def row_to_issue(row: Dict[str, Any], use_hints: bool = False) -> Issue:
-    """Convert a raw dataset row to an Issue (tolerant of the F2P/P2P casing).
-
-    SWE-bench Lite/Verified/full use ``FAIL_TO_PASS``/``PASS_TO_PASS``; Pro uses
-    the lowercase names; Multi-SWE-bench uses ``f2p_tests``/``p2p_tests`` and a
-    ``base`` dict. ``hints_text`` is only surfaced when ``use_hints`` is set
-    (default off: the human hints are excluded to keep the task honest).
-    """
+    """Convert a raw dataset row to an Issue; human hints are excluded unless ``use_hints``."""
     if "f2p_tests" in row:
         return _msb_row_to_issue(row)
     fail_to_pass = row.get("FAIL_TO_PASS", row.get("fail_to_pass"))

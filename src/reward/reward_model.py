@@ -15,10 +15,19 @@ DEFAULT_REWARD_WEIGHTS: Dict[str, float] = {
     "official_resolved": 0.3,
     "official_f2p_fraction": 0.7,
 }
+# token_cost is not weightable here; it is subtracted via token_cost_weight.
+REWARD_COMPONENT_KEYS = frozenset({
+    "official_resolved", "official_f2p_fraction", "resolved", "f2p_fraction",
+    "p2p_no_regression", "cost_efficiency", "process",
+})
 DEFAULT_TOKEN_COST_WEIGHT = 0.05
+# Token use below this budget fraction is free, so small cost gaps cannot dominate all-failed groups.
+DEFAULT_TOKEN_COST_DEADBAND = 0.5
 DEFAULT_CONTRIBUTION_WEIGHT = 0.1
 DEFAULT_CLUSTER_BASELINE_MIN_COUNT = 3
 DEFAULT_SKILL_WRITE_GATE = 0.55
+# Must stay below the valid floor -(token_cost_weight + contribution_weight) = -0.15.
+DEFAULT_FORMAT_FAILURE_REWARD = -0.5
 
 
 @dataclass
@@ -48,24 +57,34 @@ class RewardModel:
         skill_write_gate: float = DEFAULT_SKILL_WRITE_GATE,
         token_cost_weight: float = DEFAULT_TOKEN_COST_WEIGHT,
         contribution_weight: float = DEFAULT_CONTRIBUTION_WEIGHT,
+        token_cost_deadband: float = DEFAULT_TOKEN_COST_DEADBAND,
         cluster_baseline_min_count: int = DEFAULT_CLUSTER_BASELINE_MIN_COUNT,
         cluster_baselines: Optional[Dict[str, Dict[str, Any]]] = None,
         cluster_baseline_store: Optional[ClusterBaselineStore] = None,
+        format_failure_reward: float = DEFAULT_FORMAT_FAILURE_REWARD,
     ):
         self.weights = dict(DEFAULT_REWARD_WEIGHTS)
         if weights:
-            unknown = set(weights) - set(DEFAULT_REWARD_WEIGHTS)
+            unknown = set(weights) - REWARD_COMPONENT_KEYS
             if unknown:
                 raise ValueError(
                     f"unknown reward weight keys: {sorted(unknown)}; "
-                    f"expected a subset of {sorted(DEFAULT_REWARD_WEIGHTS)}"
+                    f"expected a subset of {sorted(REWARD_COMPONENT_KEYS)}"
                 )
             self.weights.update({key: float(value) for key, value in weights.items()})
         self.cost_token_budget = int(cost_token_budget)
         self.skill_write_gate = float(skill_write_gate)
         self.token_cost_weight = max(0.0, float(token_cost_weight))
         self.contribution_weight = max(0.0, float(contribution_weight))
+        self.token_cost_deadband = min(0.99, max(0.0, float(token_cost_deadband)))
         self.cluster_baseline_min_count = max(1, int(cluster_baseline_min_count))
+        valid_floor = -(self.token_cost_weight + self.contribution_weight)
+        self.format_failure_reward = float(format_failure_reward)
+        if self.format_failure_reward >= valid_floor:
+            raise ValueError(
+                f"format_failure_reward={self.format_failure_reward} must be below the "
+                f"lowest valid reward {valid_floor}; otherwise malformed output wins"
+            )
         self.cluster_baseline_store = cluster_baseline_store or ClusterBaselineStore()
         self.cluster_baselines = (
             dict(cluster_baselines)
@@ -75,12 +94,7 @@ class RewardModel:
 
     @classmethod
     def from_config_file(cls, path: Optional[Path] = None) -> "RewardModel":
-        """Build from a reward config file.
-
-        With ``path=None`` this loads ``configs/reward_config.yaml`` from the
-        repo (falling back to identical code defaults if the file is absent,
-        e.g. in a bare package install). An explicit path must exist.
-        """
+        """``path=None`` loads configs/reward_config.yaml (code defaults if absent); an explicit path must exist."""
         if path is None:
             default = default_config_path()
             if not default.exists():
@@ -102,8 +116,14 @@ class RewardModel:
             contribution_weight=float(
                 data.get("contribution_weight", DEFAULT_CONTRIBUTION_WEIGHT)
             ),
+            token_cost_deadband=float(
+                data.get("token_cost_deadband", DEFAULT_TOKEN_COST_DEADBAND)
+            ),
             cluster_baseline_min_count=int(
                 data.get("cluster_baseline_min_count", DEFAULT_CLUSTER_BASELINE_MIN_COUNT)
+            ),
+            format_failure_reward=float(
+                data.get("format_failure_reward", DEFAULT_FORMAT_FAILURE_REWARD)
             ),
         )
 
@@ -126,7 +146,9 @@ class RewardModel:
             components.get(name, 0.0) * max(0.0, weight)
             for name, weight in self.weights.items()
         )
-        task_reward = outcome_reward - self.token_cost_weight * components["token_cost"]
+        deadband = self.token_cost_deadband
+        excess_cost = max(0.0, components["token_cost"] - deadband) / (1.0 - deadband)
+        task_reward = outcome_reward - self.token_cost_weight * excess_cost
 
         resolved_cluster = str(
             cluster_id
@@ -137,11 +159,10 @@ class RewardModel:
         baseline_entry = dict(self.cluster_baselines.get(resolved_cluster) or {})
         baseline_count = int(baseline_entry.get("count", 0) or 0)
         baseline = float(baseline_entry.get("ema", 0.0) or 0.0)
+        # Independent of the selection, so selecting no skill gains no systematic edge.
         contribution = (
             task_reward - baseline
-            if skill_set_key
-            and resolved_cluster
-            and baseline_count >= self.cluster_baseline_min_count
+            if resolved_cluster and baseline_count >= self.cluster_baseline_min_count
             else 0.0
         )
         contribution = max(-1.0, min(1.0, contribution))
@@ -160,13 +181,8 @@ class RewardModel:
             skill_set_key=skill_set_key,
         )
 
-    def evolution_utility(self, utility: float) -> float:
-        """Deprecated global-EMA API; contribution now requires a cluster."""
-        return 0.0
-
 
 def default_config_path() -> Path:
-    """Repo-relative path of the canonical reward config."""
     return Path(__file__).resolve().parents[2] / "configs" / "reward_config.yaml"
 
 
@@ -178,11 +194,7 @@ def _load_config(path: Path) -> Dict[str, Any]:
 
 
 def _parse_simple_yaml(text: str) -> Dict[str, Any]:
-    """Parse the strict two-level mapping subset of YAML used by reward_config.yaml.
-
-    Supports scalar values (str/int/float/bool/null), quoted strings, and
-    comments. Rejects lists and deeper nesting loudly instead of misparsing.
-    """
+    """Strict two-level scalar-mapping YAML subset; lists and deeper nesting are rejected."""
     data: Dict[str, Any] = {}
     section: Optional[str] = None
     for lineno, raw_line in enumerate(text.splitlines(), start=1):

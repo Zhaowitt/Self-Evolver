@@ -9,8 +9,6 @@ from typing import Any, Dict, List, Optional
 
 @dataclass
 class SkillStats:
-    """Runtime metadata for a repair skill."""
-
     id: str
     usage_count: int = 0
     successes: int = 0
@@ -66,11 +64,7 @@ class SkillStats:
         success: Optional[bool] = None,
         round_id: Optional[str] = None,
     ) -> None:
-        """Record one credited trial with advantage-style contribution accounting.
-
-        When `success` is unknown, the sign of the advantage decides the trial
-        outcome (zero advantage counts as neither success nor failure).
-        """
+        """Record one credited trial; with unknown `success`, the advantage sign decides (zero: neither)."""
         previous_count = self.usage_count
         self.usage_count += 1
         self.last_reward = float(reward)

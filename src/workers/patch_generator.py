@@ -1,8 +1,4 @@
-"""
-Patch Generator Worker - Code Patch Generation Agent.
-
-Responsible for generating code patches based on inspection results.
-"""
+"""Patch generator worker: turns inspection results into a unified diff."""
 
 import json
 import logging
@@ -36,8 +32,6 @@ class EditOperation:
 
 @dataclass
 class PatchResult:
-    """Result of patch generation."""
-    
     patch_content: str = ""
     modified_files: List[str] = field(default_factory=list)
     explanation: str = ""
@@ -97,6 +91,7 @@ def _patch_result_from_json(data: Any) -> Optional[PatchResult]:
     patch = data.get("patch", "")
     if not isinstance(patch, str):
         return None
+    # Unescape only single-line diffs; a multi-line diff may contain a legitimate "\\n".
     if "\n" not in patch and "\\n" in patch:
         patch = patch.replace("\\n", "\n")
 
@@ -124,17 +119,67 @@ def _patch_result_from_json(data: Any) -> Optional[PatchResult]:
     )
 
 
-def parse_patch_response(content: str) -> PatchResult:
-    """Parse a patch from an LLM response (JSON object, ```diff block, or bare diff).
+_DIFF_HEADER_PREFIXES = (
+    "diff --git ",
+    "index ",
+    "--- ",
+    "+++ ",
+    "new file mode",
+    "deleted file mode",
+    "old mode",
+    "new mode",
+    "similarity index",
+    "rename from",
+    "rename to",
+    "Binary files",
+)
 
-    When the patch arrives as a JSON string, ``json.loads`` has already decoded
-    escape sequences. Some models instead emit the whole diff on a single line
-    with literal ``\\n`` separators and no real newlines; only in that case do we
-    unescape, so a legitimate backslash-n inside code (e.g. ``print("\\n")``) in
-    a proper multi-line diff is never turned into a real newline.
-    """
-    # The documented format is a JSON object. Parse that standard form first;
-    # Markdown fences remain supported for models that add them anyway.
+
+def _extract_unified_diff(text: str) -> str:
+    """Return the first contiguous unified diff in ``text`` (headers + hunks)."""
+    lines = text.split("\n")
+    start = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if line.startswith("diff --git ")
+            or (
+                line.startswith("--- ")
+                and index + 1 < len(lines)
+                and lines[index + 1].startswith("+++ ")
+            )
+        ),
+        None,
+    )
+    if start is None:
+        return ""
+    collected = []
+    in_hunk = False
+    body = lines[start:]
+    for index, line in enumerate(body):
+        next_line = body[index + 1] if index + 1 < len(body) else ""
+        if line.startswith("@@"):
+            in_hunk = True
+        elif line.startswith("diff --git ") or (
+            line.startswith("--- ") and next_line.startswith("+++ ")
+        ):
+            in_hunk = False  # next file's header
+        elif in_hunk and (line[:1] in {" ", "+", "-", "\\"} or line == ""):
+            pass  # hunk body (a removed "-- x" line is content, not a header)
+        elif not in_hunk and line.startswith(_DIFF_HEADER_PREFIXES):
+            pass
+        else:
+            break
+        collected.append(line)
+    while collected and not collected[-1].strip():
+        collected.pop()
+    if not any(line.startswith("@@") for line in collected):
+        return ""
+    return "\n".join(collected) + "\n"
+
+
+def parse_patch_response(content: str) -> PatchResult:
+    """Parse a patch from an LLM response (JSON object, ```diff block, or bare diff)."""
     try:
         raw_json_result = _patch_result_from_json(json.loads(content.strip()))
         if raw_json_result is not None:
@@ -151,14 +196,16 @@ def parse_patch_response(content: str) -> PatchResult:
         except (json.JSONDecodeError, TypeError):
             pass
 
-    # Fallback: a fenced ```diff block, then a bare unified diff anywhere.
-    diff_match = re.search(r'```(?:diff)?\s*(---.*?)\s*```', content, re.DOTALL)
-    if not diff_match:
-        diff_match = re.search(
-            r'(--- a/.*?\n\+\+\+ b/.*?\n@@.*?(?:\n[-+ ].*)*)', content, re.DOTALL
-        )
-    if diff_match:
-        patch = _normalize_patch(diff_match.group(1))
+    # Fallback: a unified diff inside any fence, then a bare diff anywhere.
+    raw_diff = ""
+    for block in re.findall(r'```[\w+-]*[ \t]*\n(.*?)```', content, re.DOTALL):
+        raw_diff = _extract_unified_diff(block)
+        if raw_diff:
+            break
+    if not raw_diff:
+        raw_diff = _extract_unified_diff(content)
+    if raw_diff:
+        patch = _normalize_patch(raw_diff)
         return PatchResult(
             patch_content=patch,
             modified_files=PatchInfo.from_diff(patch).modified_files,
@@ -173,8 +220,6 @@ def parse_patch_response(content: str) -> PatchResult:
 
 
 class PatchGenerator(BaseWorker):
-    """Patch Generator worker for creating code fixes."""
-    
     def __init__(
         self,
         env: ProjectEnvironment,
@@ -188,54 +233,52 @@ class PatchGenerator(BaseWorker):
             0,
             get_config().agent.patch_generator_max_tool_calls,
         )
-        # Reuse Inspector's single, repo-scoped implementation of the read-only
-        # repository tools. The PatchGenerator owns the conversation and prompt.
+        # Reuse Inspector's read-only repository tools; this worker owns the conversation.
         self.repo_tools = Inspector(env, self.llm_client, skill_bank=skill_bank)
-    
+
     @property
     def system_prompt(self) -> str:
         return PATCH_GENERATOR_SYSTEM_PROMPT
-    
+
     def execute(
         self,
         context: ExecutionContext,
         inspection_result: Optional[InspectionResult] = None,
     ) -> WorkerResult[PatchResult]:
-        """Generate a patch based on inspection results."""
         self.logger.info(f"Generating patch for issue: {context.issue.id}")
-        
+
         try:
             user_message = self._build_patch_prompt(context, inspection_result)
             additional_context = None
             if context.has_previous_attempt:
                 additional_context = self._build_retry_context(context)
-            
+
             response, tool_trace = self._call_llm_with_repo_tools(
                 user_message,
                 additional_context,
             )
-            result = self._parse_response(response.content)
+            result = parse_patch_response(response.content)
 
             if result.edits:
                 result.patch_content = self._diff_from_edits(result.edits)
                 result.modified_files = PatchInfo.from_diff(
                     result.patch_content
                 ).modified_files
-            
+
             if result.patch_content:
                 result.patch_info = PatchInfo.from_diff(result.patch_content)
-            
+
             self.logger.info(
                 f"Patch generated: {len(result.modified_files)} files modified"
             )
-            
+
             return WorkerResult(
                 success=True,
                 data=result,
                 llm_response=response,
                 metadata={"tool_trace": tool_trace},
             )
-            
+
         except Exception as e:
             self.logger.error(f"Patch generation failed: {e}")
             return WorkerResult(success=False, error=str(e))
@@ -340,15 +383,14 @@ class PatchGenerator(BaseWorker):
             for line in lines[1:]
         ]
         return f"{lines[0]}\nEXACT CONTENT (copy verbatim):\n" + "\n".join(exact_lines)
-    
+
     def _build_patch_prompt(
         self,
         context: ExecutionContext,
         inspection_result: Optional[InspectionResult],
     ) -> str:
-        """Build the patch generation prompt."""
         parts = []
-        
+
         parts.append("## Issue Description")
         parts.append(context.issue.description)
 
@@ -375,27 +417,25 @@ class PatchGenerator(BaseWorker):
                 parts.append("\n".join(f"- {path}" for path in source_files[:80]))
         except Exception as e:
             self.logger.warning(f"Could not list source paths: {e}")
-        
+
         if inspection_result:
             parts.append("\n## Fault Localization Results")
             parts.append(f"Root Cause: {inspection_result.root_cause_analysis}")
-            
+
             if inspection_result.fix_suggestions:
                 parts.append("\nSuggested Fixes:")
                 for i, suggestion in enumerate(inspection_result.fix_suggestions, 1):
                     parts.append(f"{i}. {suggestion}")
-            
+
             if inspection_result.suspected_files:
                 parts.append(f"\nSuspected Files: {', '.join(inspection_result.suspected_files)}")
-            
-            # Include code snippets
+
             if inspection_result.relevant_code_snippets:
                 parts.append("\n## Relevant Code:")
                 for loc, code in inspection_result.relevant_code_snippets.items():
                     parts.append(f"\n### {loc}")
                     parts.append(f"```python\n{code}\n```")
-        
-        # Fetch full file content for suspected files
+
         if inspection_result and inspection_result.suspected_files:
             parts.append("\n## Full File Contents:")
             for file_path in inspection_result.suspected_files[:3]:
@@ -413,7 +453,7 @@ class PatchGenerator(BaseWorker):
                     self.logger.warning(f"File not found: {file_path}")
                 except Exception as e:
                     self.logger.warning(f"Error reading {file_path}: {e}")
-        
+
         parts.append("\n## Task")
         parts.append(
             "Return the minimal fix as JSON exact text replacements described in the "
@@ -421,11 +461,10 @@ class PatchGenerator(BaseWorker):
             "from its EXACT CONTENT section. The JSON path above is only a schema "
             "example; never use it unless that exact file exists."
         )
-        
+
         return "\n".join(parts)
-    
+
     def _build_retry_context(self, context: ExecutionContext) -> str:
-        """Build context for retry attempts."""
         parts = [f"## This is attempt #{context.iteration + 1}"]
         parts.append("Previous attempts have failed. Please try a different approach.")
 
@@ -453,7 +492,7 @@ class PatchGenerator(BaseWorker):
                     "Keep the current localization unless the verifier logs prove it is "
                     "wrong; correct the repair logic using the latest test failure."
                 )
-        
+
         if context.previous_patches:
             parts.append("\n## Previous Patches (failed):")
             for i, patch in enumerate(context.previous_patches, 1):
@@ -464,26 +503,17 @@ class PatchGenerator(BaseWorker):
             parts.append("\n## Exact Previous Errors:")
             for error in context.previous_errors[-3:]:
                 parts.append(str(error)[:1500])
-        
+
         if context.last_test_result:
             parts.append("\n## Last Test Result:")
             if context.last_test_result.error_logs:
                 parts.append(f"```\n{context.last_test_result.error_logs[:1500]}\n```")
-        
+
         parts.append("\n**Analyze why previous patches failed and generate a corrected version.**")
         return "\n".join(parts)
-    
-    def _parse_response(self, content: str) -> PatchResult:
-        """Parse LLM response into PatchResult."""
-        return parse_patch_response(content)
 
     def _diff_from_edits(self, edits: List[EditOperation]) -> str:
-        """Apply uniquely grounded replacements and emit a program-generated diff.
-
-        Exact matching remains the primary path. A whitespace-only fallback tolerates
-        model changes to indentation, trailing spaces, or surrounding blank lines, but
-        is accepted only when it identifies one repository span.
-        """
+        """Apply uniquely grounded replacements and emit a program-generated diff."""
         originals: dict[str, str] = {}
         updated: dict[str, str] = {}
         for edit in edits:
@@ -584,8 +614,7 @@ class PatchGenerator(BaseWorker):
             if self._normalized_lines(candidate) == target:
                 start = offsets[start_line]
                 end = offsets[end_line]
-                # A model excerpt normally omits the final newline; keep that
-                # newline outside the replaced span unless it explicitly supplied one.
+                # Keep the final newline outside the span unless old_text supplied one.
                 if not old_text.endswith("\n") and candidate.endswith("\n"):
                     candidate = candidate[:-1]
                     end -= 1
@@ -605,10 +634,17 @@ class PatchGenerator(BaseWorker):
             return 0
 
         delta = first_indent(matched_text) - first_indent(old_text)
-        if delta <= 0:
+        if delta == 0:
             return new_text
-        prefix = " " * delta
-        return "\n".join(prefix + line if line.strip() else line for line in new_text.split("\n"))
+        if delta > 0:
+            prefix = " " * delta
+            return "\n".join(prefix + line if line.strip() else line for line in new_text.split("\n"))
+        # Over-indented old_text: dedent by the same amount, never past a line's own indent.
+        remove = -delta
+        return "\n".join(
+            line[min(remove, len(line) - len(line.lstrip(" "))):] if line.strip() else line
+            for line in new_text.split("\n")
+        )
 
     @staticmethod
     def _no_match_error(path: str, content: str, old_text: str) -> str:
@@ -634,7 +670,7 @@ class PatchGenerator(BaseWorker):
 
     def _validated_edit_path(self, raw_path: str) -> str:
         path = Path(raw_path)
-        if path.is_absolute() or ".." in path.parts:
+        if path.is_absolute() or ".." in path.parts or ".git" in path.parts:
             raise ValueError(f"unsafe edit path: {raw_path}")
         resolved = (self.env.repo_path / path).resolve()
         try:

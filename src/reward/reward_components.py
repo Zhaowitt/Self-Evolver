@@ -1,13 +1,7 @@
-"""Reward components derived only from final full official evidence.
-
-Subset outcomes are retry-routing evidence and never become task reward.
-Token use is exposed as a positive *cost magnitude* which RewardModel
-subtracts; cheap failed trajectories therefore receive no positive bonus.
-"""
+"""Reward components from final full official evidence only; subset outcomes never become reward."""
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -59,9 +53,12 @@ def compute_reward_components(
     if view is not None and view.evaluation_scope == "full":
         f2p_fraction = view.f2p_passed / view.f2p_total if view.f2p_total > 0 else 0.0
         p2p_no_regression = view.p2p_passed == view.p2p_total
-        # The official grader's resolution bit is authoritative.  Do not infer
-        # resolution from counts when the harness explicitly reports False.
+        # The official grader's resolution bit is authoritative, never inferred from counts.
         resolved = bool(view.resolved)
+    elif view is not None and view.evaluation_scope == "f2p_only":
+        # Subset already failed, so it cannot be resolved; P2P was not run.
+        f2p_fraction = view.f2p_passed / view.f2p_total if view.f2p_total > 0 else 0.0
+        p2p_no_regression, resolved = False, False
     else:
         f2p_fraction, p2p_no_regression, resolved = 0.0, False, False
 
@@ -86,8 +83,7 @@ def compute_reward_components(
         "official_resolved": official_resolved,
         "official_f2p_fraction": official_f2p_fraction,
         "token_cost": token_cost,
-        # Diagnostic compatibility fields.  They remain unweighted and are
-        # useful in old reports, but no longer provide extra positive reward.
+        # Diagnostic fields, unweighted by default.
         "resolved": official_resolved,
         "f2p_fraction": official_f2p_fraction,
         "p2p_no_regression": 1.0 if (
@@ -103,13 +99,7 @@ def extract_eval_view(
     eval_outcome: Any = None,
     issue: Any = None,
 ) -> Optional[EvalView]:
-    """Find the best available test-execution evidence for a rollout.
-
-    Priority: explicit ``eval_outcome`` (container eval of the final patch) >
-    outcome attached to the execution result by the verifier. Raw host test
-    statuses are deliberately ineligible: final reward requires a full
-    official evaluation outcome.
-    """
+    """Explicit ``eval_outcome`` > result metadata > final candidate's verification outcome."""
     view = EvalView.from_any(eval_outcome)
     if view is not None:
         return view
@@ -117,68 +107,19 @@ def extract_eval_view(
     view = EvalView.from_any(metadata.get("eval_outcome"))
     if view is not None:
         return view
+    # Only the final candidate (last attempt with a real diff) is scored; an
+    # older attempt's outcome must not stand in for it.
     records = list(getattr(execution_result, "iteration_records", []) or [])
     for record in reversed(records):
         verification = getattr(record, "verification_result", None)
-        if verification is None:
+        if verification is None or not str(
+            getattr(verification, "canonical_patch_content", "") or ""
+        ).strip():
             continue
         if getattr(verification, "evaluation_scope", "") == "subset":
-            continue
-        view = EvalView.from_any(getattr(verification, "eval_outcome", None))
-        if view is not None:
-            return view
+            return None
+        return EvalView.from_any(getattr(verification, "eval_outcome", None))
     return None
-
-
-def eval_view_from_test_result(
-    test_result: Any,
-    f2p_names: List[str],
-    p2p_names: List[str],
-) -> Optional[EvalView]:
-    """Derive an EvalView from real per-test statuses.
-
-    F2P tests missing from the run count as not passed (the agent must make
-    them pass); P2P tests are counted only when actually run, so a targeted
-    F2P-only run does not fake regression evidence either way.
-    """
-    cases = {
-        case.name: case
-        for case in (getattr(test_result, "test_cases", None) or [])
-        if getattr(case, "name", "")
-    }
-    if not cases or not f2p_names:
-        return None
-    f2p_passed = sum(1 for name in f2p_names if name in cases and cases[name].passed)
-    p2p_run = [name for name in p2p_names if name in cases]
-    p2p_passed = sum(1 for name in p2p_run if cases[name].passed)
-    return EvalView(
-        f2p_passed=f2p_passed,
-        f2p_total=len(f2p_names),
-        p2p_passed=p2p_passed,
-        p2p_total=len(p2p_run),
-        resolved=False,
-    )
-
-
-def _test_name_lists(issue: Any) -> tuple[List[str], List[str]]:
-    metadata = getattr(issue, "metadata", None) or {}
-    return (
-        _name_list(metadata.get("fail_to_pass")),
-        _name_list(metadata.get("pass_to_pass")),
-    )
-
-
-def _name_list(raw: Any) -> List[str]:
-    if not raw:
-        return []
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except (TypeError, ValueError):
-            return []
-    if not isinstance(raw, list):
-        return []
-    return [str(item) for item in raw if str(item)]
 
 
 def _any_verification(records: List[Any], predicate) -> bool:

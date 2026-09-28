@@ -1,14 +1,9 @@
-"""
-Self-Evolver CLI - Main Entry Point.
-
-Provides command-line interface for running the Multi-Agent System.
-"""
+"""Self-Evolver command-line interface."""
 
 import json
 import logging
 import sys
 from pathlib import Path
-from typing import Optional
 
 import click
 from rich.console import Console
@@ -26,9 +21,8 @@ console = Console()
 
 
 def setup_logging(verbose: bool = False):
-    """Configure logging with rich handler."""
     level = logging.DEBUG if verbose else logging.INFO
-    
+
     logging.basicConfig(
         level=level,
         format="%(message)s",
@@ -38,10 +32,9 @@ def setup_logging(verbose: bool = False):
 
 
 def print_result(result: ExecutionResult, evaluation=None):
-    """Pretty print execution result."""
     status_color = "green" if result.success else "red"
     status_text = "SUCCESS" if result.success else "FAILED"
-    
+
     console.print(Panel(
         f"[bold {status_color}]{status_text}[/bold {status_color}]\n\n"
         f"Issue: {result.issue_id}\n"
@@ -50,17 +43,17 @@ def print_result(result: ExecutionResult, evaluation=None):
         f"Duration: {result.total_duration_ms:.0f}ms",
         title="Execution Result",
     ))
-    
+
     if result.final_patch:
         console.print("\n[bold]Final Patch:[/bold]")
         console.print(f"  Files: {', '.join(result.final_patch.modified_files)}")
         console.print(f"  Changes: +{result.final_patch.added_lines} -{result.final_patch.removed_lines}")
-    
+
     if evaluation:
-        console.print(f"\n[bold]Evaluation:[/bold]")
+        console.print("\n[bold]Evaluation:[/bold]")
         console.print(f"  {evaluation.summary}")
         if not result.success:
-            console.print(f"\n[bold]Reflection:[/bold]")
+            console.print("\n[bold]Reflection:[/bold]")
             console.print(f"  {evaluation.reflection}")
 
 
@@ -85,45 +78,38 @@ def cli(ctx, verbose):
 @click.pass_context
 def fix(ctx, repo, issue, issue_id, max_iterations, test_cmd, output):
     """Fix an issue in a local repository."""
-    console.print(f"[bold]Self-Evolver Code Repair[/bold]")
+    console.print("[bold]Self-Evolver Code Repair[/bold]")
     console.print(f"Repository: {repo}")
     console.print(f"Issue: {issue[:100]}...")
     console.print()
-    
-    # Check API key
+
     config = get_config()
     if not config.validate_api_key():
         console.print("[red]Error: OPENAI_API_KEY not configured.[/red]")
         console.print("Please set OPENAI_API_KEY environment variable or create .env file.")
         sys.exit(1)
-    
-    # Initialize environment
+
     try:
         env = ProjectEnvironment(repo, test_cmd=test_cmd)
     except Exception as e:
         console.print(f"[red]Error initializing environment: {e}[/red]")
         sys.exit(1)
-    
-    # Create issue
+
     issue_obj = Issue(
         id=issue_id,
         description=issue,
     )
-    
-    # Run orchestrator
+
     console.print("[bold]Starting repair process...[/bold]\n")
-    
+
     orchestrator = ExecutionOrchestrator(env, max_iterations=max_iterations)
     result = orchestrator.run(issue_obj)
-    
-    # Evaluate
+
     judge = CriticJudge()
     evaluation = judge.evaluate(result)
-    
-    # Print results
+
     print_result(result, evaluation)
-    
-    # Save output if requested
+
     if output:
         output_data = {
             "issue_id": result.issue_id,
@@ -140,10 +126,10 @@ def fix(ctx, repo, issue, issue_id, max_iterations, test_cmd, output):
                 "reflection": evaluation.reflection,
             },
         }
-        
+
         Path(output).write_text(json.dumps(output_data, indent=2))
         console.print(f"\nResults saved to: {output}")
-    
+
     sys.exit(0 if result.success else 1)
 
 
@@ -155,17 +141,15 @@ def fix(ctx, repo, issue, issue_id, max_iterations, test_cmd, output):
 def check(ctx, repo, test_cmd):
     """Check environment setup and run tests."""
     console.print("[bold]Environment Check[/bold]\n")
-    
-    # Check API key
+
     config = get_config()
     api_ok = config.validate_api_key()
     console.print(f"API Key: {'[green]OK[/green]' if api_ok else '[red]NOT SET[/red]'}")
-    
-    # Check repository
+
     try:
         env = ProjectEnvironment(repo, test_cmd=test_cmd)
         repo_state = env.get_repo_state()
-        console.print(f"Repository: [green]OK[/green]")
+        console.print("Repository: [green]OK[/green]")
         console.print(f"  Path: {repo_state.path}")
         console.print(f"  Branch: {repo_state.current_branch}")
         console.print(f"  Commit: {repo_state.current_commit[:8] if repo_state.current_commit else 'N/A'}")
@@ -173,21 +157,19 @@ def check(ctx, repo, test_cmd):
     except Exception as e:
         console.print(f"Repository: [red]ERROR[/red] - {e}")
         sys.exit(1)
-    
-    # List files
+
     try:
         py_files = env.list_files("**/*.py")
         console.print(f"  Python files: {len(py_files)}")
     except Exception as e:
         console.print(f"  Python files: [yellow]Could not list ({e})[/yellow]")
-    
-    # Run tests
+
     console.print("\n[bold]Running tests...[/bold]")
     test_result = env.run_tests()
-    
+
     status = "[green]PASSED[/green]" if test_result.passed else "[red]FAILED[/red]"
     console.print(f"Test Result: {status}")
-    
+
     if test_result.error_logs:
         console.print("\n[bold]Error Output:[/bold]")
         console.print(test_result.error_logs[:1000])
@@ -198,11 +180,11 @@ def check(ctx, repo, test_cmd):
 def config_info(ctx):
     """Show current configuration."""
     config = get_config()
-    
+
     table = Table(title="Configuration")
     table.add_column("Setting", style="cyan")
     table.add_column("Value", style="green")
-    
+
     table.add_row("Model", config.llm.model)
     table.add_row("API Key Set", "Yes" if config.validate_api_key() else "No")
     table.add_row("Max Iterations", str(config.agent.max_iterations))
@@ -210,7 +192,7 @@ def config_info(ctx):
     table.add_row("Temperature", str(config.llm.temperature))
     table.add_row("Workspace", str(config.environment.workspace_dir))
     table.add_row("Log Level", config.environment.log_level)
-    
+
     console.print(table)
 
 
@@ -401,7 +383,6 @@ def benchmark(
 
 
 def main():
-    """Main entry point."""
     cli(obj={})
 
 

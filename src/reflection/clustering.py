@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+from collections import Counter
 import json
 import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 from src.config import get_config
 from src.memory.hard_case_buffer import HardCaseRecord
@@ -17,6 +18,10 @@ from src.skills.file_lock import file_lock
 
 
 SECONDARY_SIMILARITY_THRESHOLD = 0.62
+_SPECIFIC_FIELDS = ("summary", "error_signature")
+_STRUCTURAL_FIELDS = ("verification_pattern", "retry_pattern")
+# Concrete evidence decides; shared status/retry shape can add at most 0.2.
+_FIELD_GROUPS = ((_SPECIFIC_FIELDS, 0.8), (_STRUCTURAL_FIELDS, 0.2))
 MIN_CLUSTER_SIZE = 3
 MIN_UNIQUE_ISSUES = 2
 MIN_COHESION = 0.62
@@ -53,15 +58,8 @@ class FailureCluster:
         return len(set(self.instance_ids))
 
     @property
-    def dominant_failure_type(self) -> str:
-        return self.mechanism
-
-    @property
     def representatives(self) -> List[HardCaseRecord]:
         return [self.members[index] for index in self.representative_indices]
-
-    def summary_text(self) -> str:
-        return "\n".join(cluster_summary(record) for record in self.members)
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -84,26 +82,22 @@ def cluster_records(
     records: List[HardCaseRecord],
     embedding_client: Optional[EmbeddingClient] = None,
     similarity_threshold: float = SECONDARY_SIMILARITY_THRESHOLD,
-    cosine_threshold: Optional[float] = None,
-    lexical_threshold: Optional[float] = None,
     registry_path: Optional[Path] = None,
 ) -> List[FailureCluster]:
-    """Bucket exactly by mechanism, then run deterministic complete-link.
-
-    The old threshold parameters are accepted for call compatibility; the new
-    fielded threshold is selected explicitly via ``similarity_threshold``.
-    """
+    """Bucket exactly by mechanism, then run deterministic complete-link."""
     if not records:
         return []
     buckets: Dict[str, List[HardCaseRecord]] = {}
     legacy: List[HardCaseRecord] = []
+    # SELF_EVOLVER_CLUSTER_LEVELS=1 (ablation) skips mechanism bucketing.
+    two_level = os.getenv("SELF_EVOLVER_CLUSTER_LEVELS", "2").strip() != "1"
     for record in records:
         diagnosis = record.failure_diagnosis or {}
         mechanism = str(diagnosis.get("mechanism") or "").strip()
         if not mechanism:
             legacy.append(record)
             continue
-        buckets.setdefault(mechanism, []).append(record)
+        buckets.setdefault(mechanism if two_level else "*", []).append(record)
 
     clusters: List[FailureCluster] = []
     for mechanism in sorted(buckets):
@@ -122,10 +116,17 @@ def cluster_records(
             cohesion = min(pair_scores) if pair_scores else 1.0
             representatives = _representative_indices(grouped, similarity, indices)
             shared = _shared_pattern(grouped)
+            if mechanism == "*":
+                mechanism_of = Counter(
+                    str((m.failure_diagnosis or {}).get("mechanism") or "unknown") for m in grouped
+                )
+                label = sorted(mechanism_of.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+            else:
+                label = mechanism
             clusters.append(
                 FailureCluster(
                     members=grouped,
-                    mechanism=mechanism,
+                    mechanism=label,
                     cohesion=cohesion,
                     shared_pattern=shared,
                     representative_indices=representatives,
@@ -145,10 +146,20 @@ def cluster_records(
         )
 
     registry = StableClusterRegistry(registry_path) if registry_path else None
+    assigned: set[str] = set()
     for cluster in clusters:
-        cluster.cluster_id = (
-            registry.resolve(cluster) if registry and cluster.diagnosis_available else _stable_id(cluster)
+        cluster_id = (
+            registry.resolve(cluster, exclude=assigned)
+            if registry and cluster.diagnosis_available
+            else _stable_id(cluster)
         )
+        # Ids must be unique per round: matches, decisions and the registry key on them.
+        base, suffix = cluster_id, 2
+        while cluster_id in assigned:
+            cluster_id = f"{base}-{suffix}"
+            suffix += 1
+        assigned.add(cluster_id)
+        cluster.cluster_id = cluster_id
     if registry:
         registry.save()
     clusters.sort(key=lambda item: (item.mechanism, -item.size, item.cluster_id))
@@ -187,16 +198,21 @@ class StableClusterRegistry:
         self.path = Path(path or default_cluster_registry_path())
         self.entries = self._load()
 
-    def resolve(self, cluster: FailureCluster) -> str:
+    def resolve(self, cluster: FailureCluster, exclude: Optional[set] = None) -> str:
         signature = _pattern_text(cluster.shared_pattern)
+        taken = set(exclude or ())
         candidates = [
             (cluster_id, entry)
             for cluster_id, entry in self.entries.items()
-            if entry.get("mechanism") == cluster.mechanism
+            if entry.get("mechanism") == cluster.mechanism and cluster_id not in taken
         ]
+        # Compare values only: the shared JSON keys alone exceed the match threshold.
+        values = _pattern_values_text(cluster.shared_pattern)
         ranked = sorted(
             (
-                local_text_similarity(signature, str(entry.get("signature") or "")),
+                local_text_similarity(
+                    values, _pattern_values_text(entry.get("shared_pattern") or {})
+                ),
                 cluster_id,
             )
             for cluster_id, entry in candidates
@@ -254,6 +270,12 @@ def _fielded_similarity_matrix(
     matrix = [[1.0 if i == j else 0.0 for j in range(size)] for i in range(size)]
     for left in range(size):
         for right in range(left + 1, size):
+            if not any(
+                fields[left][name] and fields[right][name] for name in _SPECIFIC_FIELDS
+            ):
+                # Structural fields are alike for most failures; merging on them
+                # alone yields one catch-all cluster.
+                continue
             scores: Dict[str, float] = {}
             for name in FIELD_WEIGHTS:
                 a, b = fields[left][name], fields[right][name]
@@ -263,14 +285,29 @@ def _fielded_similarity_matrix(
                     scores[name] = cosine_similarity(summary_vectors[left], summary_vectors[right])
                 else:
                     scores[name] = local_text_similarity(a, b)
-            total_weight = sum(FIELD_WEIGHTS[name] for name in scores)
+            # Renormalize within groups, never across: a missing summary must not
+            # hand its weight to the near-identical structural fields.
+            groups = [
+                (weight, _group_mean(scores, names))
+                for names, weight in _FIELD_GROUPS
+                if any(name in scores for name in names)
+            ]
+            total_weight = sum(weight for weight, _ in groups)
             value = (
-                sum(scores[name] * FIELD_WEIGHTS[name] for name in scores) / total_weight
+                sum(weight * mean for weight, mean in groups) / total_weight
                 if total_weight
                 else 0.0
             )
             matrix[left][right] = matrix[right][left] = max(0.0, min(1.0, value))
     return matrix
+
+
+def _group_mean(scores: Dict[str, float], names: Sequence[str]) -> float:
+    present = [name for name in names if name in scores]
+    total = sum(FIELD_WEIGHTS[name] for name in present)
+    if not total:
+        return 0.0
+    return sum(scores[name] * FIELD_WEIGHTS[name] for name in present) / total
 
 
 def _diagnosis_fields(record: HardCaseRecord) -> Dict[str, str]:
@@ -283,8 +320,13 @@ def _diagnosis_fields(record: HardCaseRecord) -> Dict[str, str]:
         "patch_applied": evidence.get("patch_applied") or [],
     }
     retry = evidence.get("retry_pattern") or {}
+    # Rule summaries are templates, near-identical across unrelated failures;
+    # only LLM/adjudicated summaries carry case-specific meaning.
+    summary = str(diagnosis.get("summary") or "")
+    if diagnosis.get("source") == "rules_v1":
+        summary = ""
     return {
-        "summary": str(diagnosis.get("summary") or ""),
+        "summary": summary,
         "error_signature": " ".join(str(item) for item in errors),
         "verification_pattern": (
             json.dumps(verification, sort_keys=True)
@@ -373,6 +415,14 @@ def _stable_id(cluster: FailureCluster) -> str:
         f"{cluster.mechanism}\0{_pattern_text(cluster.shared_pattern)}".encode("utf-8")
     ).hexdigest()[:12]
     return f"{cluster.mechanism}-{digest}"
+
+
+def _pattern_values_text(pattern: object) -> str:
+    if isinstance(pattern, dict):
+        return " ".join(_pattern_values_text(value) for _, value in sorted(pattern.items()))
+    if isinstance(pattern, (list, tuple)):
+        return " ".join(_pattern_values_text(value) for value in pattern)
+    return "" if pattern is None else str(pattern)
 
 
 def _pattern_text(pattern: Dict[str, object]) -> str:

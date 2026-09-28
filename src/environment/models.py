@@ -1,8 +1,4 @@
-"""
-Data models for Project Environment.
-
-Defines the core data structures used across the system.
-"""
+"""Core data models for the project environment."""
 
 import re
 from dataclasses import dataclass, field
@@ -13,8 +9,6 @@ from typing import Any, Dict, List, Optional
 
 
 class TestStatus(Enum):
-    """Status of a test execution."""
-
     PASSED = "passed"
     FAILED = "failed"
     ERROR = "error"
@@ -32,7 +26,7 @@ _PYTEST_STATUS_MAP = {
     "ERROR": TestStatus.ERROR,
     "SKIPPED": TestStatus.SKIPPED,
 }
-# "PASSED path::test" (short summary, -rA) — name must be a test id.
+# "PASSED path::test" (-rA short summary).
 _PYTEST_PREFIX_LINE = re.compile(
     r"^(PASSED|FAILED|ERROR|SKIPPED|XPASS|XFAIL)\s+(\S*::\S+)"
 )
@@ -40,19 +34,16 @@ _PYTEST_PREFIX_LINE = re.compile(
 _PYTEST_SUFFIX_LINE = re.compile(
     r"^(\S*::\S+)\s+(PASSED|FAILED|ERROR|SKIPPED|XPASS|XFAIL)\b"
 )
-# Final tally, e.g. "2 failed, 3 passed, 1 skipped, 2 errors in 1.23s".
+# e.g. "2 failed, 3 passed, 1 skipped, 2 errors in 1.23s".
 _PYTEST_TALLY_ITEM = re.compile(
     r"(\d+) (passed|failed|errors?|skipped|xfailed|xpassed)\b"
 )
-# Strip SGR color codes: pytest colorizes when FORCE_COLOR/tty is set, and the
-# escapes would otherwise defeat the line-start status patterns.
+# pytest colorizes under FORCE_COLOR/tty; SGR codes would defeat line-start matches.
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
 @dataclass
 class CodeLocation:
-    """A specific location in source code."""
-    
     file_path: str
     start_line: int
     end_line: Optional[int] = None
@@ -66,7 +57,7 @@ class CodeLocation:
 
 @dataclass
 class Issue:
-    """Represents a coding task or issue to be solved."""
+    """A coding task or issue to be solved."""
     
     id: str
     description: str
@@ -83,8 +74,6 @@ class Issue:
 
 @dataclass
 class TestCase:
-    """A single test case result."""
-    
     name: str
     status: TestStatus
     duration_ms: float = 0.0
@@ -102,8 +91,6 @@ class TestCase:
 
 @dataclass
 class TestResult:
-    """Result of running tests."""
-    
     passed: bool
     total_tests: int = 0
     passed_tests: int = 0
@@ -116,28 +103,12 @@ class TestResult:
     duration_ms: float = 0.0
     
     @property
-    def failed_test_names(self) -> List[str]:
-        """Get names of failed tests."""
-        return [tc.name for tc in self.test_cases if tc.failed]
-    
-    @property
     def summary(self) -> str:
-        """Get a summary string."""
         return (
             f"Tests: {self.passed_tests}/{self.total_tests} passed, "
             f"{self.failed_tests} failed, {self.error_tests} errors"
         )
     
-    @classmethod
-    def from_success(cls, output: str = "") -> "TestResult":
-        """Create a successful test result."""
-        return cls(passed=True, output=output)
-
-    @classmethod
-    def from_failure(cls, error_logs: str, output: str = "") -> "TestResult":
-        """Create a failed test result."""
-        return cls(passed=False, error_logs=error_logs, output=output)
-
     @classmethod
     def from_pytest_output(
         cls,
@@ -146,15 +117,7 @@ class TestResult:
         error_logs: str = "",
         duration_ms: float = 0.0,
     ) -> "TestResult":
-        """
-        Build a TestResult with real per-test cases and counts parsed from
-        pytest output (works with -q, -v, and -rA report styles).
-
-        Counts come from pytest's final tally line when present (authoritative
-        even when per-test lines are absent, e.g. plain -q), otherwise from
-        the parsed per-test lines. XPASS/XFAIL count as passed, matching
-        official SWE-bench grading.
-        """
+        """Parse pytest output (-q/-v/-rA); the final tally line, when present, overrides per-test counts."""
         cases: Dict[str, TestCase] = {}
         tally: Dict[str, int] = {}
         for line in _ANSI.sub("", f"{output}\n{error_logs}").splitlines():
@@ -208,8 +171,6 @@ class TestResult:
 
 @dataclass
 class RepoState:
-    """Current state of a code repository."""
-    
     path: Path
     current_branch: str = "main"
     current_commit: Optional[str] = None
@@ -223,8 +184,6 @@ class RepoState:
 
 @dataclass
 class PatchInfo:
-    """Information about a code patch."""
-    
     content: str  # Unified diff format
     modified_files: List[str] = field(default_factory=list)
     added_lines: int = 0
@@ -236,14 +195,13 @@ class PatchInfo:
     
     @classmethod
     def from_diff(cls, diff_content: str) -> "PatchInfo":
-        """Parse patch info from unified diff content."""
         modified_files = []
         added = 0
         removed = 0
         
         for line in diff_content.split("\n"):
             if line.startswith("--- a/") or line.startswith("+++ b/"):
-                file_path = line[6:]  # Remove "--- a/" or "+++ b/"
+                file_path = line[6:]
                 if file_path not in modified_files and file_path != "/dev/null":
                     modified_files.append(file_path)
             elif line.startswith("+") and not line.startswith("+++"):
@@ -261,8 +219,6 @@ class PatchInfo:
 
 @dataclass
 class PatchApplyResult:
-    """Structured result from attempting to apply a patch."""
-
     success: bool
     strategy: str = ""
     stdout: str = ""
@@ -286,8 +242,6 @@ class PatchApplyResult:
 
 @dataclass
 class ExecutionContext:
-    """Context passed between workers during execution."""
-    
     issue: Issue
     repo_state: RepoState
     iteration: int = 0
@@ -300,10 +254,6 @@ class ExecutionContext:
     @property
     def has_previous_attempt(self) -> bool:
         return self.iteration > 0
-    
-    @property
-    def last_error(self) -> Optional[str]:
-        return self.previous_errors[-1] if self.previous_errors else None
     
     @property
     def last_test_result(self) -> Optional[TestResult]:

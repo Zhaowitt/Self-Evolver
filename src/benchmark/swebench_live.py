@@ -1,13 +1,4 @@
-"""SWE-bench-Live runner.
-
-SWE-bench-Live (microsoft/SWE-bench-Live) is a monthly-refreshed, contamination-
-controlled transfer set. Its repos are not in the classic swebench registry, so
-``make_test_spec`` cannot build the eval; instead each instance ships pytest
-FAIL_TO_PASS / PASS_TO_PASS node ids and the eval runs ``pytest -rA`` inside the
-official per-instance image (``starryzhang/sweb.eval.x86_64.<id>``). Grading uses
-the same swebench report logic as the classic runner (``build_outcome``), so the
-numbers are comparable. Images are pulled on demand; a missing image fails loudly.
-"""
+"""SWE-bench-Live runner: ``pytest -rA`` in the official image (its repos have no swebench spec)."""
 
 from __future__ import annotations
 
@@ -20,15 +11,13 @@ import tempfile
 from pathlib import Path
 from typing import Any, List, Optional
 
-from src.environment.swebench_compat import ensure_swebench_importable
-
-ensure_swebench_importable()
-
 from swebench.harness.constants import APPLY_PATCH_FAIL, APPLY_PATCH_PASS, TESTS_TIMEOUT
 
 from src.benchmark.swebench_runner import SWEBenchRunner
-from src.environment.models import TestResult, TestStatus
+from src.environment.models import TestResult
 from src.environment.test_backend import (
+    _HOST_TO_SB_STATUS,
+    run_container_command,
     EvalOutcome,
     build_outcome,
     default_eval_timeout,
@@ -40,23 +29,9 @@ logger = logging.getLogger(__name__)
 LIVE_NAMESPACE = "starryzhang"
 LIVE_SPLITS = ("test", "lite", "verified", "full")
 
-# TestStatus -> swebench grading status string (XFAIL/XPASS already map to PASSED
-# in TestResult parsing, matching swebench.harness.grading.test_passed).
-_TO_SB_STATUS = {
-    TestStatus.PASSED: "PASSED",
-    TestStatus.FAILED: "FAILED",
-    TestStatus.ERROR: "ERROR",
-    TestStatus.SKIPPED: "SKIPPED",
-    TestStatus.TIMEOUT: "ERROR",
-}
-
 
 def live_image_ref(instance_id: str, namespace: str = LIVE_NAMESPACE) -> str:
-    """Official SWE-bench-Live image reference for an instance.
-
-    Mirrors the project's ``get_default_image_name``: ``__`` -> ``_1776_``,
-    lower-cased, under the linux (x86_64) arch.
-    """
+    """Mirrors SWE-bench-Live's ``get_default_image_name`` (x86_64)."""
     name = instance_id.replace("__", "_1776_").lower()
     return f"{namespace}/sweb.eval.x86_64.{name}"
 
@@ -88,7 +63,7 @@ def grade_pytest_log(
     f2p = _test_ids(instance.get("FAIL_TO_PASS"))
     p2p = _test_ids(instance.get("PASS_TO_PASS"))
     parsed = TestResult.from_pytest_output(passed=applied, output=output)
-    status_map = {case.name: _TO_SB_STATUS[case.status] for case in parsed.test_cases}
+    status_map = {case.name: _HOST_TO_SB_STATUS[case.status] for case in parsed.test_cases}
     return build_outcome(
         status_map,
         applied,
@@ -102,10 +77,32 @@ def grade_pytest_log(
     )
 
 
-def _entry_script(pytest_ids: str) -> str:
-    """Apply the model patch (ladder) and test patch, then run pytest -rA."""
+TEST_PATCH_FAIL = ">>>>> Self-Evolver: test patch failed to apply"
+
+
+def _test_patch_files(test_patch: str) -> List[str]:
+    files = []
+    for line in (test_patch or "").split("\n"):
+        if line.startswith("diff --git a/"):
+            path = line[len("diff --git a/"):].split(" b/", 1)[0]
+            if path and path not in files:
+                files.append(path)
+    return files
+
+
+def _entry_script(pytest_ids: str, base_commit: str = "", test_files: Optional[List[str]] = None) -> str:
+    """Apply the model patch, reset test files to ``base_commit``, apply the test patch, run pytest -rA."""
+    # Resetting test files stops a model patch that edits tests from being graded on its own tests.
     patch = "/self_evolver_eval/patch.diff"
     test_patch = "/self_evolver_eval/test.patch"
+    reset = ""
+    if base_commit and test_files:
+        for path in test_files:
+            quoted = shlex.quote(path)
+            reset += (
+                f"git checkout {shlex.quote(base_commit)} -- {quoted} 2>/dev/null "
+                f"|| rm -f {quoted}\n"
+            )
     return (
         "#!/bin/bash\n"
         "cd /testbed\n"
@@ -113,8 +110,9 @@ def _entry_script(pytest_ids: str) -> str:
         f"elif git apply --verbose --reject {patch}; then echo '{APPLY_PATCH_PASS}'\n"
         f"elif patch --batch --fuzz=5 -p1 -i {patch}; then echo '{APPLY_PATCH_PASS}'\n"
         f"else echo '{APPLY_PATCH_FAIL}'; exit 1; fi\n"
-        f"git apply --verbose {test_patch} 2>/dev/null "
-        f"|| patch --batch --fuzz=5 -p1 -i {test_patch} 2>/dev/null || true\n"
+        f"{reset}"
+        f"if [ -s {test_patch} ] && ! git apply --verbose {test_patch}; then "
+        f"echo '{TEST_PATCH_FAIL}'; exit 1; fi\n"
         "if [ -f /opt/miniconda3/bin/activate ]; then "
         "source /opt/miniconda3/bin/activate testbed 2>/dev/null "
         "|| source /opt/miniconda3/bin/activate 2>/dev/null || true; fi\n"
@@ -240,21 +238,25 @@ class LiveTestBackend:
             workdir = Path(td)
             (workdir / "patch.diff").write_text(model_patch, encoding="utf-8")
             (workdir / "test.patch").write_text(instance.get("test_patch") or "", encoding="utf-8")
-            (workdir / "entry.sh").write_text(_entry_script(ids), encoding="utf-8")
+            (workdir / "entry.sh").write_text(
+                _entry_script(
+                    ids,
+                    base_commit=str(instance.get("base_commit") or ""),
+                    test_files=_test_patch_files(instance.get("test_patch") or ""),
+                ),
+                encoding="utf-8",
+            )
             cmd = self._container_cmd(image_ref, workdir)
             logger.info("Evaluating %s via %s (SWE-bench-Live)", instance_id, self.engine)
-            try:
-                result = subprocess.run(
-                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout
-                )
-                output = result.stdout or ""
-            except subprocess.TimeoutExpired as exc:
-                partial = exc.stdout or ""
-                if isinstance(partial, bytes):
-                    partial = partial.decode("utf-8", errors="replace")
-                output = f"{partial}\n\n{TESTS_TIMEOUT}: {timeout} seconds exceeded."
+            output = run_container_command(cmd, timeout)
 
-        applied = APPLY_PATCH_PASS in output and APPLY_PATCH_FAIL not in output
+        # A timed-out run or an unapplied test patch is never "resolved".
+        applied = (
+            APPLY_PATCH_PASS in output
+            and APPLY_PATCH_FAIL not in output
+            and TEST_PATCH_FAIL not in output
+            and TESTS_TIMEOUT not in output
+        )
         return grade_pytest_log(
             instance,
             output,

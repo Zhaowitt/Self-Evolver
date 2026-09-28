@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from src.controller.schema import ControllerSignal, SkillSignal, controller_signal_from_any
 from src.skills.skill_bank import SkillBank, extract_constraints, extract_procedure
@@ -26,13 +26,7 @@ def format_controller_guidance(
     signal_like: Any,
     skill_bank: Optional[SkillBank] = None,
 ) -> str:
-    """Render a ControllerSignal into a prompt block for workers.
-
-    Each selected skill is injected with its title, one-line summary, and its
-    "How to Apply" procedure (capped at MAX_PROCEDURE_CHARS characters) looked
-    up from ``skill_bank`` so the worker sees the actual repair discipline, not
-    just a name. Pass a frozen bank during eval so guidance matches the snapshot.
-    """
+    """Render grounded skills and strategy for workers; pass a frozen bank during eval."""
     bank = skill_bank or _default_bank()
     signal = ground_controller_skills(signal_like, skill_bank=bank)
     if not signal or not signal.has_guidance:
@@ -60,11 +54,7 @@ def ground_controller_skills(
     skill_bank: Optional[SkillBank] = None,
     allowed_skill_ids: Optional[Iterable[str]] = None,
 ) -> Optional[ControllerSignal]:
-    """Replace model-authored skill metadata with canonical bank entries.
-
-    Unknown, inactive, and (when supplied) non-candidate skill IDs are dropped.
-    This is a code-level boundary: prompt instructions alone are not trusted.
-    """
+    """Keep only active (and allowed) bank skills; prompt instructions alone are not trusted."""
     signal = controller_signal_from_any(signal_like)
     if signal is None:
         return None
@@ -123,11 +113,11 @@ def _format_skills(signal: ControllerSignal, skill_bank: SkillBank) -> str:
         item = [f"Skill {index}: {title}"]
         if skill.summary:
             item.append(skill.summary)
-        procedure = _procedure_for(skill.id, skill_bank)
+        procedure = _skill_section(skill.id, skill_bank, extract_procedure)
         if procedure:
             item.append("How to apply:")
             item.append(procedure)
-        constraints = _constraints_for(skill.id, skill_bank)
+        constraints = _skill_section(skill.id, skill_bank, extract_constraints)
         if constraints:
             item.append("Constraints:")
             item.append(constraints)
@@ -135,19 +125,10 @@ def _format_skills(signal: ControllerSignal, skill_bank: SkillBank) -> str:
     return "\n\n".join(parts)
 
 
-def _procedure_for(skill_id: str, skill_bank: SkillBank) -> str:
+def _skill_section(skill_id: str, skill_bank: SkillBank, extract: Callable[[str], str]) -> str:
     if not skill_id:
         return ""
     skill = skill_bank.get(skill_id)
     if not skill:
         return ""
-    return extract_procedure(skill.content)[:MAX_PROCEDURE_CHARS].rstrip()
-
-
-def _constraints_for(skill_id: str, skill_bank: SkillBank) -> str:
-    if not skill_id:
-        return ""
-    skill = skill_bank.get(skill_id)
-    if not skill:
-        return ""
-    return extract_constraints(skill.content)[:MAX_PROCEDURE_CHARS].rstrip()
+    return extract(skill.content)[:MAX_PROCEDURE_CHARS].rstrip()

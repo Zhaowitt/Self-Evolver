@@ -1,30 +1,20 @@
 #!/usr/bin/env bash
-# Shared helpers for the Self-Evolver experiment scripts.
-#
-# Every experiment script sources this file. It derives the repository root from
-# its own location (no absolute paths baked in), loads an optional .env, sets
-# portable defaults for the machine-specific knobs, and exposes small pre-flight
-# checks so each script can fail early with an actionable message.
-#
-# Override any knob from the environment, e.g.
-#   TEST_BACKEND=docker SEED=1 RUNS_DIR=/data/runs scripts/run_full_method.sh
+# Shared helpers sourced by every script: repo root, .env, defaults, checks.
+# Knobs: PYTHON, BENCHMARK, TEST_BACKEND, SEED, RUNS_DIR, WORKSPACE_ROOT, DATA_DIR,
+#        MODEL_NAME, SWEBENCH_DATA_DIR, SIF_CACHE_DIR, FRESH_RUN.
 
-# Resolve the repo root from this file's directory (scripts/ -> repo root).
-_COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${_COMMON_DIR}/.." && pwd)"
+SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPTS_DIR}/.." && pwd)"
 export REPO_ROOT
 
-# Run everything from the repo root so `python -m src...` resolves.
+# `python -m src...` must resolve from the repo root.
 cd "${REPO_ROOT}"
 
-# --- logging helpers ----------------------------------------------------------
 info()  { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 warn()  { printf '[%s] WARN: %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 die()   { printf '[%s] ERROR: %s\n' "$(date +%H:%M:%S)" "$*" >&2; exit 1; }
 
-# --- optional .env ------------------------------------------------------------
-# Load KEY=VALUE lines from .env without clobbering variables already exported
-# in the shell (the shell wins, matching dotenv semantics).
+# Load KEY=VALUE lines from .env; already-exported shell variables win.
 load_dotenv() {
     local env_file="${REPO_ROOT}/.env"
     [ -f "${env_file}" ] || return 0
@@ -48,7 +38,23 @@ load_dotenv() {
 }
 load_dotenv
 
-# --- portable defaults --------------------------------------------------------
+# EasyR1 runs the reward function from its own checkout, so repo-relative paths
+# must be absolute for every process to share the same state.
+absolutize_path_vars() {
+    local name val
+    for name in WORKSPACE_DIR SWEBENCH_DATA_DIR SIF_CACHE_DIR SELF_EVOLVER_EVAL_CACHE_DIR \
+        SELF_EVOLVER_HARD_CASES_PATH SELF_EVOLVER_CLUSTER_REGISTRY SELF_EVOLVER_CLUSTER_BASELINES \
+        SELF_EVOLVER_REWARD_WORKSPACE SELF_EVOLVER_ROLLOUT_JSONL SELF_EVOLVER_SKILLS_DIR; do
+        val="${!name:-}"
+        [ -n "${val}" ] || continue
+        case "${val}" in
+            /*) ;;
+            *) export "${name}=${REPO_ROOT}/${val#./}" ;;
+        esac
+    done
+}
+absolutize_path_vars
+
 PYTHON="${PYTHON:-python}"
 BENCHMARK="${BENCHMARK:-swebench}"          # swebench | swebench_live | swebench_pro | multi_swe_bench
 TEST_BACKEND="${TEST_BACKEND:-apptainer}"   # auto | docker | apptainer | host (HPC default: apptainer)
@@ -58,12 +64,18 @@ WORKSPACE_ROOT="${WORKSPACE_ROOT:-${REPO_ROOT}/workspace}"
 DATA_DIR="${DATA_DIR:-${REPO_ROOT}/data}"
 MODEL_NAME="${MODEL_NAME:-self-evolver}"
 
-# Data + SIF locations are read by the Python code; export them so a child
-# process picks up the same paths (Python expands a leading ~).
+# Paths shared by the stage scripts (one experiment arm = EXPERIMENT + SEED).
+export EXPERIMENT="${EXPERIMENT:-full_method}"
+export ARM_NAME="${ARM_NAME:-${EXPERIMENT}-seed${SEED}}"
+export ARM_DIR="${ARM_DIR:-${RUNS_DIR}/grpo/${ARM_NAME}}"
+export SPLITS_DIR="${SPLITS_DIR:-${DATA_DIR}/splits}"
+export SFT_DIR="${SFT_DIR:-${RUNS_DIR}/controller_sft}"
+export FLAKY_IDS="${FLAKY_IDS:-${SPLITS_DIR}/flaky_ids.txt}"
+
+# Read by the Python code (which expands a leading ~).
 export SWEBENCH_DATA_DIR="${SWEBENCH_DATA_DIR:-${REPO_ROOT}/benchmarks}"
 export SIF_CACHE_DIR="${SIF_CACHE_DIR:-${HOME}/.cache/self_evolver/sif}"
 
-# --- pre-flight checks --------------------------------------------------------
 require_cmd() {
     command -v "$1" >/dev/null 2>&1 || die "required command '$1' not found on PATH. $2"
 }
@@ -92,28 +104,81 @@ require_container_engine() {
 require_api_key() {
     [ -n "${OPENAI_API_KEY:-}" ] || die \
         "OPENAI_API_KEY is not set. Export it or add it to ${REPO_ROOT}/.env (see .env.example). Patch generation calls the worker LLM."
+    [ "${OPENAI_API_KEY}" != "sk-your-api-key-here" ] || die \
+        "OPENAI_API_KEY is still the .env.example placeholder; set a real key."
+}
+
+# Append --exclude-ids args for each id file in $2 (whitespace-separated, or one
+# path with spaces) to the array named $1. Missing files are fatal unless
+# $3=optional: a missing contamination list must not leak eval ids into training.
+exclude_id_args() {
+    local -n _out="$1"
+    local list="$2" mode="${3:-required}" path
+    local -a paths=()
+    if [ -f "${list}" ]; then
+        paths=("${list}")
+    else
+        read -ra paths <<< "${list}"
+    fi
+    for path in "${paths[@]}"; do
+        if [ -f "${path}" ]; then
+            _out+=(--exclude-ids "${path}")
+            info "Excluding ids in ${path}"
+        elif [ "${mode}" = "optional" ]; then
+            warn "Optional id file ${path} not found; skipped"
+        else
+            die "Exclusion id file ${path} not found. Run scripts/2_splits.sh or set ALLOW_MISSING_EXCLUDE_IDS=1."
+        fi
+    done
 }
 
 require_data() {
     [ -d "${SWEBENCH_DATA_DIR}" ] || die \
-        "Benchmark data dir '${SWEBENCH_DATA_DIR}' is missing. Run scripts/download_benchmarks.sh (or set SWEBENCH_DATA_DIR)."
+        "Benchmark data dir '${SWEBENCH_DATA_DIR}' is missing. Run scripts/1_download.sh (or set SWEBENCH_DATA_DIR)."
 }
 
-# Reset the on-disk skill bank to the seed state so an evolution experiment
-# starts clean (opt-in: scripts call this only when RESET_SKILLS=1).
-reset_skill_bank() {
-    local skills_dir="${REPO_ROOT}/skills"
-    info "Resetting skill bank runtime state under ${skills_dir}"
-    rm -f "${skills_dir}/metadata.json"
-    rm -rf "${skills_dir}/_archive"
-    if git -C "${REPO_ROOT}" rev-parse --git-dir >/dev/null 2>&1; then
-        git -C "${REPO_ROOT}" checkout -- skills 2>/dev/null || true
-        git -C "${REPO_ROOT}" clean -fdq skills 2>/dev/null || true
+# Tracked skills/ is the read-only seed bank; experiments evolve their own copies.
+SEED_SKILLS_DIR="${REPO_ROOT}/skills"
+
+# Point this experiment at its own bank (seeded once) so evolved skills never
+# leak into another run's baseline.
+use_skill_bank() {
+    local skills_dir="$1"
+    if [ ! -e "${skills_dir}/.initialized" ]; then
+        mkdir -p "${skills_dir}"
+        cp -a "${SEED_SKILLS_DIR}/." "${skills_dir}/"
+        touch "${skills_dir}/.initialized"
+        info "Initialized skill bank ${skills_dir} from ${SEED_SKILLS_DIR}"
     fi
+    export SELF_EVOLVER_SKILLS_DIR="${skills_dir}"
 }
 
-# Run one benchmark configuration. First arg is the run directory; the rest are
-# passed straight through to `python -m src.main benchmark`.
+# Restore SELF_EVOLVER_SKILLS_DIR to the seed skills (never the seed itself).
+reset_skill_bank() {
+    local skills_dir="${SELF_EVOLVER_SKILLS_DIR:-}"
+    [ -n "${skills_dir}" ] || die "reset_skill_bank needs SELF_EVOLVER_SKILLS_DIR (call use_skill_bank first)."
+    [ "$(cd "${skills_dir}" 2>/dev/null && pwd)" != "$(cd "${SEED_SKILLS_DIR}" && pwd)" ] || \
+        die "Refusing to reset the seed bank itself (${SEED_SKILLS_DIR})."
+    info "Resetting skill bank ${skills_dir} to the seed skills"
+    rm -rf "${skills_dir}"
+    mkdir -p "${skills_dir}"
+    cp -a "${SEED_SKILLS_DIR}/." "${skills_dir}/"
+    touch "${skills_dir}/.initialized"
+}
+
+# Ray, vLLM (zmq) and multiprocessing put AF_UNIX sockets (max 107 bytes)
+# under TMPDIR / RAY_TMPDIR; long job TMPDIRs make them fail to start.
+ensure_short_tmpdir() {
+    export RAY_TMPDIR="${RAY_TMPDIR:-/tmp/ray-${USER:-self-evolver}}"
+    if [ -n "${TMPDIR:-}" ] && [ "${#TMPDIR}" -gt 60 ]; then
+        warn "TMPDIR is too long for AF_UNIX sockets; using ${RAY_TMPDIR}/tmp"
+        export TMPDIR="${RAY_TMPDIR}/tmp"
+    fi
+    mkdir -p "${RAY_TMPDIR}" ${TMPDIR:+"${TMPDIR}"}
+}
+ensure_short_tmpdir
+
+# run_benchmark RUN_DIR [src.main benchmark args...]
 run_benchmark() {
     local run_dir="$1"; shift
     mkdir -p "${run_dir}" "${WORKSPACE_ROOT}"
@@ -125,5 +190,6 @@ run_benchmark() {
         --test-backend "${TEST_BACKEND}" \
         --seed "${SEED}" \
         --model-name "${MODEL_NAME}" \
+        ${FRESH_RUN:+--no-resume} \
         "$@"
 }

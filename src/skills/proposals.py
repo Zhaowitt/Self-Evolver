@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
-from src.skills.failure_types import FailureType
 from src.skills.skill_schema import (
     lint_skill_markdown,
     render_skill_markdown,
@@ -43,7 +42,7 @@ class SkillUpdateProposal:
 
         operation = _clean_text(value.get("operation") or value.get("decision")).lower()
         if operation == "update":
-            operation = "refine"  # legacy name; output is normalized immediately.
+            operation = "refine"  # synonym the Reflector LLM sometimes emits
         if operation not in ALLOWED_SKILL_UPDATE_OPERATIONS:
             return None, f"unsupported operation: {operation or '<missing>'}"
 
@@ -121,7 +120,7 @@ def parse_proposals(value: Any) -> tuple[List[SkillUpdateProposal], List[Dict[st
     if value is None:
         return [], []
     if not isinstance(value, list):
-        return [], [{"reason": "skill_updates must be a list", "proposal": str(value)[:300]}]
+        return [], [{"reason": "cluster_decisions must be a list", "proposal": str(value)[:300]}]
     proposals: List[SkillUpdateProposal] = []
     rejected: List[Dict[str, str]] = []
     for item in value:

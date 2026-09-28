@@ -25,11 +25,7 @@ def is_duplicate_skill(
     threshold: float = 0.88,
     embedding_client: Optional[EmbeddingClient] = None,
 ) -> DedupDecision:
-    """Detect exact or near-duplicate skill content against live and archived skills.
-
-    Returns the best (highest-similarity) match at or above the threshold so the
-    caller can distinguish self-refinements from collisions with other skills.
-    """
+    """Return the best match at or above threshold, so callers can tell self-refinements from collisions."""
     skills = list(existing_skills)
     candidate_hash = content_hash(candidate_content)
     for skill in skills:

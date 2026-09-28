@@ -1,12 +1,6 @@
-"""
-LLM Judge Worker - failure diagnosis and retry routing.
-
-The judge is intentionally not allowed to declare success. It only routes
-failed attempts based on deterministic verifier output and concise context.
-"""
+"""LLM judge that routes failed attempts; it can never declare success."""
 
 import json
-import logging
 import re
 from dataclasses import dataclass
 from enum import Enum
@@ -16,12 +10,8 @@ from src.environment.models import ExecutionContext
 from src.llm.client import LLMClient
 from src.workers.base import BaseWorker, WorkerResult
 
-logger = logging.getLogger(__name__)
-
 
 class JudgeRoute(Enum):
-    """Allowed retry routes from the LLM judge."""
-
     REPAIR_PATCH_FORMAT = "repair_patch_format"
     REGENERATE_PATCH_SAME_LOCATION = "regenerate_patch_same_location"
     REINSPECT = "reinspect"
@@ -31,8 +21,6 @@ class JudgeRoute(Enum):
 
 @dataclass
 class JudgeDecision:
-    """Structured LLM judge decision."""
-
     failure_category: str
     route: JudgeRoute
     feedback_for_next_attempt: str
@@ -74,7 +62,6 @@ class LLMJudge(BaseWorker):
         return LLM_JUDGE_SYSTEM_PROMPT
 
     def execute(self, context: ExecutionContext, iteration_record=None) -> WorkerResult[JudgeDecision]:
-        """Judge the failed attempt and choose the next retry route."""
         try:
             user_message = self._build_prompt(context, iteration_record)
             response = self._call_llm(user_message)
@@ -191,10 +178,8 @@ class LLMJudge(BaseWorker):
         if not iteration_record:
             return JudgeDecision(category, route, feedback, confidence=0.0)
 
-        # A patch worker that crashed (parse/API error) returns no patch_result
-        # at all but records an error. That is a generation failure, not a
-        # deliberately empty patch, so retry generation rather than reprompting
-        # for "non-empty" content.
+        # A crashed patch worker (no patch_result, but an error) is a generation
+        # failure, not an empty patch: retry generation instead of reprompting.
         if getattr(iteration_record, "patch_result", None) is None and getattr(
             iteration_record, "error", None
         ):

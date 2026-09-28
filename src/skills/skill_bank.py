@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -44,12 +45,23 @@ class SkillMetadata:
         )
 
 
+def default_skills_dir() -> Path:
+    """$SELF_EVOLVER_SKILLS_DIR, else the read-only seed bank <repo>/skills."""
+    configured = os.getenv("SELF_EVOLVER_SKILLS_DIR", "").strip()
+    if not configured:
+        return Path(__file__).resolve().parents[2] / "skills"
+    path = Path(configured).expanduser()
+    if not path.is_dir():
+        # A mistyped bank path would otherwise train silently with zero candidates.
+        raise FileNotFoundError(f"SELF_EVOLVER_SKILLS_DIR={path} does not exist (see use_skill_bank)")
+    return path
+
+
 class SkillBank:
     """Read Markdown skills, re-loading whenever the skills directory changes on disk."""
 
     def __init__(self, skills_dir: Optional[Path] = None):
-        repo_root = Path(__file__).resolve().parents[2]
-        self.skills_dir = Path(skills_dir or repo_root / "skills")
+        self.skills_dir = Path(skills_dir or default_skills_dir())
         self._skills: Optional[List[SkillMetadata]] = None
         self._signature: Optional[tuple] = None
 
@@ -72,7 +84,6 @@ class SkillBank:
         return None
 
     def _dir_signature(self) -> Optional[tuple]:
-        """Snapshot of directory + skill/metadata file mtimes used for cache invalidation."""
         if not self.skills_dir.exists():
             return None
         paths = sorted(self.skills_dir.glob("*.md"))
@@ -105,7 +116,6 @@ def parse_skill_content(path: Path, content: str) -> SkillMetadata:
 
 
 def extract_procedure(content: str) -> str:
-    """Return the skill's '## How to Apply' procedure block (without the heading)."""
     match = re.search(r"^## How to Apply\s*(.*?)(?:\n## |\Z)", content, re.DOTALL | re.MULTILINE)
     if not match:
         return ""
@@ -114,7 +124,6 @@ def extract_procedure(content: str) -> str:
 
 
 def extract_constraints(content: str) -> str:
-    """Return the canonical Constraints block without its heading."""
     match = re.search(r"^## Constraints\s*(.*?)(?:\n## |\nAction type:|\Z)", content, re.DOTALL | re.MULTILINE)
     if not match:
         return ""

@@ -8,6 +8,15 @@ import re
 from src.controller.schema import ControllerSignal
 
 
+def strip_reasoning(content: str) -> str:
+    """Text after the last ``</think>``; unterminated reasoning has no answer."""
+    if "</think>" in content:
+        return content.rsplit("</think>", 1)[1]
+    if "<think>" in content:
+        raise ValueError("controller response reasoning was not terminated")
+    return content
+
+
 def extract_json_object(content: str) -> str:
     """Extract the first JSON object from a raw LLM response."""
     fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
@@ -50,7 +59,7 @@ def parse_controller_response(
 ) -> ControllerSignal:
     """Parse a controller response, returning a safe empty signal on failure."""
     try:
-        json_text = extract_json_object(content or "")
+        json_text = extract_json_object(strip_reasoning(content or ""))
         data = json.loads(json_text)
         if not isinstance(data, dict):
             raise ValueError("controller response JSON must be an object")

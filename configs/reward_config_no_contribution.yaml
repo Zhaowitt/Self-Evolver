@@ -1,0 +1,12 @@
+# Ablation arm: reward without skill contribution; REWARD_CONFIG=configs/reward_config_no_contribution.yaml.
+weights:
+  official_resolved: 0.3
+  official_f2p_fraction: 0.7
+cost_token_budget: 60000
+token_cost_weight: 0.05
+token_cost_deadband: 0.5
+contribution_weight: 0.0
+cluster_baseline_min_count: 3
+skill_write_gate: 0.55
+# Invalid Controller JSON; must stay below -(token_cost_weight + contribution_weight).
+format_failure_reward: -0.5

@@ -1,9 +1,4 @@
-"""
-Execution Orchestrator - Static Workflow Coordination.
-
-Manages the execution flow: Inspector -> Patch Generator -> Verifier
-with retry logic on failures.
-"""
+"""Inspector -> Patch Generator -> Verifier loop with judge-routed retries."""
 
 import logging
 import os
@@ -27,14 +22,10 @@ from src.workers.llm_judge import JudgeDecision, JudgeRoute, LLMJudge
 from src.workers.patch_generator import PatchGenerator, PatchResult
 from src.workers.verifier import Verifier, VerificationResult
 
-logger = logging.getLogger(__name__)
-
 SYSTEM_MAX_ITERATIONS = 3
 
 
 class ExecutionStatus(Enum):
-    """Overall execution status."""
-    
     SUCCESS = "success"
     FAILED = "failed"
     MAX_ITERATIONS = "max_iterations_reached"
@@ -43,8 +34,6 @@ class ExecutionStatus(Enum):
 
 @dataclass
 class IterationRecord:
-    """Record of a single iteration attempt."""
-    
     iteration: int
     inspection_result: Optional[InspectionResult] = None
     patch_result: Optional[PatchResult] = None
@@ -57,8 +46,6 @@ class IterationRecord:
 
 @dataclass
 class ExecutionResult:
-    """Final result of the orchestrated execution."""
-    
     status: ExecutionStatus
     issue_id: str
     success: bool = False
@@ -69,7 +56,7 @@ class ExecutionResult:
     iteration_records: List[IterationRecord] = field(default_factory=list)
     error_message: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
-    
+
     @property
     def summary(self) -> str:
         status_str = "SUCCESS" if self.success else "FAILED"
@@ -81,17 +68,16 @@ class ExecutionResult:
         )
 
 
+def final_candidate_record(records: List[IterationRecord]) -> Optional[IterationRecord]:
+    """The episode's final candidate: last attempt that produced a real diff."""
+    for record in reversed(records):
+        verification = record.verification_result
+        if verification is not None and verification.canonical_patch_content.strip():
+            return record
+    return None
+
+
 class ExecutionOrchestrator:
-    """
-    Static workflow orchestrator.
-    
-    Coordinates the execution flow:
-    1. Inspector analyzes the issue
-    2. Patch Generator creates a fix
-    3. Verifier tests the fix
-    4. If failed, retry with feedback (up to max_iterations)
-    """
-    
     def __init__(
         self,
         env: ProjectEnvironment,
@@ -102,22 +88,6 @@ class ExecutionOrchestrator:
         skill_bank: Any = None,
         stage: Optional[str] = None,
     ):
-        """
-        Initialize the orchestrator.
-
-        Args:
-            env: Project environment for code operations.
-            llm_client: Shared LLM client for all workers.
-            max_iterations: Maximum retry attempts. Uses config default if None.
-            controller_signal: Optional controller guidance (skill selection + strategy).
-            test_backend: Optional test backend (``src.environment.test_backend``);
-                when given, the Verifier grades SWE-bench instances with official
-                per-test FAIL_TO_PASS / PASS_TO_PASS semantics in the loop.
-            skill_bank: Optional SkillBank whose "How to Apply" procedures are
-                injected into worker prompts. Pass the run's bank (a frozen
-                snapshot during eval) so guidance matches what is evaluated;
-                defaults to the shared repo skill bank.
-        """
         self.env = env
         self.llm_client = llm_client or LLMClient()
         requested_iterations = max_iterations or get_config().agent.max_iterations
@@ -127,7 +97,6 @@ class ExecutionOrchestrator:
             self.controller_signal.mode if self.controller_signal else "train"
         )
 
-        # Initialize workers with shared LLM client
         self.inspector = Inspector(env, self.llm_client, skill_bank=skill_bank)
         self.patch_generator = PatchGenerator(env, self.llm_client, skill_bank=skill_bank)
         self.verifier = Verifier(env, self.llm_client, test_backend=test_backend)
@@ -138,27 +107,15 @@ class ExecutionOrchestrator:
     def _effective_max_iterations(self) -> int:
         """Return the system-owned hard cap; Controller output cannot change it."""
         return max(1, self.max_iterations)
-    
+
     def run(self, issue: Issue) -> ExecutionResult:
-        """
-        Execute the full workflow for an issue.
-        
-        Args:
-            issue: The issue to solve.
-            
-        Returns:
-            ExecutionResult with status and details.
-        """
         start_time = time.time()
         self.logger.info(f"Starting execution for issue: {issue.id}")
 
-        # Reset token counter
         self.llm_client.reset_token_count()
 
-        # The iteration cap is system-owned and identical across Controller actions.
         max_iterations = self._effective_max_iterations()
 
-        # Initialize context
         repo_state = self.env.get_repo_state()
         context = ExecutionContext(
             issue=issue,
@@ -169,8 +126,9 @@ class ExecutionOrchestrator:
         if self.controller_signal:
             context.metadata["controller_signal"] = self.controller_signal.to_dict()
 
-        # Set up environment for the issue
-        if not self.env.setup_issue(issue):
+        # With a container grader the hidden tests stay out of the agents'
+        # checkout; host grading needs them applied locally.
+        if not self.env.setup_issue(issue, apply_test_patch=not self._grades_in_container(issue)):
             return ExecutionResult(
                 status=ExecutionStatus.ERROR,
                 issue_id=issue.id,
@@ -187,12 +145,11 @@ class ExecutionOrchestrator:
             context.iteration = iteration
             context.metadata["next_route"] = next_route.value
             self.logger.info(f"=== Iteration {iteration + 1}/{max_iterations} ===")
-            
+
             iter_start = time.time()
             record = IterationRecord(iteration=iteration)
-            
+
             try:
-                # Step 1: Inspection
                 if current_inspection is None or next_route == JudgeRoute.REINSPECT:
                     self.logger.info("Step 1: Running Inspector...")
                     inspect_result = self.inspector.execute(context)
@@ -211,14 +168,12 @@ class ExecutionOrchestrator:
                     self.logger.info(f"Step 1: Reusing inspection for route {next_route.value}")
 
                 record.inspection_result = current_inspection
-                
-                # Step 2: Patch Generation
+
                 self.logger.info("Step 2: Running Patch Generator...")
                 patch_result = self.patch_generator.execute(context, current_inspection)
-                
+
                 if not patch_result.success or not patch_result.data:
-                    # A worker exception (parse/API error) is diagnosed by the
-                    # judge, not silently treated as an empty patch.
+                    # Worker exceptions go to the judge rather than being treated as an empty patch.
                     record.error = f"Patch generation failed: {patch_result.error}"
                     record.duration_ms = (time.time() - iter_start) * 1000
                     iteration_records.append(record)
@@ -248,21 +203,19 @@ class ExecutionOrchestrator:
                     if next_route == JudgeRoute.REINSPECT:
                         current_inspection = None
                     continue
-                
-                # Step 3: Verification
+
                 self.logger.info("Step 3: Running Verifier...")
                 verify_result = self.verifier.execute(context, patch_result.data)
-                
+
                 record.verification_result = verify_result.data
                 record.tokens_used += verify_result.tokens_used
                 record.duration_ms = (time.time() - iter_start) * 1000
                 iteration_records.append(record)
-                
+
                 if verify_result.success and verify_result.data and verify_result.data.success:
-                    # Success!
                     self.logger.info("Verification passed! Issue fixed.")
                     final_patch = verify_result.data.canonical_patch_info or patch_result.data.patch_info
-                    
+
                     total_duration = (time.time() - start_time) * 1000
                     return ExecutionResult(
                         status=ExecutionStatus.SUCCESS,
@@ -275,16 +228,14 @@ class ExecutionOrchestrator:
                         iteration_records=iteration_records,
                         metadata=self._base_result_metadata(),
                     )
-                
-                # Verification failed - prepare for retry
+
                 self.logger.info("Verification failed, preparing for retry...")
-                
-                # Update context with failure information
+
                 if verify_result.data and verify_result.data.canonical_patch_info:
                     context.previous_patches.append(verify_result.data.canonical_patch_info)
                 elif patch_result.data.patch_info:
                     context.previous_patches.append(patch_result.data.patch_info)
-                
+
                 if verify_result.data and verify_result.data.test_result:
                     context.test_results.append(verify_result.data.test_result)
                 if verify_result.data:
@@ -298,7 +249,7 @@ class ExecutionOrchestrator:
                     break
                 if next_route == JudgeRoute.REINSPECT:
                     current_inspection = None
-                
+
             except Exception as e:
                 self.logger.error(f"Iteration {iteration + 1} error: {e}")
                 record.error = str(e)
@@ -306,8 +257,32 @@ class ExecutionOrchestrator:
                 iteration_records.append(record)
                 context.previous_errors.append(str(e))
                 next_route = JudgeRoute.REINSPECT
-        
-        # Max iterations reached
+
+        # The final candidate needs a full official outcome even if it only ran the
+        # subset gate; final reward never reads subset evidence.
+        final_record = final_candidate_record(iteration_records)
+        if final_record is not None:
+            try:
+                finalize = getattr(self.verifier, "finalize_full_eval", None)
+                if finalize is not None:
+                    finalize(context, final_record.verification_result)
+            except Exception as e:
+                self.logger.error(f"Final full evaluation failed: {e}")
+            verification = final_record.verification_result
+            if verification is not None and verification.success:
+                total_duration = (time.time() - start_time) * 1000
+                return ExecutionResult(
+                    status=ExecutionStatus.SUCCESS,
+                    issue_id=issue.id,
+                    success=True,
+                    iterations_used=len(iteration_records),
+                    total_tokens=self.llm_client.total_tokens_used,
+                    total_duration_ms=total_duration,
+                    final_patch=verification.canonical_patch_info,
+                    iteration_records=iteration_records,
+                    metadata=self._base_result_metadata(),
+                )
+
         total_duration = (time.time() - start_time) * 1000
         self.logger.warning(f"Max iterations ({max_iterations}) reached without success")
 
@@ -333,12 +308,27 @@ class ExecutionOrchestrator:
             },
         )
 
+    def _grades_in_container(self, issue: Issue) -> bool:
+        """True when an isolated official backend (not the host) grades this issue."""
+        from src.environment.test_backend import HostTestBackend
+        from src.workers.verifier import _fail_to_pass
+
+        backend = getattr(self.verifier, "test_backend", None)
+        return (
+            backend is not None
+            and not isinstance(backend, HostTestBackend)
+            and bool(_fail_to_pass(issue))
+        )
+
     def _judge_failed_attempt(
         self,
         context: ExecutionContext,
         record: IterationRecord,
     ) -> None:
         """Run LLM judge after a failed attempt and store retry feedback."""
+        if context.iteration + 1 >= context.max_iterations:
+            # No retry follows; judging would only cost tokens and overwrite the termination reason.
+            return
         judge_result = self.llm_judge.execute(context, record)
         if judge_result.data:
             record.judge_decision = judge_result.data
@@ -348,7 +338,6 @@ class ExecutionOrchestrator:
             record.tokens_used += judge_result.tokens_used
 
     def _route_from_record(self, record: IterationRecord) -> JudgeRoute:
-        """Extract the next route from a judged record, defaulting to reinspect."""
         if record.judge_decision:
             return record.judge_decision.route
         return JudgeRoute.REINSPECT
@@ -360,12 +349,7 @@ class ExecutionOrchestrator:
         reason: str,
         budget: int,
     ) -> None:
-        """Append a stage-tagged hard-case record for later failure analysis.
-
-        The failure type is left to the buffer, which derives it from the
-        verifier statuses via the unified taxonomy in
-        ``src.skills.failure_types``.
-        """
+        """Append a stage-tagged hard-case record; the buffer derives the failure type."""
         try:
             output_path = resolve_hard_cases_path()
             HardCaseBuffer(output_path).append_from_execution(

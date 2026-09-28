@@ -14,7 +14,7 @@ from src.critic.judge import CriticJudge
 from src.environment.models import Issue
 from src.environment.project_env import ProjectEnvironment
 from src.llm.client import LLMClient
-from src.orchestrator.orchestrator import ExecutionOrchestrator, ExecutionResult
+from src.orchestrator.orchestrator import ExecutionOrchestrator, final_candidate_record, ExecutionResult
 from src.reward.reward_model import RewardModel, RewardResult
 from src.rl.rollout_writer import RolloutWriter, build_rollout_record
 from src.skills.skill_evolver import SkillEvolver
@@ -24,8 +24,6 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class OnlineRolloutResult:
-    """Result of one controller-guided repair rollout."""
-
     execution_result: ExecutionResult
     evaluation: Any
     reward: RewardResult
@@ -51,17 +49,7 @@ def run_online_rollout(
     experiment: Optional[str] = None,
     verify_in_loop: bool = True,
 ) -> OnlineRolloutResult:
-    """Run the repair loop, grade the final patch, score it, and log the rollout.
-
-    When ``test_backend`` (a ``src.environment.test_backend`` backend) is
-    provided and the episode produced a non-empty patch, the patch is graded
-    with official SWE-bench eval semantics and the resulting ``EvalOutcome``
-    drives the test components of the utility.
-
-    With ``verify_in_loop`` each train patch first runs its frozen F2P subset.
-    Only subset-passing patches (plus the final usable patch) run full official
-    F2P+P2P.  Final reward reads the full outcome only.
-    """
+    """Run the repair loop, grade the final patch officially, score it, and log the rollout."""
     judge = judge or CriticJudge()
     reward_model = reward_model or RewardModel.from_config_file()
 
@@ -74,10 +62,9 @@ def run_online_rollout(
         stage=stage,
     ).run(issue)
 
-    # Reuse only a final full in-loop outcome.  A subset-only final attempt is
-    # not silently promoted, nor is an earlier patch re-graded as the final one.
+    # Only the final candidate's full in-loop outcome counts; subset results are never promoted.
     eval_outcome = _final_eval_outcome(result) if verify_in_loop else None
-    if eval_outcome is None and test_backend is not None and not verify_in_loop:
+    if test_backend is not None and not verify_in_loop:
         patch = model_patch_from_execution(result)
         if patch.strip():
             evaluator = getattr(test_backend, "run_full_eval", test_backend.run_swebench_eval)
@@ -138,18 +125,20 @@ def run_online_rollout(
 
 
 def _final_eval_outcome(result: ExecutionResult) -> Any:
-    """Full outcome of the final attempted candidate, never a subset/older patch."""
-    records = list(getattr(result, "iteration_records", []) or [])
-    if not records:
+    record = final_candidate_record(list(getattr(result, "iteration_records", []) or []))
+    if record is None:
         return None
-    verification = getattr(records[-1], "verification_result", None)
-    if not verification or getattr(verification, "evaluation_scope", "full") != "full":
+    verification = getattr(record, "verification_result", None)
+    if not verification or getattr(verification, "evaluation_scope", "full") not in {
+        "full",
+        "f2p_only",
+    }:
         return None
     return getattr(verification, "eval_outcome", None)
 
 
 def model_patch_from_execution(result: ExecutionResult) -> str:
-    """Best canonical (git-generated) patch produced by an execution."""
+    """Final patch, else the latest canonical (git-generated) verification patch."""
     final_patch = getattr(result, "final_patch", None)
     if final_patch and getattr(final_patch, "content", "").strip():
         return final_patch.content
@@ -161,7 +150,6 @@ def model_patch_from_execution(result: ExecutionResult) -> str:
 
 
 def swebench_instance_from_issue(issue: Issue) -> dict[str, Any]:
-    """Rebuild the official SWE-bench instance dict a test backend needs."""
     instance: dict[str, Any] = {
         "instance_id": issue.id,
         "repo": issue.repo_name,
@@ -179,7 +167,6 @@ def swebench_instance_from_issue(issue: Issue) -> dict[str, Any]:
 
 
 def build_targeted_test_cmd(issue: Issue) -> Optional[str]:
-    """Build a focused pytest command from SWE-bench FAIL_TO_PASS metadata."""
     raw = issue.metadata.get("fail_to_pass")
     if not raw:
         return None

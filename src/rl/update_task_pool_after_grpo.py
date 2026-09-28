@@ -54,6 +54,9 @@ def update_task_pool_after_grpo(
     duplicates = 0
     baseline_samples: list[Dict[str, Any]] = []
     for record in records:
+        # Collected even for processed rollouts: update_round is idempotent per
+        # round, so a crash before the baseline update cannot drop the round.
+        _collect_baseline_sample(record, round_id, baseline_samples)
         rollout_id = str(record.get("rollout_id") or "")
         if rollout_id and rollout_id in processed:
             duplicates += 1
@@ -73,17 +76,14 @@ def update_task_pool_after_grpo(
             observed_failure_label=str(diagnosis.get("mechanism") or ""),
             stable_cluster_id=cluster_id,
         )
-        if cluster_id and reward.get("task_reward") is not None:
-            baseline_samples.append(
-                {"cluster_id": cluster_id, "task_reward": reward.get("task_reward")}
-            )
         applied += 1
         if rollout_id:
             processed.add(rollout_id)
+    # Persist processed ids right after the pool so a rerun never applies outcomes twice.
     pool.save()
+    _save_processed_rollouts(ingestion_path, processed)
     baseline_store = ClusterBaselineStore(cluster_baselines_path)
     baseline_store.update_round(baseline_samples, round_id=round_id)
-    _save_processed_rollouts(ingestion_path, processed)
     return {
         "round_id": round_id,
         "rollout_count": len(records),
@@ -94,6 +94,19 @@ def update_task_pool_after_grpo(
         "cluster_baselines": str(baseline_store.path),
         "cluster_baseline_samples": len(baseline_samples),
     }
+
+
+def _collect_baseline_sample(
+    record: Dict[str, Any], round_id: str, samples: list[Dict[str, Any]]
+) -> None:
+    reward = record.get("reward") or {}
+    cluster_id = str(reward.get("cluster_id") or record.get("stable_cluster_id") or "")
+    record_round = str(record.get("round_id") or "")
+    # Re-reading older rounds (e.g. after RESET_TASK_POOL) must not double count.
+    if cluster_id and reward.get("task_reward") is not None and (
+        not record_round or record_round == round_id
+    ):
+        samples.append({"cluster_id": cluster_id, "task_reward": reward.get("task_reward")})
 
 
 def _state_instances(path: Path) -> list[Dict[str, Any]]:

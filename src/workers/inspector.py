@@ -1,12 +1,6 @@
-"""
-Inspector Worker - Fault Localization Agent.
-
-Responsible for analyzing issues, error logs, and stack traces
-to identify the most likely location of bugs.
-"""
+"""Inspector worker: fault localization with read-only repository tools."""
 
 import json
-import logging
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -21,13 +15,9 @@ from src.environment.project_env import ProjectEnvironment
 from src.llm.client import LLMClient, LLMResponse, Message
 from src.workers.base import BaseWorker, WorkerResult
 
-logger = logging.getLogger(__name__)
-
 
 @dataclass
 class InspectionResult:
-    """Result of the inspection/fault localization process."""
-    
     suspected_files: List[str] = field(default_factory=list)
     suspected_locations: List[CodeLocation] = field(default_factory=list)
     root_cause_analysis: str = ""
@@ -78,8 +68,6 @@ You MUST respond with a valid JSON object in the following format:
 
 
 class Inspector(BaseWorker):
-    """Inspector worker for fault localization."""
-    
     def __init__(
         self,
         env: ProjectEnvironment,
@@ -93,21 +81,20 @@ class Inspector(BaseWorker):
         self.max_tool_calls = max(0, agent_config.inspector_max_tool_calls)
         self.read_max_lines = max(1, agent_config.inspector_read_max_lines)
         self.read_max_chars = max(1000, agent_config.inspector_read_max_chars)
-    
+
     @property
     def system_prompt(self) -> str:
         return INSPECTOR_SYSTEM_PROMPT
-    
+
     def execute(self, context: ExecutionContext) -> WorkerResult[InspectionResult]:
-        """Execute fault localization."""
         self.logger.info(f"Starting inspection for issue: {context.issue.id}")
-        
+
         try:
             user_message = self._build_analysis_prompt(context)
             additional_context = None
             if context.has_previous_attempt:
                 additional_context = self._build_retry_context(context)
-            
+
             response, tool_trace = self._call_llm_with_repo_tools(
                 user_message,
                 additional_context,
@@ -115,26 +102,25 @@ class Inspector(BaseWorker):
             result = self._parse_response(response.content)
             result = self._validate_result_paths(result)
             result.relevant_code_snippets = self._fetch_code_snippets(result)
-            
+
             self.logger.info(
                 f"Inspection complete: {len(result.suspected_files)} files, "
                 f"{len(result.suspected_locations)} locations, "
                 f"{len(tool_trace)} tool calls"
             )
-            
+
             return WorkerResult(
                 success=True,
                 data=result,
                 llm_response=response,
                 metadata={"tool_trace": tool_trace},
             )
-            
+
         except Exception as e:
             self.logger.error(f"Inspection failed: {e}")
             return WorkerResult(success=False, error=str(e))
-    
+
     def _build_analysis_prompt(self, context: ExecutionContext) -> str:
-        """Build the main analysis prompt."""
         parts = []
         parts.append("## Issue Description")
         parts.append(context.issue.description)
@@ -149,9 +135,9 @@ class Inspector(BaseWorker):
         if context.issue.hints:
             parts.append("\n## Hints")
             parts.append(context.issue.hints)
-        
+
         parts.append(f"\n## Repository: {context.repo_state.path.name}")
-        
+
         try:
             language = context.issue.metadata.get("repo_language") if context.issue.metadata else None
             source_files: List[str] = []
@@ -161,20 +147,17 @@ class Inspector(BaseWorker):
             parts.append("\n".join(f"- {f}" for f in source_files[:50]))
         except Exception as e:
             self.logger.warning(f"Could not list files: {e}")
-        
+
         if context.last_test_result and context.last_test_result.error_logs:
             parts.append("\n## Error Logs:")
             parts.append(f"```\n{context.last_test_result.error_logs[:3000]}\n```")
-        
+
         return "\n".join(parts)
-    
+
     def _build_retry_context(self, context: ExecutionContext) -> str:
-        """Build context for retry attempts."""
         parts = [f"## This is attempt #{context.iteration + 1}"]
 
-        # On a re-inspection the judge already critiqued the previous
-        # localization; surface its routing and feedback so the fault region is
-        # reconsidered instead of repeated.
+        # Surface the judge's critique so the fault region is reconsidered, not repeated.
         judge_route = context.metadata.get("next_route")
         judge_feedback = context.metadata.get("judge_feedback")
         if judge_feedback or judge_route:
@@ -188,18 +171,18 @@ class Inspector(BaseWorker):
         error_context = self._format_error_context(context)
         if error_context:
             parts.append(error_context)
-        
+
         test_context = self._format_test_results(context)
         if test_context:
             parts.append(test_context)
-        
+
         if context.previous_patches:
             parts.append("\n## Previous Patches (failed):")
             for i, patch in enumerate(context.previous_patches, 1):
                 parts.append(f"\n### Patch {i}:")
                 parts.append(f"Modified files: {', '.join(patch.modified_files)}")
                 parts.append(f"```diff\n{patch.content[:1500]}\n```")
-        
+
         parts.append("\n**Please analyze why previous attempts failed and try a different approach.**")
         return "\n".join(parts)
 
@@ -299,12 +282,10 @@ class Inspector(BaseWorker):
 
     @staticmethod
     def _accumulate_usage(total_usage: Dict[str, int], response: LLMResponse) -> None:
-        """Accumulate token usage across a tool loop."""
         for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
             total_usage[key] += response.usage.get(key, 0)
 
     def _repo_tool_schemas(self) -> List[Dict[str, Any]]:
-        """Return OpenAI-compatible schemas for read-only repository tools."""
         return [
             {
                 "type": "function",
@@ -366,7 +347,6 @@ class Inspector(BaseWorker):
         ]
 
     def _execute_repo_tool(self, tool_call: Dict[str, Any]) -> str:
-        """Dispatch a repository tool call and return a text result."""
         name = self._tool_call_name(tool_call)
         arguments_text = self._tool_call_arguments_text(tool_call)
         try:
@@ -408,7 +388,6 @@ class Inspector(BaseWorker):
         return f"ERROR: {message}"
 
     def _resolve_repo_path(self, path: str) -> Path:
-        """Resolve and validate a repo-relative path."""
         if not path or not isinstance(path, str):
             raise ValueError("path is required")
         normalized = path.replace("\\", "/").strip()
@@ -439,7 +418,6 @@ class Inspector(BaseWorker):
         start_line: Optional[int] = None,
         end_line: Optional[int] = None,
     ) -> str:
-        """Read a repo file and return line-numbered text."""
         file_path = self._resolve_repo_path(path)
         if not file_path.exists() or not file_path.is_file():
             raise FileNotFoundError(f"File not found: {path}")
@@ -471,7 +449,6 @@ class Inspector(BaseWorker):
         return f"{header}\n{rendered}"
 
     def _tool_list_dir(self, path: str = ".") -> str:
-        """List a repo directory."""
         dir_path = self._resolve_repo_path(path or ".")
         if not dir_path.exists() or not dir_path.is_dir():
             raise FileNotFoundError(f"Directory not found: {path}")
@@ -510,8 +487,10 @@ class Inspector(BaseWorker):
             str(max_matches),
         ]
         if glob:
-            command.extend(["--glob", str(glob)])
-        command.extend([pattern, str(search_path)])
+            # ``--glob=VALUE`` keeps a leading "-" from being parsed as an option.
+            command.append(f"--glob={glob}")
+        # ``-e``/``--`` stop an LLM-chosen pattern like "--pre=cmd" from acting as an option.
+        command.extend(["-e", pattern, "--", str(search_path)])
 
         try:
             result = subprocess.run(
@@ -532,7 +511,6 @@ class Inspector(BaseWorker):
         return self._grep_repo_fallback(pattern, search_path, glob, max_matches)
 
     def _format_rg_output(self, output: str, max_matches: int) -> str:
-        """Normalize ripgrep output to repo-relative paths."""
         formatted = []
         for line in output.splitlines()[:max_matches]:
             parts = line.rsplit(":", 2)
@@ -556,7 +534,6 @@ class Inspector(BaseWorker):
         glob: Optional[str],
         max_matches: int,
     ) -> str:
-        """Fallback grep implementation when ripgrep is unavailable."""
         matches = []
         regex = re.compile(pattern)
         paths = [search_path] if search_path.is_file() else search_path.rglob("*")
@@ -603,9 +580,8 @@ class Inspector(BaseWorker):
         except ValueError:
             return False
         return resolved.exists() and resolved.is_file()
-    
+
     def _parse_response(self, content: str) -> InspectionResult:
-        """Parse the LLM response into InspectionResult."""
         json_match = re.search(r'```json\s*(.*?)\s*```', content, re.DOTALL)
         if json_match:
             json_str = json_match.group(1)
@@ -615,7 +591,7 @@ class Inspector(BaseWorker):
                 json_str = json_match.group(0)
             else:
                 return self._parse_fallback(content)
-        
+
         try:
             data = json.loads(json_str)
             locations = []
@@ -626,7 +602,7 @@ class Inspector(BaseWorker):
                     end_line=loc.get("end_line"),
                     snippet=loc.get("reason", ""),
                 ))
-            
+
             return InspectionResult(
                 suspected_files=data.get("suspected_files", []),
                 suspected_locations=locations,
@@ -637,9 +613,8 @@ class Inspector(BaseWorker):
         except json.JSONDecodeError as e:
             self.logger.warning(f"JSON parse error: {e}")
             return self._parse_fallback(content)
-    
+
     def _parse_fallback(self, content: str) -> InspectionResult:
-        """Fallback parsing when JSON extraction fails."""
         file_pattern = r'[\w/]+\.py'
         files = list(set(re.findall(file_pattern, content)))
         return InspectionResult(
@@ -648,9 +623,8 @@ class Inspector(BaseWorker):
             fix_suggestions=["Review the analysis above for fix suggestions"],
             confidence=0.3,
         )
-    
+
     def _fetch_code_snippets(self, result: InspectionResult) -> dict:
-        """Fetch code snippets for suspected locations."""
         snippets = {}
         for location in result.suspected_locations[:5]:
             try:

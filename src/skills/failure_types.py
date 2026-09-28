@@ -8,8 +8,6 @@ from typing import Iterable, Optional
 
 
 class FailureType(str, Enum):
-    """Single failure vocabulary used across the whole framework."""
-
     NONE = "none"
     LOCALIZATION_ERROR = "localization_error"
     PATCH_GENERATION_ERROR = "patch_generation_error"
@@ -30,25 +28,6 @@ class FailureType(str, Enum):
 
 FAILURE_TYPE_VALUES = frozenset(item.value for item in FailureType)
 
-# Values a skill may declare as its target (ordered; used in the controller prompt).
-TARGET_FAILURE_TYPES: tuple[str, ...] = (
-    FailureType.LOCALIZATION_ERROR.value,
-    FailureType.PATCH_GENERATION_ERROR.value,
-    FailureType.PATCH_APPLICATION_ERROR.value,
-    FailureType.TEST_FAILURE.value,
-    FailureType.REGRESSION_INTRODUCED.value,
-    FailureType.UNKNOWN.value,
-    FailureType.GENERAL.value,
-    FailureType.LOCALIZATION_FAILURE.value,
-    FailureType.WRONG_ROOT_CAUSE.value,
-    FailureType.PATCH_GENERATION_FAILURE.value,
-    FailureType.PATCH_APPLICATION_FAILURE.value,
-    FailureType.INCOMPLETE_FIX.value,
-    FailureType.TEST_INTERPRETATION_FAILURE.value,
-    FailureType.ENVIRONMENT_FAILURE.value,
-)
-
-# Verifier status strings -> taxonomy.
 _VERIFICATION_STATUS_MAP = {
     "patch_failed": FailureType.PATCH_APPLICATION_ERROR,
     "no_changes": FailureType.PATCH_APPLICATION_ERROR,
@@ -84,7 +63,6 @@ def normalize_failure_type(value: object, default: str = FailureType.UNKNOWN.val
 
 
 def failure_type_from_verification_status(status: object) -> str:
-    """Map a verifier status string to a taxonomy value."""
     text = str(status or "").strip().lower()
     if not text:
         return FailureType.UNKNOWN.value

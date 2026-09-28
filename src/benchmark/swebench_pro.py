@@ -1,23 +1,11 @@
-"""SWE-bench Pro runner.
-
-SWE-bench Pro (scaleapi/SWE-bench_Pro-os) is a harder, multi-language OOD set.
-Patch generation is benchmark-agnostic, so it runs through the standard rollout
-and produces a predictions file. Grading, however, uses Pro's own multi-language
-harness (``swe_bench_pro_eval.py``) with per-instance images at
-``jefzda/sweap-images:<dockerhub_tag>`` and non-pytest test identifiers; this
-framework does not reimplement that grader, so eval fails loudly with the exact
-command to run rather than emit unverified numbers.
-"""
+"""SWE-bench Pro runner: generation only; grading is delegated to the official harness."""
 
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 from typing import Any
 
 from src.benchmark.swebench_runner import SWEBenchRunner
-
-logger = logging.getLogger(__name__)
 
 PRO_IMAGE_NAMESPACE = "jefzda/sweap-images"
 PRO_OFFICIAL_REPO = "https://github.com/scaleapi/SWE-bench_Pro-os"
@@ -25,11 +13,6 @@ PRO_OFFICIAL_REPO = "https://github.com/scaleapi/SWE-bench_Pro-os"
 
 class ProEvaluationUnavailable(RuntimeError):
     """Raised when Pro grading is requested from this framework instead of the official harness."""
-
-
-def pro_image_ref(dockerhub_tag: str) -> str:
-    """Per-instance image reference: ``jefzda/sweap-images:<dockerhub_tag>``."""
-    return f"{PRO_IMAGE_NAMESPACE}:{dockerhub_tag}"
 
 
 class SWEBenchProRunner(SWEBenchRunner):
@@ -43,8 +26,6 @@ class SWEBenchProRunner(SWEBenchRunner):
         return "swebench_pro", "test"
 
     def _container_backend(self) -> Any:
-        # Pro tests are multi-language with custom identifiers; no in-loop
-        # container grading. Generation still runs; grading is external.
         return None
 
     def evaluate_predictions(self, predictions_path: Path, *args, **kwargs) -> dict:

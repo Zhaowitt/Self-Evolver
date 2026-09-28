@@ -15,6 +15,7 @@ from src.skills.proposals import SkillUpdateProposal
 from src.skills.skill_dedup import DedupDecision, is_duplicate_skill
 from src.skills.skill_store import SkillStore, normalize_skill_markdown
 from src.skills.skill_schema import lint_skill_markdown
+from src.skills.file_lock import file_lock
 from src.skills.textnorm import slug
 
 logger = logging.getLogger(__name__)
@@ -33,7 +34,6 @@ class SkillEvolutionConfig:
     retire_net_success_threshold: float = -0.2
     retire_average_advantage_threshold: float = 0.0
     baseline_ema_alpha: float = 0.3
-    reflect_every_n_rollouts: int = 10
 
     @classmethod
     def load(cls, path: Optional[Path] = None) -> "SkillEvolutionConfig":
@@ -45,8 +45,7 @@ class SkillEvolutionConfig:
         data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
         if not isinstance(data, dict):
             raise ValueError(f"{config_path} must contain a mapping of config keys")
-        known = {item.name: item.type for item in fields(cls)}
-        unknown = set(data) - set(known)
+        unknown = set(data) - {item.name for item in fields(cls)}
         if unknown:
             raise ValueError(
                 f"unknown skill_evolution config keys in {config_path}: {sorted(unknown)}"
@@ -159,15 +158,17 @@ class SkillEvolver:
         """Close one frozen GRPO round and run conservative retirement once."""
         if not round_id:
             raise ValueError("round_id is required to finalize skill credit")
-        stats = self.store.load_metadata()
-        changed = False
-        for item in stats.values():
-            if round_id in item.round_stats and round_id not in item.completed_rounds:
-                item.completed_rounds.append(round_id)
-                item.record_event("round_completed", round_id=round_id)
-                changed = True
-        if changed:
-            self.store.save_metadata(stats)
+        # Same lock as credit_skills, so concurrent credits are not dropped.
+        with file_lock(self.store.metadata_path):
+            stats = self.store.load_metadata()
+            changed = False
+            for item in stats.values():
+                if round_id in item.round_stats and round_id not in item.completed_rounds:
+                    item.completed_rounds.append(round_id)
+                    item.record_event("round_completed", round_id=round_id)
+                    changed = True
+            if changed:
+                self.store.save_metadata(stats)
         events = self._retire_unhelpful_skills()
         return {
             "round_id": round_id,
@@ -188,7 +189,8 @@ class SkillEvolver:
             events.append(event)
             if dedup:
                 dedup_decisions.append(dedup)
-        events.extend(self._enforce_active_cap())
+        written = {slug(event.skill_id) for event in events if event.applied}
+        events.extend(self._enforce_active_cap(protected=written))
         return {
             "events": [event.to_dict() for event in events],
             "dedup_decisions": dedup_decisions,
@@ -259,6 +261,18 @@ class SkillEvolver:
                     skill_id=proposal.skill_id,
                     applied=False,
                     reason="insufficient_representative_evidence",
+                    reward=reward,
+                ),
+                None,
+            )
+        if proposal.operation == "create" and self._skill_id_exists(proposal.skill_id):
+            # A create must never overwrite or resurrect a skill and inherit its credit.
+            return (
+                SkillEvolutionEvent(
+                    action="proposal_create",
+                    skill_id=proposal.skill_id,
+                    applied=False,
+                    reason="create_id_exists",
                     reward=reward,
                 ),
                 None,
@@ -382,13 +396,33 @@ class SkillEvolver:
             self.store.retire_skills(victims, reason="net_success_rate_floor")
         return events
 
-    def _enforce_active_cap(self) -> List[SkillEvolutionEvent]:
+    def _skill_id_exists(self, skill_id: str) -> bool:
+        normalized = slug(skill_id)
+        if normalized in self.store.load_metadata():
+            return True
+        return any(skill.id == normalized for skill in self.store.load_skills()) or (
+            self.store.get_skill_path(normalized).exists()
+        )
+
+    def _enforce_active_cap(self, protected: Optional[set] = None) -> List[SkillEvolutionEvent]:
         """Evict lowest-contribution skills when the active bank exceeds the cap."""
+        # Just-written and untried skills have no evidence ((0, 0) would rank them
+        # first), so they are never evicted; the bank may stay above the cap.
         active = [skill for skill in self.store.load_skills() if skill.status == "active"]
         excess = len(active) - self.config.max_active_skills
         if excess <= 0:
             return []
         stats = self.store.load_metadata()
+        protected = set(protected or ())
+        active = [
+            skill
+            for skill in active
+            if skill.id not in protected
+            and (stats.get(skill.id).usage_count if stats.get(skill.id) else 0) > 0
+        ]
+        excess = min(excess, len(active))
+        if excess <= 0:
+            return []
 
         def contribution(skill_id: str) -> tuple[float, float, str]:
             item = stats.get(skill_id)
@@ -437,14 +471,6 @@ def _is_self_refinement(proposal: SkillUpdateProposal, dedup: DedupDecision) -> 
         and dedup.matched_status == "active"
         and dedup.matched_skill_id == slug(proposal.skill_id)
     )
-
-
-def _reward_total(reward: Any) -> float:
-    if reward is None:
-        return 0.0
-    if isinstance(reward, dict):
-        return float(reward.get("total", 0.0) or 0.0)
-    return float(getattr(reward, "total", 0.0) or 0.0)
 
 
 def _reward_task(reward: Any) -> float:
