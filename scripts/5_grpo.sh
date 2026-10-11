@@ -3,7 +3,7 @@
 # freezes prompts + skills, trains STEPS_PER_ROUND steps, then reflects; resumable.
 # Starts from the stage-4 SFT model when present; merges ${ARM_DIR}/controller_hf at the end.
 # Knobs: EXPERIMENT, SEED, ROUNDS, STEPS_PER_ROUND, NUM_TRAIN, NUM_VAL, VAL_BEFORE_TRAIN,
-#        EASYR1_DIR, CONTROLLER_MODEL_PATH, SKIP_SFT, plus every tools/grpo_round.sh knob
+#        EASYR1_DIR, CONTROLLER_MODEL_PATH, SKIP_SFT, CKPT_DIR, plus every tools/grpo_round.sh knob
 #        (ablations: TRAIN_SUBSET_GATE, REWARD_CONFIG, CLUSTER_LEVELS, SAMPLING_MODE).
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
@@ -12,7 +12,7 @@ ROUNDS="${ROUNDS:-3}"
 STEPS_PER_ROUND="${STEPS_PER_ROUND:-64}"
 EASYR1_CONFIG="${EASYR1_CONFIG:-${REPO_ROOT}/configs/easyr1_online_grpo_example.yaml}"
 export EASYR1_CONFIG
-CKPT_DIR="${ARM_DIR}/checkpoints"
+CKPT_DIR="${CKPT_DIR:-${ARM_DIR}/checkpoints}"
 # CONTROLLER_MODEL_PATH is the base model; GRPO starts from the stage-4 SFT model when present.
 if [ "${SKIP_SFT:-0}" != "1" ] && [ -e "${SFT_DIR}/merged/config.json" ]; then
     export CONTROLLER_MODEL_PATH="${SFT_DIR}/merged"
@@ -21,8 +21,13 @@ fi
 EXCLUDE_IDS="${EXCLUDE_IDS:-${SPLITS_DIR}/train_exclude_ids.txt}"
 [ -s "${FLAKY_IDS}" ] && EXCLUDE_IDS="${EXCLUDE_IDS} ${FLAKY_IDS}"
 export EXCLUDE_IDS
-export VAL_DATASET="${VAL_DATASET:-full}" VAL_SPLIT="${VAL_SPLIT:-test}"
-export VAL_INCLUDE_IDS="${VAL_INCLUDE_IDS:-${SPLITS_DIR}/in_domain_val_ids.txt}"
+export VAL_DATASET="${VAL_DATASET:-full}" VAL_SPLIT="${VAL_SPLIT:-dev}"
+# A pre-existing production run may have frozen validation prompts without a
+# split manifest.  Only apply the conventional manifest when it actually
+# exists; callers can still set VAL_INCLUDE_IDS explicitly.
+if [ "${VAL_SPLIT}" = test ] && [ -z "${VAL_INCLUDE_IDS+x}" ] && [ -f "${SPLITS_DIR}/in_domain_val_ids.txt" ]; then
+    export VAL_INCLUDE_IDS="${SPLITS_DIR}/in_domain_val_ids.txt"
+fi
 info "[grpo] ${ARM_NAME}: ${ROUNDS} rounds from ${CONTROLLER_MODEL_PATH:-the config base model}"
 
 [ -n "${EASYR1_DIR:-}" ] && [ -d "${EASYR1_DIR}" ] || die "EASYR1_DIR must point at an EasyR1 checkout."
@@ -77,13 +82,17 @@ for ((round = 1; round <= ROUNDS; round++)); do
     fi
 
     info "=== ${ARM_NAME}: round ${round}/${ROUNDS} (steps up to $((round * STEPS_PER_ROUND))) ==="
+    val_jsonl="${ARM_DIR}/data/controller_val.jsonl"
+    if [ -n "${SELF_EVOLVER_FIXED_VAL_DIR:-}" ]; then
+        val_jsonl="${round_dir}/controller_val_full_dev225.jsonl"
+    fi
     RUNS_DIR="${ARM_DIR}" \
     ROUND_ID="${round_id}" \
     REBUILD_DATASETS="${rebuild}" \
     NUM_TRAIN="${NUM_TRAIN}" \
     TRAIN_JSONL="${round_dir}/controller_train.jsonl" \
-    VAL_JSONL="${ARM_DIR}/data/controller_val.jsonl" \
-    TASK_POOL_STATE="${ARM_DIR}/data/task_pool.json" \
+    VAL_JSONL="${val_jsonl}" \
+    TASK_POOL_STATE="${TASK_POOL_STATE:-${ARM_DIR}/data/task_pool.json}" \
     HARD_CASES_PATH="${ARM_DIR}/hard_cases.jsonl" \
     WORKSPACE_DIR="${ARM_DIR}/workspace" \
     TASK_SIGNALS_REPORT="${signals}" \
@@ -95,6 +104,11 @@ for ((round = 1; round <= ROUNDS; round++)); do
     EASYR1_VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-$([ "${round}" -eq 1 ] && echo true || echo false)}" \
         bash "${SCRIPTS_DIR}/tools/grpo_round.sh"
 
+    completed_ckpt="$(latest_checkpoint)"
+    completed_step="${completed_ckpt##*/global_step_}"
+    target_step="$((round * STEPS_PER_ROUND))"
+    [[ "${completed_step}" =~ ^[0-9]+$ ]] && [ "${completed_step}" -ge "${target_step}" ] || \
+        die "Round ${round} returned before checkpoint step ${target_step} (latest: ${completed_ckpt:-none}); leaving it resumable."
     touch "${round_dir}/.done"
     previous_round="${round_id}"
 done

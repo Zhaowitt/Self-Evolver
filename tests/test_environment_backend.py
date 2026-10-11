@@ -81,6 +81,16 @@ def test_entry_script_structure():
     assert f"{tb.CONTAINER_EVAL_DIR}/patch.diff" in script
 
 
+def test_entry_runtime_handles_unicode_and_pvlib_cpu_rounding():
+    script = tb.make_entry_script("pydicom/pydicom")
+    assert "export LANG=C.UTF-8 LC_ALL=C.UTF-8" in script
+    assert "NPY_DISABLE_CPU_FEATURES" not in script
+    pvlib_script = tb.make_entry_script("pvlib/pvlib-python")
+    assert "export NPY_DISABLE_CPU_FEATURES=AVX512F,AVX512_SKX,AVX2,FMA3" in pvlib_script
+    assert "xvfb-run" in tb.make_entry_script("pyvista/pyvista")
+    assert "xvfb-run" not in script
+
+
 def test_eval_script_has_output_markers():
     spec = _spec()
     assert ">>>>> Start Test Output" in spec.eval_script
@@ -138,6 +148,53 @@ def test_default_sif_cache_dir_env_and_fallback(monkeypatch):
     assert tb.default_sif_cache_dir() == Path.home() / ".cache" / "self_evolver" / "sif"
 
 
+@pytest.mark.parametrize("compression_args", ["", "-mem 1G -processors 2"])
+def test_sif_conversion_limits_and_atomic_cache(tmp_path, monkeypatch, compression_args):
+    # Only exercise cache/conversion logic, without detecting engines or network.
+    backend = object.__new__(tb.ContainerTestBackend)
+    backend.sif_cache_dir = tmp_path
+    monkeypatch.setenv("APPTAINER_MKSQUASHFS_ARGS", compression_args)
+    calls = []
+    image = "swebench/example:latest"
+
+    def convert(command, **kwargs):
+        calls.append(command)
+        destination = Path(command[-2])
+        assert destination != backend.sif_path(image)
+        assert not backend.sif_path(image).exists()
+        destination.write_bytes(b"verified-sif")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(tb.subprocess, "run", convert)
+    result = backend._ensure_sif(image)
+    assert result.read_bytes() == b"verified-sif"
+    assert backend._ensure_sif(image) == result
+    assert len(calls) == 1
+    if compression_args:
+        assert calls[0][:4] == ["apptainer", "build", "--mksquashfs-args", compression_args]
+    else:
+        assert calls[0][:2] == ["apptainer", "pull"]
+    assert not list(tmp_path.glob("*.pull-*"))
+
+
+def test_failed_sif_conversion_does_not_publish_partial_image(tmp_path, monkeypatch):
+    backend = object.__new__(tb.ContainerTestBackend)
+    backend.sif_cache_dir = tmp_path
+    monkeypatch.setenv("APPTAINER_MKSQUASHFS_ARGS", "-mem 1G -processors 2")
+    image = "swebench/example:latest"
+    backend.sif_path(image).touch()  # An empty old cache entry is not usable.
+
+    def fail(command, **kwargs):
+        Path(command[-2]).write_bytes(b"incomplete")
+        return subprocess.CompletedProcess(command, 1, stdout="", stderr="conversion failed")
+
+    monkeypatch.setattr(tb.subprocess, "run", fail)
+    with pytest.raises(RuntimeError, match="conversion failed"):
+        backend._ensure_sif(image)
+    assert backend.sif_path(image).stat().st_size == 0
+    assert not list(tmp_path.glob("*.pull-*"))
+
+
 def test_default_eval_timeout_env(monkeypatch):
     monkeypatch.setenv("SWEBENCH_EVAL_TIMEOUT", "42")
     assert tb.default_eval_timeout() == 42
@@ -188,6 +245,26 @@ def test_build_outcome_patch_not_applied_is_unresolved():
 
 
 # --- grading via outcome_from_eval_log (log parsers) -----------------------
+
+@pytest.mark.parametrize("status", ["PASSED", "FAILED"])
+def test_pydicom_absolute_parameter_paths_match_official_parser(status):
+    reference = "test_pixels.py::test_data[/old/dataset/test_files/image.dcm-data0]"
+    out = tb.build_outcome(
+        {"test_fix": "PASSED", "test_pixels.py::test_data[/image.dcm-data0]": status},
+        applied=True, f2p=["test_fix"], p2p=[reference],
+        repo="pydicom/pydicom", instance_id="pydicom__pydicom-866",
+    )
+    assert out.resolved == (status == "PASSED")
+    assert out.p2p_passed == int(status == "PASSED")
+    assert out.per_test[reference] == status
+
+
+def test_pydicom_missing_parameter_is_not_invented():
+    reference = "test_pixels.py::test_data[/old/image.dcm]"
+    out = tb.build_outcome({"test_fix": "PASSED"}, applied=True,
+                           f2p=["test_fix"], p2p=[reference],
+                           repo="pydicom/pydicom", instance_id="pydicom__pydicom-866")
+    assert not out.resolved and out.p2p_passed == 0
 
 def test_eval_log_partial_pass():
     spec = _spec()

@@ -1,5 +1,7 @@
 # Self-Evolver
 
+当前正式 GRPO 的核心修复、训练参数和不依赖集群调度的启动方法见 [复现说明](docs/GRPO_REPRODUCTION_ZH.md)。
+
 ## 安装
 
 ```bash

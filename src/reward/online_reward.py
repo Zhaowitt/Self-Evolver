@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.config import get_config
@@ -18,7 +19,9 @@ from src.controller.parser import parse_controller_response
 from src.environment.models import Issue
 from src.environment.project_env import ProjectEnvironment
 from src.reward.reward_model import RewardModel
-from src.rl.online_rollout_runner import build_targeted_test_cmd, run_online_rollout
+from src.rl.online_rollout_runner import (
+    build_targeted_test_cmd, run_online_rollout, swebench_instance_from_issue,
+)
 from src.rl.rollout_writer import RolloutWriter
 from src.skills.file_lock import file_lock
 from src.skills.skill_evolver import SkillEvolutionConfig, SkillEvolver
@@ -61,7 +64,7 @@ def compute_score(
     groups = _group_reward_inputs(reward_inputs, default_workspace, slots=slots)
     max_workers = _parallel_workers(kwargs.get("parallel_workers"))
 
-    def score_group(
+    def run_group(
         group: List[Tuple[int, Dict[str, Any]]],
     ) -> List[Tuple[int, Dict[str, float]]]:
         # Samples sharing a checkout stay sequential: each episode resets and
@@ -92,6 +95,17 @@ def compute_score(
                     group, default_workspace, slot=slots.get(group[0][0], 0) if group else 0
                 )
 
+    def score_group(group):
+        extra, truth = _reward_payload(group[0][1])
+        instance_id = truth.get("instance_id") or truth.get("id") or extra.get("instance_id")
+        if not instance_id or extra.get("repo_path") or truth.get("repo_path"):
+            return run_group(group)
+        checkout = checkout_dir_for(_workspace_root(default_workspace, extra), str(instance_id),
+                                    slots.get(group[0][0], 0))
+        # Covers reset, patch execution and cleanup, including other processes.
+        with file_lock(checkout.with_name(checkout.name + ".episode")):
+            return run_group(group)
+
     scores: List[Dict[str, float]] = [{} for _ in reward_inputs]
     worker_count = min(max_workers, len(groups))
     if worker_count <= 1:
@@ -99,7 +113,7 @@ def compute_score(
         for completed in completed_groups:
             for index, score in completed:
                 scores[index] = score
-        return _neutralize_infra_errors(reward_inputs, scores)
+        return _finish_scores(reward_inputs, scores)
 
     logger.info(
         "Scoring %d online rollouts in %d instance-safe parallel groups",
@@ -114,6 +128,27 @@ def compute_score(
         for future in as_completed(futures):
             for index, score in future.result():
                 scores[index] = score
+    return _finish_scores(reward_inputs, scores)
+
+
+class ValidationInfrastructureError(RuntimeError):
+    """An environment/API failure is not a valid policy evaluation score."""
+
+
+def _finish_scores(reward_inputs, scores):
+    invalid = []
+    for reward_input, score in zip(reward_inputs, scores):
+        extra_info, truth = _reward_payload(reward_input)
+        stage = str(extra_info.get("stage") or truth.get("stage") or "train")
+        if stage != "train" and score.get("infra_error"):
+            invalid.append(str(truth.get("instance_id") or extra_info.get("instance_id") or "unknown"))
+    if invalid:
+        raise ValidationInfrastructureError(
+            f"Validation infrastructure failure in {len(invalid)} episode(s), "
+            f"tasks={sorted(set(invalid))[:12]}; refusing to return zero/imputed validation scores. "
+            "Fix environments/provider access and retry validation; existing checkpoints remain valid."
+        )
+    # Train-time neutralization is unchanged. Never impute validation rewards.
     return _neutralize_infra_errors(reward_inputs, scores)
 
 
@@ -303,6 +338,13 @@ def _score_one(
             ),
         )
         issue = issue_from_payload(ground_truth, extra_info)
+        if stage != "train":
+            # Check the image *before* spending worker API calls or modifying a
+            # checkout. A CPU source builder holds the same image lock until a
+            # candidate has passed its controls and been atomically published.
+            ensure_image = getattr(test_backend, "ensure_image", None)
+            if callable(ensure_image):
+                ensure_image(swebench_instance_from_issue(issue))
         env = prepare_environment(
             issue, ground_truth, extra_info, default_workspace, slot=checkout_slot
         )
@@ -324,8 +366,8 @@ def _score_one(
             experiment=str(extra_info.get("experiment") or "rl_online"),
         )
     except Exception as exc:
-        # Infrastructure failure: not the policy's fault; compute_score replaces
-        # its reward with the group mean.
+        # Infrastructure failure: not the policy's fault. Training uses group
+        # mean neutralization; evaluation refuses to return an invalid metric.
         logger.exception("Online reward execution failed: %s", exc)
         return _failure_score(parse_valid=1.0, worker_executed=0.0, infra_error=1.0, signal=signal)
 
@@ -420,14 +462,13 @@ def prepare_environment(
     default_workspace: Any = None,
     slot: int = 0,
 ) -> ProjectEnvironment:
-    """``slot`` > 0 gives a sample its own checkout cloned from the slot-0 cache."""
+    """``slot`` > 0 gives a sample its own checkout cloned from the shared mirror."""
     repo_path_value = extra_info.get("repo_path") or ground_truth.get("repo_path")
     workspace_root = _workspace_root(default_workspace, extra_info)
     if repo_path_value:
         repo_dir = Path(str(repo_path_value)).expanduser().resolve()
     else:
         repo_dir = checkout_dir_for(workspace_root, issue.id, slot)
-    base_dir = checkout_dir_for(repo_dir.parent, issue.id, 0) if not repo_path_value else repo_dir
 
     test_cmd = extra_info.get("test_cmd") or build_targeted_test_cmd(issue)
     if not test_cmd:
@@ -440,42 +481,81 @@ def prepare_environment(
         )
     timeout = int(extra_info.get("timeout") or get_config().agent.timeout_seconds)
 
-    if not (repo_dir / ".git").exists():
-        if not issue.repo_name:
-            raise ValueError("repo_name is required when repo_path is not an existing git repo")
-        # Concurrent samples must not clone the same base twice or copy a half-written one.
-        with file_lock(base_dir.with_name(base_dir.name + ".clone")):
-            if not (base_dir / ".git").exists():
-                mirror = _repo_mirror(base_dir.parent, issue.repo_name)
-                shutil.rmtree(base_dir, ignore_errors=True)
-                _git("clone", "--quiet", "--local", str(mirror), str(base_dir))
-            if repo_dir != base_dir and not (repo_dir / ".git").exists():
-                shutil.rmtree(repo_dir, ignore_errors=True)
-                subprocess.run(
-                    ["git", "clone", "--quiet", "--local", str(base_dir), str(repo_dir)],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-    env = ProjectEnvironment(repo_dir, test_cmd=test_cmd, timeout=timeout)
-    if (
-        (repo_dir / ".git").exists()
-        and issue.base_commit
-        and not env.reset_to_commit(issue.base_commit)
-        and not repo_path_value
-        and issue.repo_name
-    ):
-        # The shared mirror may predate this commit: refresh it once and retry.
-        mirror = _repo_mirror(workspace_root, issue.repo_name, refresh=True)
-        _git("-C", str(repo_dir), "fetch", "--quiet", str(mirror), "+refs/*:refs/remotes/mirror/*")
-    if (repo_dir / ".git").exists() and issue.base_commit and not env.reset_to_commit(issue.base_commit):
-        # Cached checkouts are reused across samples; a failed reset would leak state.
-        raise RuntimeError(f"failed to reset cached repo {repo_dir} to {issue.base_commit}")
-    return env
+    if repo_path_value:
+        env = ProjectEnvironment(repo_dir, test_cmd=test_cmd, timeout=timeout)
+        if issue.base_commit and not env.reset_to_commit(issue.base_commit):
+            raise RuntimeError(f"failed to reset caller-owned repo {repo_dir} to {issue.base_commit}")
+        return env
+    if not issue.repo_name:
+        raise ValueError("repo_name is required for a managed checkout")
+    if repo_dir.resolve().parent != workspace_root.resolve():
+        raise ValueError("Managed checkout must be directly inside its workspace")
+    with file_lock(repo_dir.with_name(repo_dir.name + ".clone")):
+        mirror = _repo_mirror(workspace_root, issue.repo_name)
+        ensure_repository_commit(mirror, issue.base_commit, "origin")
+        # Clone each slot from the immutable bare source, never an actively
+        # modified sibling. Failed checkouts are isolated, not unlocked in place.
+        for attempt in range(2):
+            try:
+                if not (repo_dir / ".git").exists():
+                    if repo_dir.exists():
+                        raise RuntimeError(f"Incomplete managed checkout: {repo_dir}")
+                    _publish_checkout(mirror, repo_dir, issue.base_commit)
+                ensure_repository_commit(repo_dir, issue.base_commit, str(mirror))
+                env = ProjectEnvironment(repo_dir, test_cmd=test_cmd, timeout=timeout)
+                if not issue.base_commit or env.reset_to_commit(issue.base_commit):
+                    return env
+                raise RuntimeError(f"failed to reset cached repo {repo_dir} to {issue.base_commit}")
+            except (RuntimeError, subprocess.CalledProcessError):
+                if attempt or not repo_dir.exists():
+                    raise
+                quarantine = workspace_root / "_failed_checkouts"
+                quarantine.mkdir(exist_ok=True)
+                saved = quarantine / f"{repo_dir.name}-{uuid.uuid4().hex}"
+                repo_dir.rename(saved)
+                logger.warning("Rebuilding failed managed checkout; original preserved at %s", saved)
+    raise RuntimeError("Managed checkout recovery exhausted")
 
 
 def _git(*args: str) -> None:
-    subprocess.run(["git", *args], check=True, capture_output=True, text=True)
+    try:
+        subprocess.run(["git", *args], check=True, capture_output=True, text=True, timeout=300)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"Git {' '.join(args)} failed: {(exc.stderr or '').strip()[-2000:]}") from exc
+
+
+def ensure_repository_commit(repo: Path, commit: Optional[str], source: str) -> None:
+    """Fetch the exact required object, including commits outside current refs."""
+    if not commit:
+        return
+    if not all(c in "0123456789abcdefABCDEF" for c in commit) or len(commit) != 40:
+        raise ValueError(f"Expected a full Git commit SHA: {commit!r}")
+    def present():
+        return subprocess.run(["git", "-C", str(repo), "cat-file", "-e", f"{commit}^{{commit}}"],
+                              capture_output=True, timeout=30).returncode == 0
+    if not present():
+        with file_lock(repo):
+            if not present():
+                _git("-C", str(repo), "fetch", "--quiet", source, commit)
+            if not present():
+                raise RuntimeError(f"Required commit {commit} unavailable in {repo}")
+
+
+def _publish_checkout(mirror: Path, checkout: Path, commit: Optional[str]) -> None:
+    candidate = checkout.with_name(f".{checkout.name}.clone-{uuid.uuid4().hex}")
+    try:
+        with file_lock(mirror):
+            # Node-local checkouts cannot hard-link objects from shared scratch.
+            copy_args = ["--no-hardlinks"] if mirror.stat().st_dev != checkout.parent.stat().st_dev else []
+            _git("clone", "--quiet", "--no-checkout", "--local", *copy_args,
+                 str(mirror.resolve()), str(candidate))
+            ensure_repository_commit(candidate, commit, str(mirror))
+        if commit:
+            _git("-C", str(candidate), "reset", "--hard", commit)
+        candidate.rename(checkout)
+    finally:
+        if candidate.exists():
+            shutil.rmtree(candidate)
 
 
 def _repo_mirror(workspace: Path, repo_name: str, refresh: bool = False) -> Path:

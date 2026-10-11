@@ -109,3 +109,9 @@ def get_config() -> Config:
     if _config is None:
         _config = Config()
     return _config
+
+
+def reset_config() -> None:
+    """Clear the lazy configuration cache (used to isolate tests)."""
+    global _config
+    _config = None

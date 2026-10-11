@@ -80,7 +80,7 @@ def test_group_reward_inputs_serializes_shared_checkout(tmp_path):
     assert [[index for index, _ in group] for group in groups] == [[0, 1], [2, 3]]
 
 
-def test_compute_score_parallelizes_instances_but_preserves_order(monkeypatch):
+def test_compute_score_parallelizes_instances_but_preserves_order(monkeypatch, tmp_path):
     barrier = threading.Barrier(2, timeout=2)
     starts = {"a": [], "b": []}
     starts_lock = threading.Lock()
@@ -106,7 +106,8 @@ def test_compute_score_parallelizes_instances_but_preserves_order(monkeypatch):
         {"ground_truth": {"instance_id": "b"}, "sequence": 2, "value": 4},
     ]
 
-    scores = compute_score(inputs, parallel_workers=2)
+    scores = compute_score(inputs, parallel_workers=2, parallel_samples=False,
+                           workspace_root=tmp_path)
 
     assert [score["overall"] for score in scores] == [1.0, 2.0, 3.0, 4.0]
     assert starts == {"a": [1, 2], "b": [1, 2]}
@@ -149,7 +150,13 @@ def test_compute_score_optionally_removes_only_managed_checkout(monkeypatch, tmp
 def test_failure_score_matches_utility_components():
     score = _failure_score(parse_valid=0.0, worker_executed=0.0)
     assert score["overall"] == 0.0
-    assert set(score) == {"overall", "parse_valid", "worker_executed", *DEFAULT_REWARD_WEIGHTS}
+    assert set(score) == {
+        "overall", "parse_valid", "worker_executed", "infra_error",
+        "official_resolved", "official_f2p_fraction", "token_cost", "resolved",
+        "f2p_fraction", "p2p_no_regression", "cost_efficiency", "process",
+        "num_selected_skills", "empty_selection", "strategy_present",
+    }
+    assert all(value == 0.0 for value in score.values())
     assert all(score[name] == 0.0 for name in DEFAULT_REWARD_WEIGHTS)
 
 
@@ -198,6 +205,9 @@ def test_rollout_record_gains_stage_seed_arm_models_and_eval_outcome():
         "resolved": False,
         "evaluation_scope": "full",
         "selected_f2p_ids": [],
+        "duration_seconds": 0.0,
+        "cache_hit": False,
+        "timed_out": False,
     }
     assert record["reward"]["evolution_utility"] == 0.0
 
@@ -210,7 +220,10 @@ def test_rollout_record_backward_defaults():
     assert record["experiment"] is None
     assert set(record["models"]) == {"worker", "controller"}
     assert record["eval_outcome"] is None
-    assert record["skill_updates"] == []
+    assert record["skill_evolution"] == {
+        "events": [], "dedup_decisions": [],
+        "skill_stats_before": {}, "skill_stats_after": {},
+    }
 
 
 def test_rollout_writer_appends_json_lines(tmp_path):

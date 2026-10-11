@@ -97,7 +97,7 @@ class EvalCache:
     def key(image: str, eval_script: str, patch: str, scope: str, selected: List[str]) -> str:
         payload = json.dumps(
             {
-                "v": 1,
+                "v": 3,
                 "image": image,
                 "eval_script": hashlib.sha256(eval_script.encode("utf-8")).hexdigest(),
                 "patch": hashlib.sha256((patch or "").encode("utf-8")).hexdigest(),
@@ -235,6 +235,10 @@ class EvalOutcome:
     ran_without_status: List[str] = field(default_factory=list)
 
     @property
+    def f2p_pass_fraction(self) -> float:
+        return self.f2p_passed / self.f2p_total if self.f2p_total else 0.0
+
+    @property
     def p2p_no_regression(self) -> bool:
         return self.p2p_passed == self.p2p_total
 
@@ -258,6 +262,17 @@ def build_outcome(
     selected_f2p_ids: Optional[List[str]] = None,
 ) -> EvalOutcome:
     """Grade a test-status map with the official swebench report logic."""
+    if repo == "pydicom/pydicom":
+        # The official parser canonicalizes absolute paths in parameter IDs.
+        # Full/dev's reference IDs retain the original dataset-machine paths;
+        # apply exactly the same canonicalization when matching references.
+        from swebench.harness.log_parsers.python import parse_log_pytest_options
+
+        status_map = dict(status_map)
+        for test_id in [*f2p, *p2p]:
+            canonical = next(iter(parse_log_pytest_options(f"PASSED {test_id}", None)), test_id)
+            if test_id not in status_map and canonical in status_map:
+                status_map[test_id] = status_map[canonical]
     eval_ref = {KEY_INSTANCE_ID: instance_id, FAIL_TO_PASS: f2p, PASS_TO_PASS: p2p}
     eval_type = (
         EvalType.FAIL_ONLY if repo in FAIL_ONLY_REPOS else EvalType.PASS_AND_FAIL
@@ -510,11 +525,24 @@ def run_container_command(cmd: List[str], timeout: int) -> str:
             )
 
 
-def make_entry_script() -> str:
+def make_entry_script(repo: Optional[str] = None) -> str:
     """Bash driver mirroring swebench's run_instance: apply the patch, emit APPLY_PATCH_* markers, run eval.sh."""
     patch = f"{CONTAINER_EVAL_DIR}/patch.diff"
+    numerical_env = (
+        "export NPY_DISABLE_CPU_FEATURES=AVX512F,AVX512_SKX,AVX2,FMA3\n"
+        if repo == "pvlib/pvlib-python" else ""
+    )
+    eval_command = "/bin/bash /eval.sh"
+    if repo == "pyvista/pyvista":
+        eval_command = "PYVISTA_OFF_SCREEN=true xvfb-run -a -s '-screen 0 1024x768x24' /bin/bash /eval.sh"
     return (
         "#!/bin/bash\n"
+        # Python 3.6 otherwise inherits Apptainer's ASCII locale and fails
+        # legitimate Unicode filename tests. Keep this identical on all nodes.
+        "export LANG=C.UTF-8 LC_ALL=C.UTF-8\n"
+        # Older pvlib tests have tight trig tolerances. NumPy's dispatched
+        # AVX/FMA kernels round differently across CPU and GPU host nodes.
+        f"{numerical_env}"
         "cd /testbed\n"
         f"if {GIT_APPLY_CMDS[0]} {patch}; then\n"
         f"    echo '{APPLY_PATCH_PASS}'\n"
@@ -526,7 +554,7 @@ def make_entry_script() -> str:
         f"    echo '{APPLY_PATCH_FAIL}'\n"
         "    exit 1\n"
         "fi\n"
-        "/bin/bash /eval.sh\n"
+        f"{eval_command}\n"
     )
 
 
@@ -573,27 +601,36 @@ class ContainerTestBackend:
 
     def _ensure_sif(self, image_key: str, timeout: int = 3600) -> Path:
         sif = self.sif_path(image_key)
-        if sif.exists():
+        if sif.is_file() and sif.stat().st_size > 0:
             return sif
         self.sif_cache_dir.mkdir(parents=True, exist_ok=True)
         # Concurrent samples of one instance must pull an image only once.
         from src.skills.file_lock import file_lock
 
         with file_lock(sif):
-            if sif.exists():
+            if sif.is_file() and sif.stat().st_size > 0:
                 return sif
             tmp = sif.with_name(f".{sif.name}.pull-{os.getpid()}-{uuid.uuid4().hex[:8]}")
             logger.info(f"Pulling docker://{image_key} -> {sif}")
+            # OCI `pull` does not forward build-only mksquashfs arguments.
+            # Use `build` when compression limits were explicitly requested;
+            # keep the same per-image lock and atomic cache publication.
+            squashfs_args = os.environ.get("APPTAINER_MKSQUASHFS_ARGS", "").strip()
+            if squashfs_args:
+                command = ["apptainer", "build", "--mksquashfs-args", squashfs_args,
+                           str(tmp), f"docker://{image_key}"]
+            else:
+                command = ["apptainer", "pull", str(tmp), f"docker://{image_key}"]
             try:
                 result = subprocess.run(
-                    ["apptainer", "pull", str(tmp), f"docker://{image_key}"],
+                    command,
                     capture_output=True,
                     text=True,
                     timeout=timeout,
                 )
                 if result.returncode != 0:
                     raise RuntimeError(
-                        f"apptainer pull docker://{image_key} failed:\n"
+                        f"apptainer {command[1]} docker://{image_key} failed:\n"
                         f"{_tail(result.stderr or result.stdout, 2000)}"
                     )
                 os.replace(tmp, sif)
@@ -726,8 +763,19 @@ class ContainerTestBackend:
                 default_subset_timeout() if evaluation_scope == "subset" else default_eval_timeout()
             )
             timeout = self.timings.timeout(spec.instance_id, evaluation_scope, default)
+        image_identity = spec.instance_image_key
+        if self.engine == "apptainer":
+            # A dependency-repaired SIF keeps the registry key. Its receipt
+            # distinguishes the new environment from cached old evaluations.
+            receipt = self.sif_path(image_identity).with_suffix(".verified.json")
+            try:
+                digest = json.loads(receipt.read_text()).get("sif_sha256", "")
+                if re.fullmatch(r"[a-f0-9]{64}", digest):
+                    image_identity += "@sif:" + digest
+            except (OSError, ValueError, TypeError):
+                pass
         cache_key = EvalCache.key(
-            spec.instance_image_key, eval_script, model_patch, evaluation_scope, selected_f2p_ids
+            image_identity, eval_script, model_patch, evaluation_scope, selected_f2p_ids
         )
         cached = self.eval_cache.get(cache_key)
         if cached is not None:
@@ -738,7 +786,7 @@ class ContainerTestBackend:
             workdir = Path(td)
             (workdir / "patch.diff").write_text(model_patch or "", encoding="utf-8")
             (workdir / "eval.sh").write_text(eval_script, encoding="utf-8")
-            (workdir / "entry.sh").write_text(make_entry_script(), encoding="utf-8")
+            (workdir / "entry.sh").write_text(make_entry_script(spec.repo), encoding="utf-8")
             cmd = self._container_cmd(spec, workdir)
             logger.info(
                 f"Evaluating {spec.instance_id} scope={evaluation_scope} "

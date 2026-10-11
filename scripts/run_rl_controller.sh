@@ -15,6 +15,7 @@
 #        TASK_POOL_UNIFORM_FRACTION, MAX_INSTANCE_REPEATS,
 #        TASK_POOL_STATE, RESET_TASK_POOL (0/1),
 #        EASYR1_EXPERIMENT_NAME (optional fresh checkpoint namespace),
+#        EASYR1_SAVE_CHECKPOINT_PATH (optional isolated checkpoint root),
 #        EASYR1_LOAD_CHECKPOINT_PATH (optional prior-round global_step_*),
 #        EASYR1_MAX_STEPS (optional cumulative trainer step target),
 #        EASYR1_VAL_FREQ/EASYR1_VAL_BATCH_SIZE (optional validation overrides),
@@ -28,7 +29,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 TRAIN_DATASET="${TRAIN_DATASET:-full}"
 TRAIN_SPLIT="${TRAIN_SPLIT:-test}"
 NUM_TRAIN="${NUM_TRAIN:-}"
-VAL_DATASET="${VAL_DATASET:-lite}"
+VAL_DATASET="${VAL_DATASET:-full}"
 VAL_SPLIT="${VAL_SPLIT:-dev}"
 NUM_VAL="${NUM_VAL:-}"
 EXCLUDE_IDS="${EXCLUDE_IDS:-${DATA_DIR}/eval_ids.txt}"
@@ -63,6 +64,7 @@ MAX_INSTANCE_REPEATS="${MAX_INSTANCE_REPEATS:-3}"
 RESET_TASK_POOL="${RESET_TASK_POOL:-0}"
 SKILL_SNAPSHOT_DIR="${SKILL_SNAPSHOT_DIR:-${RUNS_DIR}/skill_bank_at_start}"
 EASYR1_EXPERIMENT_NAME="${EASYR1_EXPERIMENT_NAME:-}"
+EASYR1_SAVE_CHECKPOINT_PATH="${EASYR1_SAVE_CHECKPOINT_PATH:-}"
 EASYR1_LOAD_CHECKPOINT_PATH="${EASYR1_LOAD_CHECKPOINT_PATH:-}"
 EASYR1_MAX_STEPS="${EASYR1_MAX_STEPS:-}"
 EASYR1_VAL_FREQ="${EASYR1_VAL_FREQ:-}"
@@ -86,6 +88,11 @@ fi
 
 # 1) Build the Controller prompt datasets (real, offline; no LLM call).
 EXCLUDE_ARG=""
+EXCLUDE_ARGS=()
+if [ -n "${SELF_EVOLVER_FIXED_VAL_DIR:-}" ]; then
+    exclude_id_args EXCLUDE_ARGS "${VAL_INCLUDE_IDS}" required
+    exclude_id_args EXCLUDE_ARGS "${SFT_IDS}" required
+fi
 if [ -f "${EXCLUDE_IDS}" ]; then
     EXCLUDE_ARG="--exclude-ids ${EXCLUDE_IDS}"
     info "Excluding eval ids in ${EXCLUDE_IDS} from the training prompts"
@@ -115,16 +122,39 @@ if [ "${REBUILD_DATASETS}" = "1" ]; then
         --task-pool-state "${TASK_POOL_STATE}" \
         ${NUM_TRAIN:+--num-instances "${NUM_TRAIN}"} \
         "${TASK_SIGNAL_ARGS[@]}" \
+        "${EXCLUDE_ARGS[@]}" \
         ${EXCLUDE_ARG}
-    info "Building validation prompts -> ${VAL_JSONL}"
-    "${PYTHON}" -m src.rl.easyr1_dataset \
-        --output "${VAL_JSONL}" \
-        --dataset "${VAL_DATASET}" --split "${VAL_SPLIT}" --stage eval \
-        ${NUM_VAL:+--num-instances "${NUM_VAL}"}
+    if [ -z "${SELF_EVOLVER_FIXED_VAL_DIR:-}" ]; then
+        info "Building validation prompts -> ${VAL_JSONL}"
+        "${PYTHON}" -m src.rl.easyr1_dataset \
+            --output "${VAL_JSONL}" \
+            --dataset "${VAL_DATASET}" --split "${VAL_SPLIT}" --stage eval \
+            ${NUM_VAL:+--num-instances "${NUM_VAL}"}
+    fi
 else
     [ -s "${TRAIN_JSONL}" ] || die "REBUILD_DATASETS=0 but TRAIN_JSONL='${TRAIN_JSONL}' is missing or empty."
-    [ -s "${VAL_JSONL}" ] || die "REBUILD_DATASETS=0 but VAL_JSONL='${VAL_JSONL}' is missing or empty."
+    if [ -z "${SELF_EVOLVER_FIXED_VAL_DIR:-}" ]; then
+        [ -s "${VAL_JSONL}" ] || die "REBUILD_DATASETS=0 but VAL_JSONL='${VAL_JSONL}' is missing or empty."
+    fi
     info "Reusing frozen Controller prompt datasets for checkpoint resume"
+fi
+
+if [ -n "${SELF_EVOLVER_FIXED_VAL_DIR:-}" ]; then
+    [ "${VAL_DATASET}/${VAL_SPLIT}/${NUM_VAL}" = full/dev/225 ] || \
+        die "Production validation must be Full/dev with NUM_VAL=225."
+    "${PYTHON}" -m src.rl.fixed_validation \
+        --source-dir "${SELF_EVOLVER_FIXED_VAL_DIR}" --state-root "${STATE_ROOT:-${RUNS_DIR}}" \
+        --sft-manifest "${SELF_EVOLVER_SFT_MANIFEST}" \
+        --output "${VAL_JSONL}" --train-jsonl "${TRAIN_JSONL}" \
+        --skills-dir "${SKILL_SNAPSHOT_DIR}" --model "${CONTROLLER_MODEL_PATH}" \
+        --config "${EASYR1_CONFIG}"
+fi
+
+if [ "${SELF_EVOLVER_REQUIRE_READY_IMAGES:-0}" = 1 ]; then
+    "${PYTHON}" "${REPO_ROOT}/scripts/tools/check_training_images_ready.py" \
+        --task-pool "${TASK_POOL_STATE}" --train-jsonl "${TRAIN_JSONL}" \
+        --source-dir "${SELF_EVOLVER_FIXED_VAL_DIR}" --cache-dir "${SIF_CACHE_DIR}" \
+        --health-report "${SELF_EVOLVER_VALIDATION_HEALTH_REPORT:-${SELF_EVOLVER_FIXED_VAL_DIR}/validation_health.json}"
 fi
 
 # 2) GRPO training with EasyR1. Each candidate patch uses the frozen F2P subset
@@ -182,6 +212,9 @@ if [ -n "${EASYR1_DIR}" ]; then
     fi
     if [ -n "${EASYR1_EXPERIMENT_NAME}" ]; then
         EASYR1_OVERRIDES+=(trainer.experiment_name="${EASYR1_EXPERIMENT_NAME}")
+    fi
+    if [ -n "${EASYR1_SAVE_CHECKPOINT_PATH}" ]; then
+        EASYR1_OVERRIDES+=(trainer.save_checkpoint_path="${EASYR1_SAVE_CHECKPOINT_PATH}")
     fi
     if [ -n "${EASYR1_LOAD_CHECKPOINT_PATH}" ]; then
         EASYR1_OVERRIDES+=(trainer.load_checkpoint_path="${EASYR1_LOAD_CHECKPOINT_PATH}")

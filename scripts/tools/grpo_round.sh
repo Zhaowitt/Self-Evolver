@@ -8,7 +8,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/../common.sh"
 TRAIN_DATASET="${TRAIN_DATASET:-full}"
 TRAIN_SPLIT="${TRAIN_SPLIT:-test}"
 NUM_TRAIN="${NUM_TRAIN:-}"
-VAL_DATASET="${VAL_DATASET:-lite}"
+VAL_DATASET="${VAL_DATASET:-full}"
 VAL_SPLIT="${VAL_SPLIT:-dev}"
 NUM_VAL="${NUM_VAL:-}"
 EXCLUDE_IDS="${EXCLUDE_IDS:-${DATA_DIR}/eval_ids.txt}"
@@ -79,6 +79,12 @@ fi
 # 1) Build prompt datasets (offline). Eval/validation/SFT ids must never enter
 # GRPO prompts; EXCLUDE_IDS is required since full/test contains Verified test.
 EXCLUDE_ARGS=()
+if [ -n "${SELF_EVOLVER_FIXED_VAL_DIR:-}" ]; then
+    [ "${VAL_DATASET}/${VAL_SPLIT}/${NUM_VAL}" = full/dev/225 ] || \
+        die "Production validation must be Full/dev with NUM_VAL=225."
+    # Unlike legacy optional exclusion lists, the fixed holdout is mandatory.
+    exclude_id_args EXCLUDE_ARGS "${VAL_INCLUDE_IDS}" required
+fi
 if [ "${ALLOW_MISSING_EXCLUDE_IDS:-0}" = "1" ]; then
     exclude_id_args EXCLUDE_ARGS "${EXCLUDE_IDS}" optional
 else
@@ -116,22 +122,44 @@ if [ "${REBUILD_DATASETS}" = "1" ]; then
         ${NUM_TRAIN:+--num-instances "${NUM_TRAIN}"} \
         ${TASK_SIGNAL_ARGS[@]+"${TASK_SIGNAL_ARGS[@]}"} \
         ${EXCLUDE_ARGS[@]+"${EXCLUDE_ARGS[@]}"}
-    info "Building validation prompts -> ${VAL_JSONL}"
-    # VAL_INCLUDE_IDS pins the fixed validation manifest; SFT ids stay out.
-    VAL_ARGS=()
-    [ -n "${VAL_INCLUDE_IDS:-}" ] && VAL_ARGS+=(--include-ids "${VAL_INCLUDE_IDS}")
-    exclude_id_args VAL_ARGS "${SFT_IDS}" optional
-    "${PYTHON}" -m src.rl.easyr1_dataset \
-        --output "${VAL_JSONL}" \
-        --dataset "${VAL_DATASET}" --split "${VAL_SPLIT}" --stage eval \
-        ${NUM_VAL:+--num-instances "${NUM_VAL}"} \
-        ${VAL_ARGS[@]+"${VAL_ARGS[@]}"}
+    if [ -z "${SELF_EVOLVER_FIXED_VAL_DIR:-}" ]; then
+        info "Building validation prompts -> ${VAL_JSONL}"
+        # VAL_INCLUDE_IDS pins the fixed validation manifest; SFT ids stay out.
+        VAL_ARGS=()
+        [ -n "${VAL_INCLUDE_IDS:-}" ] && VAL_ARGS+=(--include-ids "${VAL_INCLUDE_IDS}")
+        exclude_id_args VAL_ARGS "${SFT_IDS}" optional
+        "${PYTHON}" -m src.rl.easyr1_dataset \
+            --output "${VAL_JSONL}" \
+            --dataset "${VAL_DATASET}" --split "${VAL_SPLIT}" --stage eval \
+            ${NUM_VAL:+--num-instances "${NUM_VAL}"} \
+            ${VAL_ARGS[@]+"${VAL_ARGS[@]}"}
+    fi
     # Marks this round's prompts as frozen: a crash resume must reuse them.
     touch "${ROUND_STATE_DIR}/.datasets_built"
 else
     [ -s "${TRAIN_JSONL}" ] || die "REBUILD_DATASETS=0 but TRAIN_JSONL='${TRAIN_JSONL}' is missing or empty."
-    [ -s "${VAL_JSONL}" ] || die "REBUILD_DATASETS=0 but VAL_JSONL='${VAL_JSONL}' is missing or empty."
+    if [ -z "${SELF_EVOLVER_FIXED_VAL_DIR:-}" ]; then
+        [ -s "${VAL_JSONL}" ] || die "REBUILD_DATASETS=0 but VAL_JSONL='${VAL_JSONL}' is missing or empty."
+    fi
     info "Reusing frozen Controller prompt datasets for checkpoint resume"
+fi
+
+# A checkpoint resume keeps frozen TRAIN_JSONL/dataloader.pt intact but must
+# adopt the new holdout, even when the old round has .datasets_built already.
+if [ -n "${SELF_EVOLVER_FIXED_VAL_DIR:-}" ]; then
+    "${PYTHON}" -m src.rl.fixed_validation \
+        --source-dir "${SELF_EVOLVER_FIXED_VAL_DIR}" --state-root "${ARM_DIR}" \
+        --sft-manifest "${SELF_EVOLVER_SFT_MANIFEST}" \
+        --output "${VAL_JSONL}" --train-jsonl "${TRAIN_JSONL}" \
+        --skills-dir "${SKILL_SNAPSHOT_DIR}" --model "${CONTROLLER_MODEL_PATH}" \
+        --config "${EASYR1_CONFIG}"
+fi
+
+if [ "${SELF_EVOLVER_REQUIRE_READY_IMAGES:-0}" = 1 ]; then
+    "${PYTHON}" "${REPO_ROOT}/scripts/tools/check_training_images_ready.py" \
+        --task-pool "${TASK_POOL_STATE}" --train-jsonl "${TRAIN_JSONL}" \
+        --source-dir "${SELF_EVOLVER_FIXED_VAL_DIR}" --cache-dir "${SIF_CACHE_DIR}" \
+        --health-report "${SELF_EVOLVER_VALIDATION_HEALTH_REPORT:-${SELF_EVOLVER_FIXED_VAL_DIR}/validation_health.json}"
 fi
 
 # 2) GRPO training with EasyR1.
@@ -165,6 +193,12 @@ if [ -n "${EASYR1_DIR}" ]; then
     export SELF_EVOLVER_ENABLE_SKILL_EVOLUTION="${ENABLE_SKILL_CREDIT}"
     export SELF_EVOLVER_REWARD_WORKERS="${REWARD_WORKERS}"
     export WORKSPACE_DIR
+    if [ "${SELF_EVOLVER_REQUIRE_READY_IMAGES:-0}" = 1 ]; then
+        info "Checking exact training and validation repository commits before GPU training"
+        "${PYTHON}" "${SCRIPTS_DIR}/tools/check_reward_repositories.py" \
+            --jsonl "${TRAIN_JSONL}" --jsonl "${VAL_JSONL}" \
+            --workspace "${SELF_EVOLVER_REWARD_WORKSPACE:-${WORKSPACE_DIR}/online_reward}"
+    fi
     # Record where this round's hard cases begin on first launch and reuse it
     # on resume; recomputing it after a crash would skip the round's records.
     OFFSET_FILE="${ROUND_STATE_DIR}/hard_case_start_offset"

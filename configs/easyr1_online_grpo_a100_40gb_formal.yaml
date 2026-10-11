@@ -1,0 +1,122 @@
+# Resumable production GRPO for one 40 GiB A100.
+# The training launcher supplies absolute data/model paths and a cumulative
+# max_steps target.  Checkpoint every two completed steps to balance restart
+# safety against writing a roughly 10 GiB FSDP checkpoint after every update.
+data:
+  train_files: data/controller_train.jsonl
+  val_files: data/controller_val.jsonl
+  prompt_key: prompt
+  answer_key: ground_truth
+  max_prompt_length: 12288
+  max_response_length: 1024
+  rollout_batch_size: 2
+  mini_rollout_batch_size: null
+  val_batch_size: 2
+  format_prompt: null
+  shuffle: true
+  seed: 1
+  filter_overlong_prompts: true
+  filter_overlong_prompts_workers: 8
+
+algorithm:
+  adv_estimator: rloo
+  disable_kl: false
+  use_kl_loss: true
+  kl_penalty: low_var_kl
+  kl_coef: 1.0e-2
+  online_filtering: false
+
+worker:
+  actor:
+    global_batch_size: 2
+    micro_batch_size_per_device_for_update: 1
+    micro_batch_size_per_device_for_experience: 1
+    max_grad_norm: 1.0
+    padding_free: true
+    dynamic_batching: true
+    ulysses_size: 1
+    model:
+      model_path: Qwen/Qwen3.5-4B
+      enable_gradient_checkpointing: true
+      trust_remote_code: false
+      lora:
+        rank: 16
+        alpha: 32
+        target_modules: all-linear
+    optim:
+      lr: 1.0e-5
+      weight_decay: 1.0e-2
+      strategy: adamw_bf16
+      lr_warmup_ratio: 0.03
+    fsdp:
+      enable_full_shard: true
+      enable_cpu_offload: false
+      enable_rank0_init: true
+      torch_dtype: bf16
+    offload:
+      offload_params: false
+      offload_optimizer: false
+
+  rollout:
+    # Two prompts x six samples gives RLOO within-group comparisons.
+    n: 6
+    temperature: 1.0
+    top_p: 1.0
+    limit_images: 0
+    gpu_memory_utilization: 0.30
+    enforce_eager: true
+    enable_chunked_prefill: true
+    tensor_parallel_size: 1
+    max_model_len: 13312
+    max_num_batched_tokens: 13312
+    disable_tqdm: false
+    # Bound Qwen3.5's large-vocabulary sampler warm-up and match the maximum
+    # number of rollouts produced by one training batch.
+    extra_engine_kwargs:
+      max_num_seqs: 12
+      additional_config:
+        gdn_prefill_backend: triton
+      attention_config:
+        backend: FLASH_ATTN
+        flash_attn_version: 2
+    val_override_config:
+      temperature: 0.6
+      top_p: 0.95
+      n: 2
+
+  ref:
+    fsdp:
+      enable_full_shard: true
+      enable_cpu_offload: false
+      enable_rank0_init: true
+      torch_dtype: bf16
+    offload:
+      offload_params: false
+
+  reward:
+    reward_function: src/reward/online_reward.py:compute_score
+    num_cpus: 4
+
+trainer:
+  total_epochs: 1
+  max_steps: 64
+  project_name: self_evolver
+  experiment_name: controller_qwen35_4b_sft_grpo_formal
+  logger: [console]
+  nnodes: 1
+  n_gpus_per_node: 1
+  max_try_make_batch: 20
+  # The A100 smoke already covered validation; do not spend the first formal
+  # segment evaluating the 225-task Full/dev holdout before a checkpoint.
+  val_before_train: false
+  val_freq: 64
+  val_generations_to_log: 2
+  # A wall-time stop can roll back at most one completed step (plus the
+  # in-flight step), while halving checkpoint I/O versus save_freq: 1.
+  save_freq: 2
+  save_limit: 2
+  save_model_only: false
+  # Override with CKPT_DIR (stage 5) or EASYR1_SAVE_CHECKPOINT_PATH (single launch).
+  # Keep checkpoints on a filesystem with room for rotating resumable FSDP state.
+  save_checkpoint_path: checkpoints/controller_qwen35_4b_sft_grpo_formal
+  find_last_checkpoint: true
